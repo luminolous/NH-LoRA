@@ -89,20 +89,20 @@ Now, we will use some math to find out how much `it_` "pays attention" to `anima
 
 ##### Some Math
 
-Let’s invent some hypothetical vector values that a trained model might output for these words.
+Let’s take an example. Assume this hypothetical vector values that a trained model might output for these words.
+
+So, example vectors:
+
+- Query for `"it_"` \(\left(Q_{\text{it}}\right)\): \([0.6,\ 0.3,\ -0.4,\ 0.8]\)
+- Key for `"animal_"` \(\left(K_{\text{animal}}\right)\): \([0.5,\ 0.4,\ -0.3,\ 0.7]\)
+- Key for `"street_"` \(\left(K_{\text{street}}\right)\): \([-0.2,\ 0.1,\ 0.5,\ -0.3]\)
+- Key for `"was_"` \(\left(K_{\text{was}}\right)\): \([0.3,\ 0.1,\ -0.1,\ 0.5]\)
 
 Assume \(d_k = 4\), so the scaling factor is:
 
 \[
 \sqrt{d_k} = \sqrt{4} = 2
 \]
-
-Let’s use these example vectors:
-
-- Query for `"it_"` \(\left(Q_{\text{it}}\right)\): \([0.6,\ 0.3,\ -0.4,\ 0.8]\)
-- Key for `"animal_"` \(\left(K_{\text{animal}}\right)\): \([0.5,\ 0.4,\ -0.3,\ 0.7]\)
-- Key for `"street_"` \(\left(K_{\text{street}}\right)\): \([-0.2,\ 0.1,\ 0.5,\ -0.3]\)
-- Key for `"was_"` \(\left(K_{\text{was}}\right)\): \([0.3,\ 0.1,\ -0.1,\ 0.5]\)
 
 First, compute the raw score for `"it_"` attending to `"animal_"`:
 
@@ -208,7 +208,7 @@ The reasoning here is basically to make the embedding more grouped by position.
 
 #### Some Math 
 
-Let's do a tiny example. Imagine we are looking at a picture of a landscape. Patch 1 is the top-left corner (blue sky), and Patch 16 is the bottom-right corner (which happens to be a blue lake). Visually, they might look identical.
+Let's take an example. Imagine we are looking at a picture of a landscape. Patch 1 is the top-left corner (blue sky), and Patch 16 is the bottom-right corner (which happens to be a blue lake). Visually, they might look identical.
 
 Let's say our embedding dimension is $4$:
 - Visual Embedding for Patch 1 (Sky): $[0.8, 0.2, 0.9, 0.1]$
@@ -249,22 +249,50 @@ $$
 \mathcal{C}_{\text{total}} = \mathcal{C}_1 \cup \mathcal{C}_2 \cup \cdots \cup \mathcal{C}_t
 $$
 
+
+hmm ... fine tune .. tbh, there are many ways to do it... like update all model parameters, or only small part of it. I think most people will chose the fastest one or update small part of the parameter. 
+
+
 # PEFT (Parameter Efficient Tunning) 
-PEFT, in short, is the practice of not training all the parameters, and instead, do the modification only on some components of the model.
+PEFT, is the "family of techniques" that fine-tune model by updating a small number of parameters (that I mention before).
 
-Why? Because training all LLM parameters are really, really long. We don't have that much time, this methods can even give results that converge, even more, than pure fine-tuning LLM. So almost same result with less time.  
+In many cases, these methods can achieve performance that is comparable to fine-tuning all model parameter. So almost same result with less time, win-win solution.
 
+There are really lot of them (well, family technique),but this picture from [] should visualize this clearer.
 ![peft](./imgs/peft.png)
 
-For time efficiency we’re gonna skip a lot and just focus on LoRA
+For time efficiency we’re gonna skip a lot and just focus on LoRA.
 
 ## LoRA
 
+Okay, so LoRA stands for Low-Rank Adaption, which some technique to approximate updates on weight matrix with a "low-rank decomposition" matrix [].
+
+.. what does that mean? Let's start with diagram for better intuiton :
+
+![](./imgs/lora.png)
+
+As shown in diagram, we call the original pre-trained weights $W$. During training (or fine-tuning, to be specific), we want to find a change to these weights, which we'll call $\Delta W$. Instead of learning that $\Delta W$ matrix directly, we freeze the original weights $W$ and approximate $\Delta W$ by multiplying two much smaller matrices together, $A$ and $B$. 
+
+### Some Math
+Let's take an example. From training, "ideal" weight update $\Delta W$ from a standard backprop looks like this $3 \times 3$ matrix:
+
+$$\Delta W = \begin{bmatrix} 2 & 4 & 6 \\ 3 & 6 & 9 \\ 4 & 8 & 12 \end{bmatrix}$$
+
+Normally, that's $9$ separate parameters we have to update and train. But if we look closely, there's a pattern. Every row is essentially just a multiple of the sequence $[1, 2, 3]$. Because of this redundancy (which actually happens a lot in neural networks during adaptation), we can represent this exact same matrix by taking the outer product of a $3 \times 1$ column matrix ($A$) and a $1 \times 3$ row matrix ($B$) at a rank size of $r=1$ :
+
+$$A = \begin{bmatrix} 2 \\ 3 \\ 4 \end{bmatrix}$$
+
+$$B = \begin{bmatrix} 1 & 2 & 3 \end{bmatrix}$$
+
+So, if we multiply $A \times B$, we get the exact same $\Delta W$ back, right ?
+
+In short, We optimize A and B such that when $A⊗B$, we get as close as an approximation as possible to the actual updated $\Delta W$.
+
 ### What r cons ?
 
-Connect the cons with H-LoRA pros.
+Connect the cons with NH-LoRA pros, especially on incremental learning
 
-## H-LoRA (Key Point)
+## NH-LoRA (Key Point)
 This is the main part btw, better be focused. We'll try to simplify some terms, while also keeps the essential things
 
 
