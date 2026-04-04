@@ -6,7 +6,7 @@
   <a href=""><img src="https://img.shields.io/github/last-commit/luminolous/NH-LoRA?color=blue"></a>
 </p>
 
-This repository contains the official implementation of NH-LoRA: Future-Aware Structural Expansion of Low-Rank Adapters for Rehearsal-Free Class-Incremental Learning.
+This repository contains the official implementation of **NH-LoRA: Future-Aware Structural Expansion of Low-Rank Adapters for Rehearsal-Free Class-Incremental Learning**.
 
 ## Architecture Design
 ![NH-LoRA Architecture](assets/nh-lora-design.png)
