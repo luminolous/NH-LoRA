@@ -1,0 +1,117 @@
+experiment:
+  name: nh_lora
+  project_name: nh_lora_cil
+  output_root: outputs
+  log_dir: outputs/logs
+  metrics_dir: outputs/metrics
+  summaries_dir: outputs/summaries
+  checkpoints_dir: outputs/checkpoints
+  save_checkpoints: true
+  save_best_only: false
+  overwrite_existing: false
+
+runtime:
+  device: cuda
+  num_workers: 8
+  deterministic: false
+  mixed_precision: fp16
+  pin_memory: true
+  persistent_workers: true
+
+seeds:
+  values: [1, 2, 3, 4, 5]
+  summarize_after_run: true
+
+model:
+  name: nh_lora
+  backbone_name: vit_base_patch16_224_in21k
+  backbone_source: timm
+  local_smoke_backbone_name: toy_vit_tiny
+  local_smoke_backbone_source: internal
+  freeze_backbone: true
+  selected_blocks: [8, 9, 10, 11]
+  insertion_points: [q_proj, v_proj]
+  feature_dim: 768
+
+nh_lora:
+  shared_rank: 4
+  shared_lr_scale: 0.5
+  slot_r_max: 16
+  slot_init_rank: 4
+  bootstrap_slot_rank: 4
+  max_slots_per_block: 8
+  router_topk: 2
+  router_temperature: 1.0
+  use_rank_mask: true
+  rank_mask_type: prefix
+  use_shared_gate: true
+  use_history_bank: true
+  use_chu: true
+
+warmup:
+  enabled: true
+  num_batches: 5
+  task_embedding_dim: 128
+  gradient_sketch_dim: 16
+  use_aux_head: true
+  collect_feature_mean: true
+  collect_feature_var: true
+  collect_gradient_sketch: true
+  collect_similarity: true
+  collect_entropy: true
+
+planner:
+  type: mlp_per_layer
+  hidden_dim: 256
+  layer_embedding_dim: 32
+  tau_novelty: 0.5
+  tau_conflict: 0.5
+  tau_consolidate: 0.5
+  rank_min: 1
+  rank_max: 16
+  use_history_aggregation: true
+
+chu:
+  merge_rate: 0.5
+  usage_high_threshold: 0.20
+  usage_low_threshold: 0.01
+  stability_threshold: 0.80
+  redundancy_threshold: 0.95
+  freeze_on_keep: true
+
+classifier:
+  type: cosine
+  tau_cls: 16.0
+  init_mode: imprint
+
+training:
+  optimizer: adamw
+  lr: 0.001
+  weight_decay: 0.0005
+  epochs_per_task: 20
+  batch_size: 64
+  grad_clip_norm: 5.0
+  use_scheduler: true
+  scheduler: cosine
+  warmup_epochs: 0
+
+loss:
+  lambda_kd: 1.0
+  lambda_feat: 1.0
+  lambda_orth: 0.1
+  lambda_rank: 0.0001
+  lambda_grow: 0.01
+  lambda_route: 0.01
+  kd_temperature: 2.0
+  retention_layers: [11]
+
+logging:
+  log_every_n_steps: 20
+  save_metrics_every_epoch: true
+  write_json_metrics: true
+  write_text_log: true
+
+summary:
+  enabled: true
+  format: json
+  include_per_seed: true

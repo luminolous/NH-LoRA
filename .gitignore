@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.coverage
+outputs/checkpoints/*
+outputs/logs/*.log
+outputs/logs/*.out
+outputs/metrics/**/*.json
+outputs/summaries/*.json
+
