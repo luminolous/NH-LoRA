@@ -120,6 +120,7 @@ def build_test_config(output_root: str):
             "type": "mlp_per_layer",
             "hidden_dim": 64,
             "layer_embedding_dim": 16,
+            "history_pool_dim": 4,
             "tau_novelty": 0.4,
             "tau_conflict": 0.4,
             "tau_consolidate": 0.5,
@@ -179,10 +180,17 @@ class SyntheticContinualSmokeTest(unittest.TestCase):
         self.assertTrue(trainer.last_train_state["teacher_used_on_task2"])
         self.assertTrue(trainer.last_train_state["planner_used_on_task2"])
         self.assertTrue(trainer.last_train_state["materialize_used_on_task2"])
+        self.assertTrue(trainer.last_train_state["raw_planner_separated"])
+        self.assertTrue(trainer.last_train_state["task2_materialized_has_candidates"])
+        self.assertTrue(trainer.last_train_state["task2_history_attention_used"])
         self.assertTrue(trainer.last_train_state["router_seen"])
+        self.assertTrue(trainer.last_train_state["warmup_imprinting_used"])
+        self.assertTrue(trainer.last_train_state["classifier_imprinting_used"])
         self.assertEqual(trainer.last_train_state["classifier_sizes"], [2, 4])
+        self.assertEqual(trainer.last_train_state["warmup_head_class_counts"], [2, 2])
         self.assertEqual(trainer.last_train_state["chu_calls_per_task"], [1, 1])
         self.assertEqual(trainer.last_train_state["history_sizes"], [1, 2])
+        self.assertGreater(trainer.last_train_state["history_summary_dim"], 0)
 
         first_task_state = trainer.last_train_state["task_states"][0]
         second_task_state = trainer.last_train_state["task_states"][1]
@@ -190,6 +198,12 @@ class SyntheticContinualSmokeTest(unittest.TestCase):
         self.assertAlmostEqual(first_task_state["similarity_mean"], 0.0, places=6)
         self.assertTrue(second_task_state["has_history"])
         self.assertNotAlmostEqual(second_task_state["similarity_mean"], 0.0, places=6)
+        self.assertTrue(all(action in {
+            "reuse_shared",
+            "expand_rank_existing_slot",
+            "open_new_slot",
+            "freeze_old_strong_retention",
+        } for action in trainer.last_train_state["task2_actions"].values()))
 
         for layer in trainer.model.layers.values():
             self.assertGreaterEqual(len(layer.slot_metadata), 1)

@@ -35,8 +35,15 @@ class IncrementalCosineClassifier(nn.Module):
                     prototype = F.normalize(features[mask].mean(dim=0, keepdim=True), dim=-1)
                     self.weight[class_id : class_id + 1].copy_(prototype)
 
+    def imprint_from_prototypes(self, prototypes: dict[int, torch.Tensor], class_ids: Iterable[int]) -> None:
+        with torch.no_grad():
+            for class_id in class_ids:
+                if class_id not in prototypes:
+                    continue
+                prototype = F.normalize(prototypes[class_id].view(1, -1), dim=-1)
+                self.weight[class_id : class_id + 1].copy_(prototype)
+
     def forward(self, features: torch.Tensor) -> torch.Tensor:
         if self.num_classes == 0:
             raise RuntimeError("Classifier head has not been expanded yet.")
         return self.tau * (F.normalize(features, dim=-1) @ F.normalize(self.weight, dim=-1).t())
-

@@ -26,15 +26,34 @@ class ConsolidationHomeostasisUnit:
     def estimate_redundancy(self, layer) -> Dict[int, float]:
         live_slots = layer.live_slot_ids()
         if len(live_slots) <= 1:
-            return {slot_id: 0.0 for slot_id in live_slots}
-        keys = torch.stack([layer.slot_keys[slot_id].detach() for slot_id in live_slots], dim=0)
-        keys = torch.nn.functional.normalize(keys, dim=-1)
-        similarity = keys @ keys.t()
+            shared_signature = torch.nn.functional.normalize(layer.shared_update_signature().detach().view(1, -1), dim=-1)
+            return {
+                slot_id: float(
+                    torch.nn.functional.cosine_similarity(
+                        layer.slot_update_signature(slot_id).detach().view(1, -1),
+                        shared_signature,
+                        dim=-1,
+                    ).item()
+                )
+                for slot_id in live_slots
+            }
+        slot_signatures = torch.stack([layer.slot_update_signature(slot_id).detach() for slot_id in live_slots], dim=0)
+        slot_signatures = torch.nn.functional.normalize(slot_signatures, dim=-1)
+        shared_signature = torch.nn.functional.normalize(layer.shared_update_signature().detach().view(1, -1), dim=-1)
+        similarity = slot_signatures @ slot_signatures.t()
         redundancy = {}
         for row, slot_id in enumerate(live_slots):
             row_values = similarity[row]
             other_values = torch.cat([row_values[:row], row_values[row + 1 :]], dim=0)
-            redundancy[slot_id] = float(other_values.max().item()) if other_values.numel() else 0.0
+            shared_similarity = torch.nn.functional.cosine_similarity(
+                slot_signatures[row : row + 1],
+                shared_signature,
+                dim=-1,
+            )
+            candidate_values = other_values
+            if shared_similarity.numel():
+                candidate_values = torch.cat([candidate_values, shared_similarity], dim=0)
+            redundancy[slot_id] = float(candidate_values.max().item()) if candidate_values.numel() else 0.0
         return redundancy
 
     def consolidate_layer(self, layer, planner_cfg: Dict[str, object], usage_stats: Dict[int, float]) -> CHUReport:
@@ -48,7 +67,7 @@ class ConsolidationHomeostasisUnit:
             redundant = redundancy.get(slot_id, 0.0)
             if consolidate_flag and usage >= self.usage_high_threshold and stable >= self.stability_threshold:
                 for bank in layer.point_banks.values():
-                    bank.merge_slot_into_shared(slot_id, self.merge_rate)
+                    bank.merge_slot_into_shared(slot_id, self.merge_rate, rank=layer.slot_metadata[slot_id].rank)
                 layer.freeze_slot(slot_id)
                 report.merged_slots += 1
                 report.frozen_slots += 1
@@ -61,4 +80,3 @@ class ConsolidationHomeostasisUnit:
                     report.frozen_slots += 1
                 report.kept_slots += 1
         return report
-

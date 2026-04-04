@@ -64,6 +64,7 @@ planner:
   type: mlp_per_layer
   hidden_dim: 256
   layer_embedding_dim: 32
+  history_pool_dim: 8
   tau_novelty: 0.5
   tau_conflict: 0.5
   tau_consolidate: 0.5

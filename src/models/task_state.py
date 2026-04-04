@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import List
+from dataclasses import dataclass, field
+from typing import Dict, List
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 
 @dataclass
@@ -15,46 +16,56 @@ class TaskState:
     gradient_sketch: torch.Tensor
     similarity: torch.Tensor
     entropy: torch.Tensor
+    similarity_anchor: torch.Tensor
+    summary_vector: torch.Tensor
+    class_prototypes: Dict[int, torch.Tensor] = field(default_factory=dict)
+    warmup_logits: torch.Tensor | None = None
 
 
 @dataclass
 class HistoryEntry:
     task_id: int
+    pooled_feature_mean: torch.Tensor
+    pooled_feature_var: torch.Tensor
+    gradient_sketch: torch.Tensor
+    usage_summary: torch.Tensor
+    active_rank_summary: torch.Tensor
+    entropy_summary: torch.Tensor
+    similarity_anchor: torch.Tensor
     task_embedding: torch.Tensor
-    feature_norm: float
-    entropy: float
-    usage: float
-    active_rank: float
     summary_vector: torch.Tensor
 
 
 class TaskStateEncoder(nn.Module):
-    def __init__(self, feature_dim: int, grad_dim: int = 16, embedding_dim: int = 128):
+    def __init__(self, feature_dim: int, grad_dim: int = 16, embedding_dim: int = 128, pool_dim: int | None = None):
         super().__init__()
-        self.feature_proj = nn.Sequential(nn.Linear(feature_dim * 2, embedding_dim), nn.GELU())
-        self.grad_proj = nn.Sequential(nn.Linear(grad_dim, embedding_dim), nn.GELU())
-        self.scalar_proj = nn.Sequential(nn.Linear(2, embedding_dim), nn.GELU())
-        self.final_proj = nn.Sequential(
-            nn.Linear(embedding_dim * 3, embedding_dim),
+        self.pool_dim = pool_dim or feature_dim
+        raw_dim = self.pool_dim * 2 + grad_dim + 2
+        self.input_norm = nn.LayerNorm(raw_dim)
+        self.encoder = nn.Sequential(
+            nn.Linear(raw_dim, embedding_dim),
             nn.GELU(),
             nn.Linear(embedding_dim, embedding_dim),
         )
         self.grad_dim = grad_dim
         self.embedding_dim = embedding_dim
 
-    def forward(self, feature_mean, feature_var, gradient_sketch, similarity, entropy) -> TaskState:
-        feature_stack = torch.cat([feature_mean, feature_var], dim=-1)
-        scalar_stack = torch.cat([similarity, entropy], dim=-1)
-        embedding = self.final_proj(
-            torch.cat(
-                [
-                    self.feature_proj(feature_stack),
-                    self.grad_proj(gradient_sketch),
-                    self.scalar_proj(scalar_stack),
-                ],
-                dim=-1,
-            )
-        )
+    def forward(
+        self,
+        feature_mean,
+        feature_var,
+        gradient_sketch,
+        similarity,
+        entropy,
+        similarity_anchor: torch.Tensor | None = None,
+        summary_vector: torch.Tensor | None = None,
+        class_prototypes: Dict[int, torch.Tensor] | None = None,
+        warmup_logits: torch.Tensor | None = None,
+    ) -> TaskState:
+        pooled_mean = pool_vector(feature_mean, self.pool_dim)
+        pooled_var = pool_vector(feature_var, self.pool_dim)
+        raw_vector = torch.cat([pooled_mean, pooled_var, gradient_sketch, similarity, entropy], dim=-1)
+        embedding = self.encoder(self.input_norm(raw_vector))
         return TaskState(
             embedding=embedding,
             feature_mean=feature_mean,
@@ -62,6 +73,10 @@ class TaskStateEncoder(nn.Module):
             gradient_sketch=gradient_sketch,
             similarity=similarity,
             entropy=entropy,
+            similarity_anchor=similarity_anchor if similarity_anchor is not None else F.normalize(feature_mean, dim=-1),
+            summary_vector=summary_vector if summary_vector is not None else torch.cat([feature_mean, feature_var, gradient_sketch, entropy], dim=-1),
+            class_prototypes=class_prototypes or {},
+            warmup_logits=warmup_logits,
         )
 
 
@@ -78,33 +93,94 @@ class HistoryBank:
     def aggregate(self) -> torch.Tensor | None:
         if not self.entries:
             return None
-        return torch.stack([entry.summary_vector for entry in self.entries], dim=0).mean(dim=0)
+        return torch.cat([entry.summary_vector for entry in self.entries], dim=0)
 
-    def mean_similarity(self, current_embedding: torch.Tensor) -> torch.Tensor:
+    def mean_similarity(self, current_summary_vector: torch.Tensor, current_anchor: torch.Tensor) -> torch.Tensor:
         if not self.entries:
-            return current_embedding.new_zeros(current_embedding.size(0), 1)
-        anchors = torch.stack([entry.task_embedding.squeeze(0) for entry in self.entries], dim=0)
-        anchors = torch.nn.functional.normalize(anchors, dim=-1)
-        current = torch.nn.functional.normalize(current_embedding, dim=-1)
-        return (current @ anchors.t()).mean(dim=-1, keepdim=True)
+            return current_summary_vector.new_zeros(current_summary_vector.size(0), 1)
+        summary_bank = torch.stack([entry.summary_vector.squeeze(0) for entry in self.entries], dim=0)
+        anchor_bank = torch.stack([entry.similarity_anchor.squeeze(0) for entry in self.entries], dim=0)
+        summary_bank = F.normalize(summary_bank, dim=-1)
+        anchor_bank = F.normalize(anchor_bank, dim=-1)
+        current_summary = F.normalize(current_summary_vector, dim=-1)
+        current_anchor = F.normalize(current_anchor, dim=-1)
+        summary_scores = current_summary @ summary_bank.t()
+        anchor_scores = current_anchor @ anchor_bank.t()
+        combined_scores = 0.5 * (summary_scores + anchor_scores)
+        return combined_scores.max(dim=-1, keepdim=True).values
 
 
-def build_history_entry(task_id: int, task_state: TaskState, usage: float, active_rank: float) -> HistoryEntry:
-    summary_vector = torch.cat(
+def pool_vector(vector: torch.Tensor, output_dim: int) -> torch.Tensor:
+    flattened = vector.reshape(vector.size(0), -1)
+    chunks = torch.chunk(flattened, output_dim, dim=-1)
+    pooled = []
+    for chunk in chunks:
+        pooled.append(chunk.mean(dim=-1, keepdim=True))
+    if len(pooled) < output_dim:
+        pooled.extend([flattened.new_zeros(flattened.size(0), 1) for _ in range(output_dim - len(pooled))])
+    return torch.cat(pooled[:output_dim], dim=-1)
+
+
+def build_history_summary_vector(
+    pooled_feature_mean: torch.Tensor,
+    pooled_feature_var: torch.Tensor,
+    gradient_sketch: torch.Tensor,
+    usage_summary: torch.Tensor,
+    active_rank_summary: torch.Tensor,
+    entropy_summary: torch.Tensor,
+) -> torch.Tensor:
+    return torch.cat(
         [
-            task_state.embedding.detach(),
-            task_state.feature_mean.norm(dim=-1, keepdim=True).detach(),
-            task_state.entropy.detach(),
-            task_state.embedding.new_tensor([[usage, active_rank]]),
+            pooled_feature_mean,
+            pooled_feature_var,
+            gradient_sketch,
+            usage_summary,
+            active_rank_summary,
+            entropy_summary,
         ],
         dim=-1,
     )
+
+
+def build_history_entry(
+    task_id: int,
+    task_state: TaskState,
+    usage_summary: torch.Tensor,
+    active_rank_summary: torch.Tensor,
+    pooled_feature_mean: torch.Tensor,
+    pooled_feature_var: torch.Tensor,
+) -> HistoryEntry:
     return HistoryEntry(
         task_id=task_id,
+        pooled_feature_mean=pooled_feature_mean.detach(),
+        pooled_feature_var=pooled_feature_var.detach(),
+        gradient_sketch=task_state.gradient_sketch.detach(),
+        usage_summary=usage_summary.detach(),
+        active_rank_summary=active_rank_summary.detach(),
+        entropy_summary=task_state.entropy.detach(),
+        similarity_anchor=task_state.similarity_anchor.detach(),
         task_embedding=task_state.embedding.detach(),
-        feature_norm=float(task_state.feature_mean.norm().item()),
-        entropy=float(task_state.entropy.mean().item()),
-        usage=usage,
-        active_rank=active_rank,
-        summary_vector=summary_vector,
+        summary_vector=build_history_summary_vector(
+            pooled_feature_mean=pooled_feature_mean.detach(),
+            pooled_feature_var=pooled_feature_var.detach(),
+            gradient_sketch=task_state.gradient_sketch.detach(),
+            usage_summary=usage_summary.detach(),
+            active_rank_summary=active_rank_summary.detach(),
+            entropy_summary=task_state.entropy.detach(),
+        ),
+    )
+
+
+def detach_task_state(task_state: TaskState) -> TaskState:
+    return TaskState(
+        embedding=task_state.embedding.detach(),
+        feature_mean=task_state.feature_mean.detach(),
+        feature_var=task_state.feature_var.detach(),
+        gradient_sketch=task_state.gradient_sketch.detach(),
+        similarity=task_state.similarity.detach(),
+        entropy=task_state.entropy.detach(),
+        similarity_anchor=task_state.similarity_anchor.detach(),
+        summary_vector=task_state.summary_vector.detach(),
+        class_prototypes={class_id: prototype.detach() for class_id, prototype in task_state.class_prototypes.items()},
+        warmup_logits=task_state.warmup_logits.detach() if task_state.warmup_logits is not None else None,
     )

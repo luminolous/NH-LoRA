@@ -49,12 +49,15 @@ class NHLoRAModel(nn.Module):
             slot_id = layer.ensure_bootstrap_slot(task_id)
             planner_out[block_id] = {
                 "action": "reuse_shared",
-                "active_slots": [slot_id],
+                "active_slot_candidates": [slot_id],
+                "selected_slot": slot_id,
                 "rank_cfg": {slot_id: layer.slot_metadata[slot_id].rank},
                 "shared_gate": 1.0,
                 "consolidate_flag": False,
                 "deterministic": True,
                 "created_new_slot": False,
+                "fallback_action": None,
+                "strong_retention": False,
             }
         return planner_out
 
@@ -65,13 +68,29 @@ class NHLoRAModel(nn.Module):
     def expand_classifier(self, num_new_classes: int) -> List[int]:
         return self.classifier.expand(num_new_classes)
 
-    def forward(self, images: torch.Tensor, task_state: TaskState | None, planner_out):
-        features_dict = self.backbone.forward_features(images, self.nh_layers_by_block(), task_state, planner_out)
+    def encode(self, images: torch.Tensor, task_state: TaskState | None = None, planner_out=None):
+        return self.backbone.forward_features(images, self.nh_layers_by_block() if planner_out is not None else None, task_state, planner_out)
+
+    def forward_with_state(self, images: torch.Tensor, task_state: TaskState | None, planner_out):
+        features_dict = self.encode(images, task_state=task_state, planner_out=planner_out)
+        layer_features = {
+            int(block_id): tokens[:, 0]
+            for block_id, tokens in features_dict["block_outputs"].items()
+        }
         logits = self.classifier(features_dict["features"])
-        return logits, features_dict["features"], features_dict["route_info"]
+        return {
+            "logits": logits,
+            "features": features_dict["features"],
+            "route_info": features_dict["route_info"],
+            "layer_features": layer_features,
+        }
+
+    def forward(self, images: torch.Tensor, task_state: TaskState | None, planner_out):
+        state = self.forward_with_state(images, task_state, planner_out)
+        return state["logits"], state["features"], state["route_info"]
 
     def extract_features(self, images: torch.Tensor) -> torch.Tensor:
-        return self.backbone.forward_features(images)["features"]
+        return self.encode(images)["features"]
 
     def make_teacher_snapshot(self) -> "NHLoRAModel":
         teacher = deepcopy(self)

@@ -55,11 +55,26 @@ class ProjectionBank(nn.Module):
         low_rank = low_rank * mask
         return F.linear(low_rank, self.slot_b[slot_id])
 
-    def merge_slot_into_shared(self, slot_id: int, merge_rate: float) -> None:
-        overlap = min(self.shared_rank, self.slot_r_max)
+    def shared_update_matrix(self) -> torch.Tensor:
+        return self.shared_b @ self.shared_a
+
+    def slot_update_matrix(self, slot_id: int, rank: int) -> torch.Tensor:
+        return self.slot_b[slot_id][:, :rank] @ self.slot_a[slot_id][:rank, :]
+
+    def merge_slot_into_shared(self, slot_id: int, merge_rate: float, rank: int | None = None) -> None:
         with torch.no_grad():
-            self.shared_a[:overlap].add_(merge_rate * self.slot_a[slot_id][:overlap])
-            self.shared_b[:, :overlap].add_(merge_rate * self.slot_b[slot_id][:, :overlap])
+            slot_rank = min(rank or self.slot_r_max, self.slot_a[slot_id].size(0))
+            merged_update = self.shared_update_matrix() + merge_rate * self.slot_update_matrix(slot_id, slot_rank)
+            u, s, vh = torch.linalg.svd(merged_update, full_matrices=False)
+            target_rank = min(self.shared_rank, s.numel())
+            shared_a = torch.zeros_like(self.shared_a)
+            shared_b = torch.zeros_like(self.shared_b)
+            if target_rank > 0:
+                sqrt_s = torch.sqrt(s[:target_rank])
+                shared_b[:, :target_rank] = u[:, :target_rank] * sqrt_s.unsqueeze(0)
+                shared_a[:target_rank, :] = sqrt_s.unsqueeze(1) * vh[:target_rank, :]
+            self.shared_a.copy_(shared_a)
+            self.shared_b.copy_(shared_b)
 
 
 class NHLoRALayer(nn.Module):
@@ -156,16 +171,21 @@ class NHLoRALayer(nn.Module):
     def route(self, normalized_tokens: torch.Tensor, planner_cfg: Dict[str, object], task_state) -> Dict[str, object]:
         pooled = normalized_tokens[:, 0]
         live_slots = self.live_slot_ids()
-        requested = planner_cfg.get("active_slots", live_slots)
+        requested = planner_cfg.get("active_slot_candidates", planner_cfg.get("active_slots", live_slots))
         candidate_slots = [slot_id for slot_id in requested if slot_id in live_slots]
         if not candidate_slots:
             candidate_slots = live_slots[:1]
         if not candidate_slots:
-            return {"active_slots": [], "routing_weights": normalized_tokens.new_zeros(normalized_tokens.size(0), 0)}
+            return {
+                "candidate_slots": [],
+                "selected_slots": [],
+                "routing_weights": normalized_tokens.new_zeros(normalized_tokens.size(0), 0),
+            }
         if len(candidate_slots) == 1 and bool(planner_cfg.get("deterministic", False)):
             weights = normalized_tokens.new_ones(normalized_tokens.size(0), 1)
             return {
-                "active_slots": candidate_slots,
+                "candidate_slots": candidate_slots,
+                "selected_slots": list(candidate_slots),
                 "routing_weights": weights,
                 "usage_vector": weights.mean(dim=0),
             }
@@ -177,12 +197,18 @@ class NHLoRALayer(nn.Module):
         topk_scores, topk_indices = torch.topk(scores, k=topk, dim=1)
         weights = torch.softmax(topk_scores / self.router_temperature, dim=-1)
         usage_vector = normalized_tokens.new_zeros(len(candidate_slots))
+        selected_slots = []
         for row, indices in enumerate(topk_indices):
+            row_selected = []
             for col, candidate_index in enumerate(indices.tolist()):
                 usage_vector[candidate_index] += weights[row, col].detach()
+                row_selected.append(candidate_slots[candidate_index])
+            if row == 0:
+                selected_slots = row_selected
         usage_vector = usage_vector / max(scores.size(0), 1)
         return {
-            "active_slots": candidate_slots,
+            "candidate_slots": candidate_slots,
+            "selected_slots": selected_slots,
             "routing_weights": weights,
             "topk_indices": topk_indices,
             "usage_vector": usage_vector,
@@ -200,7 +226,7 @@ class NHLoRALayer(nn.Module):
     def _slot_delta(self, point_name: str, hidden_states: torch.Tensor, route_state: Dict[str, object], planner_cfg: Dict[str, object]) -> torch.Tensor:
         if point_name not in self.selected_points:
             return hidden_states.new_zeros(*hidden_states.shape[:-1], self._point_output_dim(point_name))
-        candidate_slots = route_state.get("active_slots", [])
+        candidate_slots = route_state.get("candidate_slots", route_state.get("active_slots", []))
         if not candidate_slots:
             return hidden_states.new_zeros(*hidden_states.shape[:-1], self._point_output_dim(point_name))
         bank = self.point_banks[sanitize_key(point_name)]
@@ -267,5 +293,18 @@ class NHLoRALayer(nn.Module):
                 prev_b = snapshot[f"{point_name}.b"]
                 delta_norm += float((current_a - prev_a).norm().item() + (current_b - prev_b).norm().item())
                 current_norm += float(current_a.norm().item() + current_b.norm().item())
-            stability[slot_id] = 1.0 / (1.0 + delta_norm / max(current_norm, 1e-6))
+            stability[slot_id] = float(torch.exp(torch.tensor(-delta_norm / max(current_norm, 1e-6))).item())
         return stability
+
+    def slot_update_signature(self, slot_id: int) -> torch.Tensor:
+        fragments = []
+        rank = self.slot_metadata[slot_id].rank
+        for bank in self.point_banks.values():
+            fragments.append(bank.slot_update_matrix(slot_id, rank).reshape(-1))
+        return torch.cat(fragments, dim=0)
+
+    def shared_update_signature(self) -> torch.Tensor:
+        fragments = []
+        for bank in self.point_banks.values():
+            fragments.append(bank.shared_update_matrix().reshape(-1))
+        return torch.cat(fragments, dim=0)
