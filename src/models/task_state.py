@@ -11,6 +11,7 @@ from torch.nn import functional as F
 @dataclass
 class TaskState:
     embedding: torch.Tensor
+    raw_task_vector: torch.Tensor
     feature_mean: torch.Tensor
     feature_var: torch.Tensor
     gradient_sketch: torch.Tensor
@@ -50,6 +51,18 @@ class TaskStateEncoder(nn.Module):
         self.grad_dim = grad_dim
         self.embedding_dim = embedding_dim
 
+    def build_raw_task_vector(
+        self,
+        feature_mean: torch.Tensor,
+        feature_var: torch.Tensor,
+        gradient_sketch: torch.Tensor,
+        similarity: torch.Tensor,
+        entropy: torch.Tensor,
+    ) -> torch.Tensor:
+        pooled_mean = pool_vector(feature_mean, self.pool_dim)
+        pooled_var = pool_vector(feature_var, self.pool_dim)
+        return torch.cat([pooled_mean, pooled_var, gradient_sketch, similarity, entropy], dim=-1)
+
     def forward(
         self,
         feature_mean,
@@ -62,19 +75,24 @@ class TaskStateEncoder(nn.Module):
         class_prototypes: Dict[int, torch.Tensor] | None = None,
         warmup_logits: torch.Tensor | None = None,
     ) -> TaskState:
-        pooled_mean = pool_vector(feature_mean, self.pool_dim)
-        pooled_var = pool_vector(feature_var, self.pool_dim)
-        raw_vector = torch.cat([pooled_mean, pooled_var, gradient_sketch, similarity, entropy], dim=-1)
-        embedding = self.encoder(self.input_norm(raw_vector))
+        raw_task_vector = self.build_raw_task_vector(
+            feature_mean=feature_mean,
+            feature_var=feature_var,
+            gradient_sketch=gradient_sketch,
+            similarity=similarity,
+            entropy=entropy,
+        )
+        embedding = self.encoder(self.input_norm(raw_task_vector))
         return TaskState(
             embedding=embedding,
+            raw_task_vector=raw_task_vector,
             feature_mean=feature_mean,
             feature_var=feature_var,
             gradient_sketch=gradient_sketch,
             similarity=similarity,
             entropy=entropy,
             similarity_anchor=similarity_anchor if similarity_anchor is not None else F.normalize(feature_mean, dim=-1),
-            summary_vector=summary_vector if summary_vector is not None else torch.cat([feature_mean, feature_var, gradient_sketch, entropy], dim=-1),
+            summary_vector=summary_vector if summary_vector is not None else torch.cat([raw_task_vector], dim=-1),
             class_prototypes=class_prototypes or {},
             warmup_logits=warmup_logits,
         )
@@ -108,6 +126,43 @@ class HistoryBank:
         anchor_scores = current_anchor @ anchor_bank.t()
         combined_scores = 0.5 * (summary_scores + anchor_scores)
         return combined_scores.max(dim=-1, keepdim=True).values
+
+    def state_dict(self) -> Dict[str, object]:
+        serialized_entries = []
+        for entry in self.entries:
+            serialized_entries.append(
+                {
+                    "task_id": entry.task_id,
+                    "pooled_feature_mean": entry.pooled_feature_mean,
+                    "pooled_feature_var": entry.pooled_feature_var,
+                    "gradient_sketch": entry.gradient_sketch,
+                    "usage_summary": entry.usage_summary,
+                    "active_rank_summary": entry.active_rank_summary,
+                    "entropy_summary": entry.entropy_summary,
+                    "similarity_anchor": entry.similarity_anchor,
+                    "task_embedding": entry.task_embedding,
+                    "summary_vector": entry.summary_vector,
+                }
+            )
+        return {"entries": serialized_entries}
+
+    def load_state_dict(self, state: Dict[str, object]) -> None:
+        self.entries = []
+        for payload in state.get("entries", []):
+            self.entries.append(
+                HistoryEntry(
+                    task_id=int(payload["task_id"]),
+                    pooled_feature_mean=payload["pooled_feature_mean"],
+                    pooled_feature_var=payload["pooled_feature_var"],
+                    gradient_sketch=payload["gradient_sketch"],
+                    usage_summary=payload["usage_summary"],
+                    active_rank_summary=payload["active_rank_summary"],
+                    entropy_summary=payload["entropy_summary"],
+                    similarity_anchor=payload["similarity_anchor"],
+                    task_embedding=payload["task_embedding"],
+                    summary_vector=payload["summary_vector"],
+                )
+            )
 
 
 def pool_vector(vector: torch.Tensor, output_dim: int) -> torch.Tensor:
@@ -171,9 +226,42 @@ def build_history_entry(
     )
 
 
+def serialize_task_state(task_state: TaskState) -> Dict[str, object]:
+    return {
+        "embedding": task_state.embedding,
+        "raw_task_vector": task_state.raw_task_vector,
+        "feature_mean": task_state.feature_mean,
+        "feature_var": task_state.feature_var,
+        "gradient_sketch": task_state.gradient_sketch,
+        "similarity": task_state.similarity,
+        "entropy": task_state.entropy,
+        "similarity_anchor": task_state.similarity_anchor,
+        "summary_vector": task_state.summary_vector,
+        "class_prototypes": task_state.class_prototypes,
+        "warmup_logits": task_state.warmup_logits,
+    }
+
+
+def deserialize_task_state(payload: Dict[str, object]) -> TaskState:
+    return TaskState(
+        embedding=payload["embedding"],
+        raw_task_vector=payload["raw_task_vector"],
+        feature_mean=payload["feature_mean"],
+        feature_var=payload["feature_var"],
+        gradient_sketch=payload["gradient_sketch"],
+        similarity=payload["similarity"],
+        entropy=payload["entropy"],
+        similarity_anchor=payload["similarity_anchor"],
+        summary_vector=payload["summary_vector"],
+        class_prototypes=payload.get("class_prototypes", {}),
+        warmup_logits=payload.get("warmup_logits"),
+    )
+
+
 def detach_task_state(task_state: TaskState) -> TaskState:
     return TaskState(
         embedding=task_state.embedding.detach(),
+        raw_task_vector=task_state.raw_task_vector.detach(),
         feature_mean=task_state.feature_mean.detach(),
         feature_var=task_state.feature_var.detach(),
         gradient_sketch=task_state.gradient_sketch.detach(),

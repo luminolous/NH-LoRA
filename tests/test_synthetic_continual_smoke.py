@@ -205,8 +205,15 @@ class SyntheticContinualSmokeTest(unittest.TestCase):
             "freeze_old_strong_retention",
         } for action in trainer.last_train_state["task2_actions"].values()))
 
-        for layer in trainer.model.layers.values():
+        for block_id, layer in trainer.model.layers.items():
             self.assertGreaterEqual(len(layer.slot_metadata), 1)
+            inference_profile = trainer.inference_profile[int(block_id)]
+            self.assertLessEqual(len(inference_profile["active_slot_candidates"]), layer.router_topk)
+            if layer.last_structural_action in {"reuse_shared", "freeze_old_strong_retention"}:
+                self.assertEqual(inference_profile["active_slot_candidates"], [])
+            else:
+                for slot_id in inference_profile["active_slot_candidates"]:
+                    self.assertTrue(layer.slot_metadata[slot_id].retained_for_inference)
 
 
 if __name__ == "__main__":

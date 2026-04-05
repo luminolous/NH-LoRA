@@ -16,6 +16,7 @@ def parse_args():
     parser.add_argument("--seed", required=True, type=int, help="Random seed for the run.")
     parser.add_argument("--benchmark", required=True, help="Benchmark name override for output naming.")
     parser.add_argument("--output-root", default="outputs", help="Root output directory.")
+    parser.add_argument("--resume", default=None, help="Optional checkpoint path for resuming a run.")
     return parser.parse_args()
 
 
@@ -29,6 +30,9 @@ def main():
     logger = configure_logger(log_file=log_file)
     seed_everything(args.seed, deterministic=bool(config["runtime"].get("deterministic", False)))
     trainer = NHLoRATrainer(config, logger)
+    if args.resume:
+        trainer.load_checkpoint(args.resume)
+        logger.info("Resumed NH-LoRA state from %s", args.resume)
     metrics = trainer.train(seed=args.seed)
     metrics["seed"] = args.seed
     metrics_path = output_dirs["benchmark_metrics"] / f"seed_{args.seed}.json"
@@ -39,4 +43,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

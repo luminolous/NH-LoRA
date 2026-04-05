@@ -1,89 +1,119 @@
 # NH-LoRA Development Status
 
 ## Latest updates
-- Completed a paper-faithful alignment pass against the latest `NH-LoRA Design Paper [ID].pdf` using local PDF text extraction without installing new packages.
-- Tightened the implementation around the paper's information flow, not just the module list:
-  - persistent prototype-imprinted warm-up head,
-  - pooled raw-vector TSE,
-  - richer history-bank summaries,
-  - history-aware planner q/k/v aggregation,
-  - explicit separation between raw planner signals and `materialize_action`,
-  - additive rank expansion with max-slot fallback,
-  - normalized CHU usage and exponential stability,
-  - shared-core lower learning-rate path.
-- Extended the paper-alignment tests so task 2 now proves that history attention, materialized candidates, classifier imprinting, CHU, and history growth are all wired together.
-- Re-ran lightweight validation after each patch; all current alignment checks are green.
 
-## Files touched
-- `configs/base.yaml`
+- Completed the official paper-alignment implementation pass focused on correctness first, then robustness and documentation.
+- Rebuilt the training engine around the explicit paper flow:
+  - warm-up sensing
+  - raw planner
+  - pure `materialize_action`
+  - explicit `apply_structure_changes`
+  - task training
+  - CHU consolidation
+  - history append
+  - post-consolidation inference profile
+- Added save/load checkpoint support with resume state, RNG state, sampler state, and current task context.
+- Updated tests so critical NH-LoRA behaviors are validated directly.
+
+## Files changed in this pass
+
+- `README.md`
+- `docs/paper_alignment.md`
+- `src/engine/train.py`
 - `src/engine/trainer.py`
-- `src/models/task_state.py`
-- `src/models/planner.py`
+- `src/models/chu.py`
 - `src/models/lora.py`
 - `src/models/losses.py`
-- `src/models/chu.py`
-- `src/models/classifier.py`
 - `src/models/nh_lora.py`
 - `tests/test_paper_alignment_units.py`
 - `tests/test_synthetic_continual_smoke.py`
+- `tests/test_checkpoint_resume.py`
 - `outputs/logs/dev_status.md`
 
 ## Gap analysis
-### Already paper-faithful
-- Frozen ViT backbone remains fully frozen, with configurable selected blocks and default `q_proj`/`v_proj` insertion plus optional MLP path support.
-- Shared Core LoRA, expandable task slots, fixed-capacity rank-mask behavior, and sparse instance routing remain in the repo and match the intended NH-LoRA decomposition.
-- The training loop still follows the paper phase order: warm-up sensing, planning, structure expansion, task training, consolidation, and task-summary save.
-- Bootstrap task-1 behavior remains paper-consistent: no teacher, no history-aware similarity, no KD, no feature-retention loss, and deterministic single-slot routing.
-- The incremental cosine classifier head still expands per task and stays aligned with the paper's frozen-backbone setting.
+
+### Already close before this pass
+
+- Frozen backbone structure
+- shared-versus-slot NH-LoRA decomposition
+- basic slot bank and rank-mask idea
+- incremental cosine head
+- summary-only history bank direction
+- bootstrap branch skeleton
 
 ### Corrected in this pass
-- Replaced the old ad-hoc warm-up behavior with a persistent auxiliary warm-up head initialized by prototype-based imprinting and used only to form warm-up statistics.
-- Reworked TSE to encode a pooled raw task vector `[pool(mean), pool(var), grad, similarity, entropy]` through a normalized MLP, which is closer to the paper formula than the previous separated-projection shortcut.
-- Expanded history entries to store pooled feature mean, pooled feature variance, gradient sketch, usage summary, active-rank summary, entropy summary, similarity anchor, task embedding, and a history summary vector.
-- Changed similarity-to-history from mean-style matching to max-style matching over summary vectors and anchors, which is closer to the paper's similarity intent.
-- Replaced mean history aggregation in the planner with history-aware q/k/v attention and formed planner inputs as `[z_t, h_t, z_t * h_t, e_l]` per layer.
-- Preserved raw planner state as a first-class object: novelty, conflict, rank score, rank budget, consolidation score, shared gate, history attention, history context, and planner representation now exist separately from materialized structural actions.
-- Made `materialize_action` closer to the paper by using additive rank expansion, explicit candidate-slot sets, and `open_new_slot -> expand_rank_existing_slot` fallback when slot capacity is full.
-- Wired `shared_lr_scale` into optimizer param groups so shared memory now actually behaves as the slower-plasticity path described in the paper.
-- Normalized CHU usage by task sample count, switched slot stability to an exponential drift form, and based redundancy on adapter update signatures instead of slot-key similarity.
-- Tightened `L_rank` and `L_grow` so they use planner raw signals and active-rank surrogates that are closer to the paper's intent than the earlier metadata-only constants.
-- Tightened the two-task synthetic continual smoke test to confirm task-2 history attention, planner/action separation, classifier imprinting, CHU invocation, and history-bank growth.
+
+- Planner input now explicitly uses `[z_t; h_t_tilde; |z_t-h_t_tilde|; z_t ⊙ h_t_tilde; e_l]`.
+- History-aware aggregation is explicit and separated from structural materialization.
+- `materialize_action` is pure; structure mutation happens only in `apply_structure_changes`.
+- `reuse_shared` is now truly shared-only by default.
+- `open_new_slot` falls back to `expand_rank_existing_slot` with the official compatibility rule when slot capacity is full.
+- `freeze_old_strong_retention` now has real effect:
+  - old slots are frozen
+  - inference candidates are emptied
+  - the affected layer is treated as shared-dominant
+- Warm-up sensing now uses a temporary prototype-imprinted auxiliary head and produces task-state statistics used by TSE.
+- Slot compatibility is now defined consistently as cosine similarity between normalized task embedding and normalized slot key.
+- Slot keys now live in task-embedding space, matching the official compatibility definition.
+- `L_orth` is now based on active low-rank factors.
+- `L_rank` is now based on realized active-rank masks, not planner scores.
+- `L_grow` is now based on actual slot opening events.
+- `L_route` now uses `KL(mean routing distribution || uniform)`.
+- Eval/inference no longer uses the old shortcut `all live slots + shared_gate=1.0`.
+- Checkpoint/resume now restores model/planner/TSE/history/inference profile plus trainer and RNG state.
 
 ### Still approximation
-- The local fallback path still uses the internal toy ViT for smoke checks; exact ViT-B/16-IN21K behavior still depends on the `timm` path on the SSH machine.
-- Planner action selection still uses explicit thresholds over learned novelty/conflict/consolidation signals. This is paper-consistent as a heuristic materialization rule, but not benchmark-tuned yet.
-- Slot orthogonality is enforced in adapter update-space signatures, not the exact factor-only form `A_{l;s}^T A_{l;u}`.
-- CHU is still heuristic by design, although its inputs now follow the paper much more closely.
-- Feature retention is layer-aware over configured block outputs, but not every possible internal sub-activation is retained.
 
-### Not yet safe for real benchmark runs
-- The `timm` ViT-B/16-IN21K path has not been executed locally in this environment.
-- Real CIFAR-100, CUB-200-2011, ImageNet-R, and OmniBenchmark layouts have not been re-validated in this paper-alignment pass.
-- No full benchmark run, long continual sequence, or real checkpoint/runtime stress test was executed here by design.
+- CHU remains heuristic by design, although it now uses explicit merge/prune/keep/freeze decisions.
+- `L_rank` is paper-faithful as realized structural cost, but can become near-constant during a task once structure is fixed.
+- Full ViT-B/16-IN21K validation still depends on the SSH runtime with `timm`.
+
+### Not fully validated here
+
+- Real dataset layouts for CUB-200-2011, ImageNet-R, and OmniBenchmark
+- Full benchmark throughput and long-run training
+- Real multi-worker or CUDA-heavy resume determinism
 
 ## Completed
-- Paper-vs-code gap analysis completed and reflected in the implementation.
-- Warm-up sensing, TSE, history bank, planner, materialization, losses, and CHU were patched toward paper-faithful behavior.
-- Lightweight paper-alignment validation passed:
-  - `python -m compileall src tests`
-  - `python -m unittest tests.test_config_summary tests.test_paper_alignment_units tests.test_synthetic_continual_smoke`
+
+- PASS 1:
+  - planner input correctness
+  - history-aware aggregation
+  - pure materialization
+  - explicit structure mutation
+  - action semantics
+  - bootstrap task-1 behavior
+  - paper-target losses
+  - inference policy replacement
+- PASS 2:
+  - checkpoint/resume wiring
+  - scheduler activation
+  - efficiency metrics in trainer output
+  - README update
+  - paper alignment documentation
+  - checkpoint/resume test coverage
 
 ## Pending
-- Real benchmark execution on the SSH machine.
-- Validation of the true `timm`-backed ViT-B/16-IN21K runtime path.
-- Validation of real dataset layouts for CUB-200-2011, ImageNet-R, and OmniBenchmark.
-- Real-task retuning of planner and CHU thresholds only if benchmark evidence later shows they are necessary.
+
+- SSH validation with the real `timm` backbone path
+- real benchmark execution
+- benchmark-scale calibration only if benchmark evidence later shows it is needed
 
 ## Assumptions
-- Local development must avoid heavy compute, package installation, and full benchmark runs.
-- Fixed `r_max` rank masking is always on in this repo because NH-LoRA is the only target method here; `use_rank_mask` remains informational rather than a toggle.
-- History bank stores summary statistics only; no old-task raw data is retained.
-- Growth regularization uses planner open-slot pressure (`novelty * conflict`) as the soft surrogate for the paper's new-slot indicator.
-- Shared-usage history summary is represented by per-block planner shared-gate averages.
-- TSE pooling dimension follows `planner.history_pool_dim` so the current task-state and history-bank summaries stay shape-consistent.
+
+- The design paper remains the primary source of truth.
+- Heuristic CHU is acceptable because the paper allows it.
+- The chosen inference policy is the most conservative operationalization under paper ambiguity.
+- `L_rank` remains realized-mask based even when its optimizer signal is weak, because that is more paper-faithful than reverting to planner-score surrogates.
 
 ## Risks to verify later on SSH
-- Full `timm`-backed ViT runtime path.
-- Real dataset directory layouts for CUB-200-2011, ImageNet-R, and OmniBenchmark.
-- Full training/evaluation throughput and long-run checkpoint behavior.
-- Whether the current heuristic thresholds need mild retuning once real benchmark evidence is available.
+
+- ViT-B/16-IN21K runtime path with `timm`
+- dataset path/layout details on the real server
+- long continual runs and checkpoint stress behavior
+- exact determinism limits under real CUDA and multi-worker dataloading
+
+## Validation run
+
+- `python -m compileall src tests`
+- `python -m unittest tests.test_config_summary tests.test_paper_alignment_units tests.test_synthetic_continual_smoke tests.test_checkpoint_resume`

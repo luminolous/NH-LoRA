@@ -35,45 +35,58 @@ def slot_orthogonality(model) -> torch.Tensor:
         live_slots = layer.live_slot_ids()
         if len(live_slots) <= 1:
             continue
-        signatures = torch.stack([layer.slot_update_signature(slot_id) for slot_id in live_slots], dim=0)
-        signatures = F.normalize(signatures, dim=-1)
-        gram = signatures @ signatures.t()
-        penalties.append((gram - torch.eye(gram.size(0), device=gram.device)).pow(2).mean())
+        for point_name in layer.selected_points:
+            factors = []
+            for slot_id in live_slots:
+                factor = layer.active_slot_a(slot_id, point_name)
+                factors.append(F.normalize(factor, dim=0))
+            for left_index in range(len(factors)):
+                for right_index in range(left_index + 1, len(factors)):
+                    overlap = factors[left_index] @ factors[right_index].transpose(0, 1)
+                    penalties.append(overlap.pow(2).mean())
     if not penalties:
         return torch.zeros((), device=device)
     return torch.stack(penalties).mean()
 
 
-def rank_penalty(model, raw_planner: Dict[int, object] | None, device: torch.device) -> torch.Tensor:
+def rank_penalty(model, device: torch.device) -> torch.Tensor:
     penalties = []
-    if raw_planner:
-        for signals in raw_planner.values():
-            penalties.append(signals.rank_score.mean())
     for layer in model.layers.values():
         for slot_id in layer.live_slot_ids():
-            rank_fraction = layer.slot_metadata[slot_id].rank / layer.slot_r_max
-            penalties.append(torch.tensor(rank_fraction, device=device))
+            mask = layer.active_rank_mask(slot_id, device=device)
+            penalties.append(mask.abs().sum())
     if not penalties:
         return torch.zeros((), device=device)
     return torch.stack(penalties).mean()
 
 
-def growth_penalty(raw_planner: Dict[int, object] | None, device: torch.device) -> torch.Tensor:
-    if not raw_planner:
+def growth_penalty(applied_plans: Dict[int, Dict[str, object]] | None, device: torch.device) -> torch.Tensor:
+    if not applied_plans:
         return torch.zeros((), device=device)
     penalties = []
-    for signals in raw_planner.values():
-        penalties.append((signals.novelty * signals.conflict).mean())
-    return torch.stack(penalties).mean() if penalties else torch.zeros((), device=device)
+    for plan in applied_plans.values():
+        penalties.append(torch.tensor(float(bool(plan.get("created_new_slot", False))), device=device))
+    if not penalties:
+        return torch.zeros((), device=device)
+    return torch.stack(penalties).mean()
 
 
 def routing_balance_loss(route_info: Dict[int, Dict[str, object]], device: torch.device) -> torch.Tensor:
     losses = []
     for layer_state in route_info.values():
-        weights = layer_state.get("routing_weights")
-        if weights is None or weights.numel() == 0:
+        distribution = layer_state.get("routing_distribution")
+        if distribution is None or distribution.numel() == 0:
             continue
-        losses.append((weights.mean(dim=0) - weights.mean()).pow(2).mean())
+        mean_distribution = distribution.mean(dim=0)
+        mean_distribution = mean_distribution / mean_distribution.sum().clamp_min(1e-8)
+        uniform = torch.full_like(mean_distribution, 1.0 / max(mean_distribution.numel(), 1))
+        losses.append(
+            torch.sum(
+                mean_distribution * (
+                    mean_distribution.clamp_min(1e-8).log() - uniform.clamp_min(1e-8).log()
+                )
+            )
+        )
     if not losses:
         return torch.zeros((), device=device)
     return torch.stack(losses).mean()

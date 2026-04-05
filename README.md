@@ -1,13 +1,25 @@
 # NH-LoRA
 
-Paper-oriented implementation of **NH-LoRA: Future-Aware Structural Expansion of Low-Rank Adapters for Rehearsal-Free Class-Incremental Learning**.
+Paper-aligned implementation of **NH-LoRA: Future-Aware Structural Expansion of Low-Rank Adapters for Rehearsal-Free Class-Incremental Learning**.
 
-The implementation follows the latest NH-LoRA design paper first, then the synced repo documents:
-- `SPEC.md`
-- `PLANS.md`
-- `IMPLEMENT.md`
-- `RUNS.md`
-- `PROMPT_CODEX_ID.md`
+This repository is organized to serve as the implementation-facing reference for NH-LoRA. The latest NH-LoRA design paper is the primary source of truth. Any remaining practical gaps or ambiguities are documented explicitly in [docs/paper_alignment.md](/C:/Users/Syauqi%20Nabil/research/self/NH-LoRA/docs/paper_alignment.md).
+
+## What Is Implemented
+
+- Frozen ViT backbone with configurable selected blocks and paper-consistent insertion points
+- Shared Core LoRA plus expandable task slot bank
+- Fixed-capacity prefix rank mask and additive rank expansion
+- Task-State Encoder from feature mean, feature variance, gradient sketch, similarity, and entropy
+- Layer-wise Horizon Planner with history-aware aggregation and explicit planner input `[z_t; h_t_tilde; |z_t-h_t_tilde|; z_t ⊙ h_t_tilde; e_l]`
+- Pure `materialize_action`, separate `apply_structure_changes`, and paper action semantics
+- Sparse cosine Instance Router over candidate slots
+- Incremental cosine classifier with prototype-based imprinting
+- Heuristic but explicit CHU decisions: merge, prune, keep, freeze
+- Bootstrap mode for task 1
+- Summary-only history bank
+- Rehearsal-free class-incremental training loop
+- Multi-seed metrics and summaries
+- Checkpoint save/load with resume state, RNG state, sampler state, and inference profile
 
 ## Repository Layout
 
@@ -21,6 +33,7 @@ src/
   engine/
   utils/
 tests/
+docs/
 outputs/
   logs/
   metrics/
@@ -28,52 +41,64 @@ outputs/
   checkpoints/
 ```
 
-## Implemented NH-LoRA Components
+## Core NH-LoRA Flow
 
-- Frozen Vision Transformer backbone wrapper
-- Shared Core LoRA
-- Expandable Task Slot Bank
-- Fixed-capacity dynamic rank mask
-- Task-State Encoder
-- Horizon Planner
-- Materialize Action
-- Instance Router
-- Incremental cosine classifier head
-- Consolidation and Homeostasis Unit
-- Bootstrap mode for task 1
-- History bank based on summary statistics
-- Rehearsal-free class-incremental training loop
-- Multi-seed metric summarization
+1. Warm-up sensing builds a temporary prototype-imprinted auxiliary head.
+2. TSE encodes the current task state from warm-up statistics.
+3. Horizon Planner produces raw per-layer signals.
+4. `materialize_action` converts raw signals into pure structural plans.
+5. `apply_structure_changes` mutates shared memory and slot bank explicitly.
+6. Task training uses the paper loss branch for task 1 or task > 1.
+7. CHU consolidates slot/shared memory after the task.
+8. The task summary is appended to the history bank.
+9. Post-consolidation inference profile is rebuilt for evaluation and future tasks.
 
-## Benchmark Support
+## Bootstrap Task 1
 
-- CIFAR-100 via a natural CIFAR-100 pickle adapter
-- CUB-200-2011 via metadata-aware benchmark-specific parsing
-- ImageNet-R via benchmark-specific folder parsing
-- OmniBenchmark via realm-wise benchmark-specific task building
+Task 1 is intentionally special:
 
-The engine contract is unified, but each benchmark adapter stays benchmark-specific where needed.
+- no history-aware similarity
+- no teacher
+- no KD
+- no feature retention
+- no growth penalty
+- bootstrap shared-dominant structure plus one bootstrap slot per selected block
+- light post-task consolidation followed by history-bank append
+
+## Evaluation Policy
+
+Evaluation does **not** use the old shortcut `all live slots + shared_gate=1.0`.
+
+The default inference profile is built post-consolidation per layer from:
+
+- latest consolidated shared gate
+- surviving non-pruned slots with `retained_for_inference=True`
+- usage ordering via `usage_ema` then `cumulative_usage`
+- router `top-k` restriction
+
+If the last structural action for a layer is `reuse_shared` or `freeze_old_strong_retention`, that layer defaults to shared-only inference.
+
+## Benchmarks
+
+- CIFAR-100
+- CUB-200-2011
+- ImageNet-R
+- OmniBenchmark
+
+Dataset adapters are unified at the engine boundary but remain benchmark-specific internally where the benchmark requires it.
 
 ## Local Validation
 
 Only lightweight validation is intended in this environment:
 
 ```bash
-python -m unittest tests.test_config_summary
-python -m unittest tests.test_synthetic_continual_smoke
+python -m compileall src tests
+python -m unittest tests.test_config_summary tests.test_paper_alignment_units tests.test_synthetic_continual_smoke tests.test_checkpoint_resume
 ```
 
-The synthetic continual smoke test checks:
-- task 1 bootstrap mode without teacher or history-aware similarity
-- task-state creation
-- bootstrap slot materialization
-- task 2 planning/materialization/routing/classifier expansion
-- CHU invocation
-- history bank growth
+## Run On SSH
 
-## Running On The SSH Server
-
-Set the dataset paths in each benchmark config first, then run:
+Set dataset paths in the benchmark YAML files, then run:
 
 ```bash
 bash scripts/run_cifar100.sh
@@ -82,22 +107,22 @@ bash scripts/run_imagenet_r.sh
 bash scripts/run_omnibenchmark.sh
 ```
 
-Or run all:
+Direct CLI usage:
 
 ```bash
-bash scripts/run_all.sh
+python -m src.engine.train --config configs/cifar100.yaml --seed 1 --benchmark cifar100 --output-root outputs
+python -m src.engine.train --config configs/cifar100.yaml --seed 1 --benchmark cifar100 --output-root outputs --resume outputs/checkpoints/cifar100/latest.pt
 ```
 
-Use `nohup`, `tmux`, or `screen` on the SSH machine for long experiments. Logs are written to `outputs/logs/`, raw metrics to `outputs/metrics/`, summaries to `outputs/summaries/`, and lightweight checkpoints to `outputs/checkpoints/`.
+Outputs:
 
-## Backbone Runtime Note
+- logs: `outputs/logs/`
+- raw metrics: `outputs/metrics/`
+- summaries: `outputs/summaries/`
+- checkpoints: `outputs/checkpoints/`
 
-Default benchmark configs target `timm` for ViT-B/16-IN21K on the SSH machine. Local smoke tests should use the internal toy ViT path instead of requiring `timm`.
+## Notes
 
-## Status Tracking
-
-Development progress and assumptions are tracked in:
-
-```text
-outputs/logs/dev_status.md
-```
+- Local smoke tests use the internal toy ViT path.
+- Full ViT-B/16-IN21K validation still belongs on the SSH machine with `timm`.
+- Development status is tracked in [outputs/logs/dev_status.md](/C:/Users/Syauqi%20Nabil/research/self/NH-LoRA/outputs/logs/dev_status.md).
