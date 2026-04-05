@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import logging
+import os
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -177,6 +179,36 @@ class _DummyModel(nn.Module):
 
 
 class PaperAlignmentUnitTests(unittest.TestCase):
+    def test_dynamic_slot_params_follow_layer_device(self):
+        target_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        layer = NHLoRALayer(
+            embed_dim=8,
+            selected_points=["q_proj"],
+            shared_rank=2,
+            slot_r_max=4,
+            slot_init_rank=1,
+            bootstrap_slot_rank=1,
+            max_slots=2,
+            router_topk=1,
+            router_temperature=1.0,
+            task_embedding_dim=8,
+        ).to(target_device)
+        slot_id = layer.add_slot(initial_rank=1, task_id=1)
+
+        self.assertEqual(layer.slot_keys[slot_id].device, layer.query_proj.weight.device)
+        bank = layer.point_banks["q_proj"]
+        self.assertEqual(bank.slot_a[slot_id].device, target_device)
+        self.assertEqual(bank.slot_b[slot_id].device, target_device)
+
+        hidden_states = torch.randn(2, 5, 8, device=target_device)
+        delta = layer._slot_delta(
+            "q_proj",
+            hidden_states,
+            route_state={"candidate_slots": [slot_id]},
+            planner_cfg={"rank_cfg": {slot_id: 1}},
+        )
+        self.assertEqual(delta.device, hidden_states.device)
+
     def test_planner_input_contains_all_terms(self):
         planner = HorizonPlanner(
             selected_blocks=[0],
@@ -242,6 +274,7 @@ class PaperAlignmentUnitTests(unittest.TestCase):
         self.assertEqual(materialized.candidate_slots, [])
 
     def test_apply_structure_changes_mutates_and_freezes(self):
+        target_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         layer = NHLoRALayer(
             embed_dim=8,
             selected_points=["q_proj"],
@@ -252,7 +285,8 @@ class PaperAlignmentUnitTests(unittest.TestCase):
             max_slots=2,
             router_topk=1,
             router_temperature=1.0,
-        )
+            task_embedding_dim=8,
+        ).to(target_device)
         open_plan = MaterializedLayerPlan(
             requested_action="open_new_slot",
             action="open_new_slot",
@@ -262,9 +296,11 @@ class PaperAlignmentUnitTests(unittest.TestCase):
             create_new_slot=True,
             new_slot_rank=2,
         )
-        runtime = layer.apply_structure_change(open_plan, torch.randn(1, 8), task_id=1)
+        runtime = layer.apply_structure_change(open_plan, torch.randn(1, 8, device=target_device), task_id=1)
         self.assertEqual(len(layer.slot_metadata), 1)
         self.assertTrue(runtime["created_new_slot"])
+        self.assertEqual(layer.slot_keys[0].device, target_device)
+        self.assertEqual(layer.point_banks["q_proj"].slot_a[0].device, target_device)
 
         freeze_plan = MaterializedLayerPlan(
             requested_action="freeze_old_strong_retention",
@@ -277,9 +313,45 @@ class PaperAlignmentUnitTests(unittest.TestCase):
             strong_retention=True,
             shared_only=True,
         )
-        frozen_runtime = layer.apply_structure_change(freeze_plan, torch.randn(1, 8), task_id=2)
+        frozen_runtime = layer.apply_structure_change(freeze_plan, torch.randn(1, 8, device=target_device), task_id=2)
         self.assertTrue(layer.slot_metadata[0].frozen)
         self.assertEqual(frozen_runtime["active_slot_candidates"], [])
+
+    def test_load_structure_state_keeps_dynamic_params_on_layer_device(self):
+        target_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        layer = NHLoRALayer(
+            embed_dim=8,
+            selected_points=["q_proj"],
+            shared_rank=2,
+            slot_r_max=4,
+            slot_init_rank=1,
+            bootstrap_slot_rank=1,
+            max_slots=2,
+            router_topk=1,
+            router_temperature=1.0,
+            task_embedding_dim=8,
+        ).to(target_device)
+        slot_id = layer.add_slot(initial_rank=2, task_id=1)
+        layer.initialize_slot_key(slot_id, torch.randn(1, 8, device=target_device))
+        state = layer.export_structure_state()
+
+        restored = NHLoRALayer(
+            embed_dim=8,
+            selected_points=["q_proj"],
+            shared_rank=2,
+            slot_r_max=4,
+            slot_init_rank=1,
+            bootstrap_slot_rank=1,
+            max_slots=2,
+            router_topk=1,
+            router_temperature=1.0,
+            task_embedding_dim=8,
+        ).to(target_device)
+        restored.load_structure_state(state)
+
+        self.assertEqual(restored.slot_keys[0].device, target_device)
+        self.assertEqual(restored.point_banks["q_proj"].slot_a[0].device, target_device)
+        self.assertEqual(restored.point_banks["q_proj"].slot_b[0].device, target_device)
 
     def test_slot_full_fallback_uses_compatible_existing_slot(self):
         layer = NHLoRALayer(
@@ -407,6 +479,16 @@ class PaperAlignmentUnitTests(unittest.TestCase):
         self.assertAlmostEqual(float(losses["kd"].item()), 0.0, places=7)
         self.assertAlmostEqual(float(losses["feat"].item()), 0.0, places=7)
         self.assertAlmostEqual(float(losses["grow"].item()), 0.0, places=7)
+
+    def test_logger_can_disable_file_handler_for_tee_mode(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        log_path = repo_root / "outputs" / "test_tmp" / "logger_tee" / "tee.log"
+        if log_path.exists():
+            log_path.unlink()
+        with patch.dict(os.environ, {"NH_LORA_DISABLE_FILE_LOG": "1"}):
+            logger = configure_logger(log_file=log_path, level=logging.WARNING)
+        self.assertFalse(any(isinstance(handler, logging.FileHandler) for handler in logger.handlers))
+        self.assertFalse(log_path.exists())
 
 
 if __name__ == "__main__":

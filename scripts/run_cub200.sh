@@ -14,12 +14,12 @@ for SEED in "${SEEDS[@]}"; do
   LOG_FILE="outputs/logs/${BENCHMARK}_seed${SEED}_${TIMESTAMP}.log"
   echo "[INFO] Seed ${SEED} -> ${LOG_FILE}"
 
-  python -m src.engine.train \
+  PYTHONUNBUFFERED=1 NH_LORA_DISABLE_FILE_LOG=1 python -m src.engine.train \
     --config "${CONFIG}" \
     --seed "${SEED}" \
     --benchmark "${BENCHMARK}" \
     --output-root outputs \
-    >> "${LOG_FILE}" 2>&1
+    2>&1 | tee "${LOG_FILE}"
 
 done
 

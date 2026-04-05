@@ -106,14 +106,12 @@ The design paper is the primary source of truth. When paper detail was ambiguous
   - [src/engine/trainer.py](/C:/Users/Syauqi%20Nabil/research/self/NH-LoRA/src/engine/trainer.py)
   - `NHLoRATrainer._evaluate_up_to`
 
-### Checkpointing And Resume
+### Final Model Artifact
 
 - Code:
   - [src/utils/checkpoint.py](/C:/Users/Syauqi%20Nabil/research/self/NH-LoRA/src/utils/checkpoint.py)
-  - [src/utils/sampler.py](/C:/Users/Syauqi%20Nabil/research/self/NH-LoRA/src/utils/sampler.py)
   - [src/engine/trainer.py](/C:/Users/Syauqi%20Nabil/research/self/NH-LoRA/src/engine/trainer.py)
-  - `NHLoRATrainer.save_checkpoint`
-  - `NHLoRATrainer.load_checkpoint`
+  - `NHLoRATrainer._save_final_model_artifact`
   - [src/engine/train.py](/C:/Users/Syauqi%20Nabil/research/self/NH-LoRA/src/engine/train.py)
 
 ## Final Slot Compatibility Definition
@@ -172,34 +170,24 @@ This policy is implemented in [src/models/nh_lora.py](/C:/Users/Syauqi%20Nabil/r
 - Status: this is the most paper-faithful choice available in the current discrete structure design.
 - Important note: because active rank changes through planning and structural mutation, `L_rank` can become near-constant during a task and may act more like a structural cost than a strong optimizer-driving signal.
 
-## Resume Guarantees And Limits
+## Final Artifact Policy
 
-Checkpoint payload includes:
+The runtime no longer writes periodic training checkpoints or exposes resume support.
 
-- model state
-- planner state
-- task-state encoder state
-- classifier state
-- shared/slot structure state
-- history bank state
-- trainer state: current task, epoch, global step, step in epoch, sampler state
-- current task context
-- RNG state for Python, NumPy, Torch CPU, and Torch CUDA when available
-- config snapshot
-- metrics summary
-- latest inference profile
+Instead, when `experiment.save_checkpoints=true`, the repository writes exactly one lightweight final model artifact per seed-run:
 
-Deterministic resume policy:
+- `outputs/checkpoints/<benchmark>/<benchmark>_seed<seed>_final.pt`
 
-- train loaders use a stateful permutation sampler
-- mid-epoch resume restores sampler permutation and position
-- resume restores global step and step-in-epoch
+The final artifact contains:
 
-Limits:
+- `model_state`
+- `model_structure_state`
+- `inference_profile`
+- `benchmark`
+- `seed`
+- `final_metrics`
 
-- the repository targets deterministic resume as closely as possible in the current setup
-- exact determinism can still depend on backend behavior, CUDA kernels, and multi-worker dataloader timing outside the scope of this lightweight environment
-- because this local environment did not run long real benchmarks, deterministic guarantees are validated only through lightweight resume tests
+It intentionally does not contain optimizer state, scheduler state, current-task context, or large periodic snapshot history.
 
 ## Remaining Gaps
 

@@ -2,6 +2,12 @@
 
 ## Latest updates
 
+- Removed periodic checkpoint writing from the runtime after SSH logs showed failures inside `torch.save(...)` during `_auto_checkpoint`.
+- Simplified runtime artifact behavior to one lightweight final model file per seed-run, with no `latest.pt`, no per-epoch snapshots, and no resume flow.
+- Updated benchmark runner scripts to stream logs live with `tee` while saving the same output to `outputs/logs/`, which is more notebook-friendly.
+- Fixed the GPU SSH crash caused by dynamic NH-LoRA slot parameters being created on CPU while the active model and hidden states were already on CUDA.
+- Closed the same device-placement risk for `load_structure_state` and dynamic structure restore paths by rebuilding dynamic slot tensors on the current layer device and dtype.
+- Added test guards for dynamic slot creation, structure restore, and final-artifact consistency.
 - Completed the official paper-alignment implementation pass focused on correctness first, then robustness and documentation.
 - Rebuilt the training engine around the explicit paper flow:
   - warm-up sensing
@@ -12,7 +18,7 @@
   - CHU consolidation
   - history append
   - post-consolidation inference profile
-- Added save/load checkpoint support with resume state, RNG state, sampler state, and current task context.
+- Replaced the old save/resume runtime path with a lighter final-artifact-only policy.
 - Updated tests so critical NH-LoRA behaviors are validated directly.
 
 ## Files changed in this pass
@@ -55,12 +61,15 @@
 - Warm-up sensing now uses a temporary prototype-imprinted auxiliary head and produces task-state statistics used by TSE.
 - Slot compatibility is now defined consistently as cosine similarity between normalized task embedding and normalized slot key.
 - Slot keys now live in task-embedding space, matching the official compatibility definition.
+- Dynamic slot adapters and slot keys now inherit device and dtype from the active NH-LoRA layer instead of defaulting to CPU during runtime growth.
+- Structure restore now rebuilds slot tensors on the current layer device, reducing dynamic restore CPU/CUDA mismatch risk.
 - `L_orth` is now based on active low-rank factors.
 - `L_rank` is now based on realized active-rank masks, not planner scores.
 - `L_grow` is now based on actual slot opening events.
 - `L_route` now uses `KL(mean routing distribution || uniform)`.
 - Eval/inference no longer uses the old shortcut `all live slots + shared_gate=1.0`.
-- Checkpoint/resume now restores model/planner/TSE/history/inference profile plus trainer and RNG state.
+- Runtime storage now saves only one final model artifact per seed-run.
+- Notebook-oriented benchmark scripts now show live logs while preserving full log files.
 
 ### Still approximation
 
@@ -72,7 +81,7 @@
 
 - Real dataset layouts for CUB-200-2011, ImageNet-R, and OmniBenchmark
 - Full benchmark throughput and long-run training
-- Real multi-worker or CUDA-heavy resume determinism
+- Real benchmark throughput with only final model artifact retention
 
 ## Completed
 
@@ -86,12 +95,12 @@
   - paper-target losses
   - inference policy replacement
 - PASS 2:
-  - checkpoint/resume wiring
+  - final model artifact wiring
   - scheduler activation
   - efficiency metrics in trainer output
   - README update
   - paper alignment documentation
-  - checkpoint/resume test coverage
+  - final artifact test coverage
 
 ## Pending
 
@@ -105,13 +114,14 @@
 - Heuristic CHU is acceptable because the paper allows it.
 - The chosen inference policy is the most conservative operationalization under paper ambiguity.
 - `L_rank` remains realized-mask based even when its optimizer signal is weak, because that is more paper-faithful than reverting to planner-score surrogates.
+- The runtime no longer supports training resume by design; storage pressure was prioritized over resume capability.
 
 ## Risks to verify later on SSH
 
 - ViT-B/16-IN21K runtime path with `timm`
 - dataset path/layout details on the real server
-- long continual runs and checkpoint stress behavior
-- exact determinism limits under real CUDA and multi-worker dataloading
+- long continual runs with the new final-artifact-only policy
+- notebook output truncation limits in the UI when logs are very long
 
 ## Validation run
 

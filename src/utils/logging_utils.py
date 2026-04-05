@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 
@@ -17,7 +18,8 @@ def configure_logger(log_file: str | Path | None = None, level: int = logging.IN
     stream_handler.setFormatter(formatter)
     logger.addHandler(stream_handler)
 
-    if log_file is not None:
+    disable_file_log = str(os.getenv("NH_LORA_DISABLE_FILE_LOG", "")).lower() in {"1", "true", "yes"}
+    if log_file is not None and not disable_file_log:
         Path(log_file).parent.mkdir(parents=True, exist_ok=True)
         file_handler = logging.FileHandler(log_file, encoding="utf-8")
         file_handler.setFormatter(formatter)
@@ -25,4 +27,3 @@ def configure_logger(log_file: str | Path | None = None, level: int = logging.IN
 
     logger.propagate = False
     return logger
-

@@ -19,7 +19,7 @@ This repository is organized to serve as the implementation-facing reference for
 - Summary-only history bank
 - Rehearsal-free class-incremental training loop
 - Multi-seed metrics and summaries
-- Checkpoint save/load with resume state, RNG state, sampler state, and inference profile
+- One lightweight final model artifact per seed-run
 
 ## Repository Layout
 
@@ -111,7 +111,6 @@ Direct CLI usage:
 
 ```bash
 python -m src.engine.train --config configs/cifar100.yaml --seed 1 --benchmark cifar100 --output-root outputs
-python -m src.engine.train --config configs/cifar100.yaml --seed 1 --benchmark cifar100 --output-root outputs --resume outputs/checkpoints/cifar100/latest.pt
 ```
 
 Outputs:
@@ -119,10 +118,11 @@ Outputs:
 - logs: `outputs/logs/`
 - raw metrics: `outputs/metrics/`
 - summaries: `outputs/summaries/`
-- checkpoints: `outputs/checkpoints/`
+- final model artifact: `outputs/checkpoints/<benchmark>/<benchmark>_seed<seed>_final.pt`
 
 ## Notes
 
 - Local smoke tests use the internal toy ViT path.
 - Full ViT-B/16-IN21K validation still belongs on the SSH machine with `timm`.
+- Benchmark runner scripts stream logs live to notebook output and save the same stream to `outputs/logs/`.
 - Development status is tracked in [outputs/logs/dev_status.md](/C:/Users/Syauqi%20Nabil/research/self/NH-LoRA/outputs/logs/dev_status.md).

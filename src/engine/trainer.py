@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import time
 from copy import deepcopy
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -33,19 +32,11 @@ from src.models.task_state import (
     TaskStateEncoder,
     build_history_entry,
     build_history_summary_vector,
-    deserialize_task_state,
     detach_task_state,
     pool_vector,
-    serialize_task_state,
 )
-from src.utils.checkpoint import (
-    capture_rng_state,
-    load_checkpoint as load_checkpoint_file,
-    restore_rng_state,
-    save_checkpoint as save_checkpoint_file,
-)
+from src.utils.checkpoint import save_model_artifact
 from src.utils.io import ensure_output_dirs
-from src.utils.sampler import StatefulIndexSampler
 
 
 class NHLoRATrainer:
@@ -89,9 +80,6 @@ class NHLoRATrainer:
         self.chu = ConsolidationHomeostasisUnit(config["chu"])
         self.history_bank = HistoryBank()
         self.inference_profile = self.model.build_inference_profile()
-        self.current_task_context: Dict[str, Any] | None = None
-        self.current_optimizer = None
-        self.current_scheduler = None
 
         self.task_metrics: List[Dict[str, Any]] = []
         self.accuracy_matrix: List[List[float]] = []
@@ -115,15 +103,12 @@ class NHLoRATrainer:
             "task_states": [],
             "task2_actions": {},
             "eval_shared_only_layers": [],
-            "last_checkpoint_path": None,
+            "last_model_artifact_path": None,
         }
         self.training_state: Dict[str, Any] = {
             "seed": None,
             "current_task_id": 0,
-            "epoch": 0,
             "global_step": 0,
-            "step_in_epoch": 0,
-            "sampler_state": None,
         }
 
     def _resolve_device(self, requested_device: str) -> torch.device:
@@ -171,21 +156,17 @@ class NHLoRATrainer:
             raise ValueError(f"Unsupported scheduler: {scheduler_name}")
         return CosineAnnealingLR(optimizer, T_max=max(int(training_cfg["epochs_per_task"]), 1))
 
-    def _build_train_loader(self, dataset, task_id: int, epoch: int, sampler_state=None):
+    def _build_train_loader(self, dataset):
         runtime_cfg = self.config["runtime"]
-        seed = int(self.training_state["seed"] or 0) + task_id * 10_000 + epoch
-        sampler = StatefulIndexSampler(len(dataset), shuffle=True, seed=seed)
-        if sampler_state is not None:
-            sampler.load_state_dict(sampler_state)
         loader = DataLoader(
             dataset,
             batch_size=int(self.config["training"]["batch_size"]),
-            sampler=sampler,
+            shuffle=True,
             num_workers=int(runtime_cfg["num_workers"]),
             pin_memory=bool(runtime_cfg.get("pin_memory", False)),
             persistent_workers=bool(runtime_cfg.get("persistent_workers", False)) and int(runtime_cfg["num_workers"]) > 0,
         )
-        return loader, sampler
+        return loader
 
     def _build_eval_loader(self, dataset):
         runtime_cfg = self.config["runtime"]
@@ -541,31 +522,17 @@ class NHLoRATrainer:
         task_index = task_definition.task_id
         optimizer = context["optimizer"]
         scheduler = context["scheduler"]
-        self.current_optimizer = optimizer
-        self.current_scheduler = scheduler
         train_dataset, _ = self.benchmark.build_task_datasets(task_index)
         epochs_per_task = int(self.config["training"]["epochs_per_task"])
         grad_clip_norm = float(self.config["training"]["grad_clip_norm"])
 
-        epoch_start = int(self.training_state["epoch"])
-        sampler_state = deepcopy(self.training_state.get("sampler_state"))
         usage_accumulator: Dict[int, Dict[int, float]] = {}
         batch_count = 0
         loss_history = []
         start_time = time.perf_counter()
 
-        for epoch in range(epoch_start, epochs_per_task):
-            train_loader, sampler = self._build_train_loader(
-                train_dataset,
-                task_id=task_index,
-                epoch=epoch,
-                sampler_state=sampler_state,
-            )
-            self.training_state["epoch"] = epoch
-            self.training_state["step_in_epoch"] = 0 if sampler_state is None else int(self.training_state["step_in_epoch"])
-            self.training_state["sampler_state"] = sampler.state_dict()
-            sampler_state = None
-
+        for _epoch in range(epochs_per_task):
+            train_loader = self._build_train_loader(train_dataset)
             self.model.train()
             self.planner.train()
             self.task_state_encoder.train()
@@ -586,19 +553,12 @@ class NHLoRATrainer:
                 if outputs["route_info"]:
                     self.last_train_state["router_seen"] = True
 
-                batch_size = int(labels.size(0))
-                sampler.mark_consumed(batch_size)
-                self.training_state["sampler_state"] = sampler.state_dict()
                 self.training_state["global_step"] += 1
-                self.training_state["step_in_epoch"] += 1
                 batch_count += 1
                 loss_history.append(float(losses["total"].detach().item()))
 
             if scheduler is not None:
                 scheduler.step()
-            self.training_state["step_in_epoch"] = 0
-            self.training_state["sampler_state"] = None
-            self._auto_checkpoint(task_definition.task_id, epoch + 1)
 
         usage_stats = self._finalize_usage(usage_accumulator, batch_count)
         for block_id, stats in usage_stats.items():
@@ -635,9 +595,6 @@ class NHLoRATrainer:
         self.task_metrics.append(metrics)
         self.accuracy_matrix.append(eval_metrics["per_task_acc"])
         self.total_train_time += task_train_time
-        self.training_state["epoch"] = 0
-        self.training_state["step_in_epoch"] = 0
-        self.training_state["sampler_state"] = None
         return metrics
 
     def _run_consolidation(self, context: Dict[str, Any], usage_stats: Dict[int, Dict[int, float]]) -> Dict[str, int]:
@@ -741,189 +698,34 @@ class NHLoRATrainer:
             nh_elapsed = max(time.perf_counter() - nh_start, 1e-8)
         return nh_elapsed / base_elapsed
 
-    def _serialize_planner_signals(self, raw_planner: Dict[int, PlannerSignals]) -> Dict[int, Dict[str, Any]]:
-        payload = {}
-        for block_id, signals in raw_planner.items():
-            payload[int(block_id)] = {
-                "novelty": signals.novelty.detach(),
-                "conflict": signals.conflict.detach(),
-                "rank_score": signals.rank_score.detach(),
-                "rank_budget": int(signals.rank_budget),
-                "consolidate": signals.consolidate.detach(),
-                "shared_gate": signals.shared_gate.detach(),
-                "history_attention": None if signals.history_attention is None else signals.history_attention.detach(),
-                "history_context": None if signals.history_context is None else signals.history_context.detach(),
-                "planner_input": None if signals.planner_input is None else signals.planner_input.detach(),
-                "planner_representation": None if signals.planner_representation is None else signals.planner_representation.detach(),
-            }
-        return payload
-
-    def _deserialize_planner_signals(self, payload: Dict[int, Dict[str, Any]]) -> Dict[int, PlannerSignals]:
-        restored = {}
-        for block_id, signals in payload.items():
-            restored[int(block_id)] = PlannerSignals(
-                novelty=signals["novelty"],
-                conflict=signals["conflict"],
-                rank_score=signals["rank_score"],
-                rank_budget=int(signals["rank_budget"]),
-                consolidate=signals["consolidate"],
-                shared_gate=signals["shared_gate"],
-                history_attention=signals.get("history_attention"),
-                history_context=signals.get("history_context"),
-                planner_input=signals.get("planner_input"),
-                planner_representation=signals.get("planner_representation"),
-            )
-        return restored
-
-    def _serialize_materialized_plans(self, plans: Dict[int, MaterializedLayerPlan]) -> Dict[int, Dict[str, Any]]:
-        return {int(block_id): asdict(plan) for block_id, plan in plans.items()}
-
-    def _deserialize_materialized_plans(self, payload: Dict[int, Dict[str, Any]]) -> Dict[int, MaterializedLayerPlan]:
+    def _final_model_artifact_payload(self, seed: int, final_metrics: Dict[str, Any]) -> Dict[str, Any]:
         return {
-            int(block_id): MaterializedLayerPlan(**plan_dict)
-            for block_id, plan_dict in payload.items()
-        }
-
-    def _serialize_current_task_context(self) -> Dict[str, Any] | None:
-        if self.current_task_context is None:
-            return None
-        context = self.current_task_context
-        teacher_model = context.get("teacher_model")
-        teacher_payload = None
-        if teacher_model is not None:
-            teacher_payload = {
-                "structure_state": teacher_model.export_structure_state(),
-                "model_state": teacher_model.state_dict(),
-                "inference_profile": context.get("teacher_profile"),
-            }
-        return {
-            "task_id": int(context["task_definition"].task_id),
-            "task_number": int(context["task_number"]),
-            "task_state": serialize_task_state(context["task_state"]),
-            "raw_planner": self._serialize_planner_signals(context["raw_planner"]),
-            "materialized_plans": self._serialize_materialized_plans(context["materialized_plans"]),
-            "applied_plans": deepcopy(context["applied_plans"]),
-            "strong_retention_layers": sorted(int(layer_id) for layer_id in context["strong_retention_layers"]),
-            "optimizer_state": None if context["optimizer"] is None else context["optimizer"].state_dict(),
-            "scheduler_state": None if context["scheduler"] is None else context["scheduler"].state_dict(),
-            "teacher_payload": teacher_payload,
-            "warmup_info": deepcopy(context["warmup_info"]),
-        }
-
-    def _restore_current_task_context(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        task_definition = self.benchmark.tasks[int(payload["task_id"])]
-        optimizer = self._build_optimizer()
-        scheduler = self._build_scheduler(optimizer)
-        if payload.get("optimizer_state") is not None:
-            optimizer.load_state_dict(payload["optimizer_state"])
-        if scheduler is not None and payload.get("scheduler_state") is not None:
-            scheduler.load_state_dict(payload["scheduler_state"])
-
-        teacher_model = None
-        teacher_profile = None
-        teacher_payload = payload.get("teacher_payload")
-        if teacher_payload is not None:
-            teacher_model = NHLoRAModel(self.config).to(self.device)
-            teacher_model.load_structure_state(teacher_payload["structure_state"])
-            teacher_model.load_state_dict(teacher_payload["model_state"])
-            teacher_model.eval()
-            for parameter in teacher_model.parameters():
-                parameter.requires_grad = False
-            teacher_profile = teacher_payload["inference_profile"]
-
-        return {
-            "task_definition": task_definition,
-            "task_number": int(payload["task_number"]),
-            "task_state": detach_task_state(deserialize_task_state(payload["task_state"])),
-            "raw_planner": self._deserialize_planner_signals(payload["raw_planner"]),
-            "materialized_plans": self._deserialize_materialized_plans(payload["materialized_plans"]),
-            "applied_plans": payload["applied_plans"],
-            "teacher_model": teacher_model,
-            "teacher_profile": teacher_profile,
-            "strong_retention_layers": set(int(layer_id) for layer_id in payload["strong_retention_layers"]),
-            "optimizer": optimizer,
-            "scheduler": scheduler,
-            "warmup_info": payload["warmup_info"],
-        }
-
-    def _checkpoint_payload(self) -> Dict[str, Any]:
-        return {
-            "model_structure_state": self.model.export_structure_state(),
+            "benchmark": self.benchmark.name,
+            "seed": int(seed),
             "model_state": self.model.state_dict(),
-            "planner_state": self.planner.state_dict(),
-            "task_state_encoder_state": self.task_state_encoder.state_dict(),
-            "classifier_state": self.model.classifier.state_dict(),
-            "history_bank_state": self.history_bank.state_dict(),
-            "trainer_state": deepcopy(self.training_state),
-            "current_task_context": self._serialize_current_task_context(),
-            "rng_state": capture_rng_state(),
-            "config_snapshot": deepcopy(self.config),
-            "metrics_summary": {
-                "task_metrics": deepcopy(self.task_metrics),
-                "accuracy_matrix": deepcopy(self.accuracy_matrix),
-                "total_train_time": float(self.total_train_time),
-                "last_train_state": deepcopy(self.last_train_state),
-            },
+            "model_structure_state": self.model.export_structure_state(),
             "inference_profile": deepcopy(self.inference_profile),
+            "final_metrics": deepcopy(final_metrics),
         }
 
-    def save_checkpoint(self, name: str = "latest.pt", output_path: str | Path | None = None) -> Path:
-        if output_path is None:
-            output_path = Path(self.output_dirs["benchmark_checkpoints"]) / name
-        output_path = Path(output_path)
-        payload = self._checkpoint_payload()
-        save_checkpoint_file(payload, output_path)
-        self.last_train_state["last_checkpoint_path"] = str(output_path)
-        return output_path
-
-    def load_checkpoint(self, checkpoint_path: str | Path) -> None:
-        payload = load_checkpoint_file(checkpoint_path, map_location=self.device)
-        self.model.load_structure_state(payload["model_structure_state"])
-        self.model.load_state_dict(payload["model_state"])
-        self.planner.load_state_dict(payload["planner_state"])
-        self.task_state_encoder.load_state_dict(payload["task_state_encoder_state"])
-        self.model.classifier.load_state_dict(payload["classifier_state"])
-        self.history_bank.load_state_dict(payload["history_bank_state"])
-        self.training_state = payload["trainer_state"]
-        self.inference_profile = payload["inference_profile"]
-        self.task_metrics = payload["metrics_summary"]["task_metrics"]
-        self.accuracy_matrix = payload["metrics_summary"]["accuracy_matrix"]
-        self.total_train_time = float(payload["metrics_summary"]["total_train_time"])
-        self.last_train_state = payload["metrics_summary"]["last_train_state"]
-        restore_rng_state(payload["rng_state"])
-        current_task_context = payload.get("current_task_context")
-        if current_task_context is not None:
-            self.current_task_context = self._restore_current_task_context(current_task_context)
-            self.current_optimizer = self.current_task_context["optimizer"]
-            self.current_scheduler = self.current_task_context["scheduler"]
-        else:
-            self.current_task_context = None
-            self.current_optimizer = None
-            self.current_scheduler = None
-
-    def _auto_checkpoint(self, task_id: int, epoch: int) -> None:
+    def _save_final_model_artifact(self, seed: int, final_metrics: Dict[str, Any]) -> Path | None:
         if not bool(self.config["experiment"].get("save_checkpoints", False)):
-            return
-        checkpoint_name = f"task{task_id + 1}_epoch{epoch}.pt"
-        self.save_checkpoint(name=checkpoint_name)
-        self.save_checkpoint(name="latest.pt")
+            self.last_train_state["last_model_artifact_path"] = None
+            return None
+        output_path = Path(self.output_dirs["benchmark_checkpoints"]) / f"{self.benchmark.name}_seed{seed}_final.pt"
+        payload = self._final_model_artifact_payload(seed=seed, final_metrics=final_metrics)
+        save_model_artifact(payload, output_path)
+        self.last_train_state["last_model_artifact_path"] = str(output_path)
+        return output_path
 
     def train(self, seed: int) -> Dict[str, Any]:
         if self.training_state["seed"] is None:
             self.training_state["seed"] = int(seed)
 
         for task_index in range(int(self.training_state["current_task_id"]), len(self.benchmark.tasks)):
-            if self.current_task_context is not None and self.current_task_context["task_definition"].task_id == task_index:
-                context = self.current_task_context
-            else:
-                context = self._prepare_task_context(self.benchmark.tasks[task_index])
-                self.current_task_context = context
+            context = self._prepare_task_context(self.benchmark.tasks[task_index])
             metrics = self._train_single_task(context)
-            self.current_task_context = None
-            self.current_optimizer = None
-            self.current_scheduler = None
             self.training_state["current_task_id"] = task_index + 1
-            self.save_checkpoint(name="latest.pt")
             self.logger.info(
                 "Finished task %d | avg_acc=%.4f | active_rank=%d",
                 context["task_number"],
@@ -932,7 +734,7 @@ class NHLoRATrainer:
             )
 
         final_avg_acc = self.task_metrics[-1]["avg_acc"] if self.task_metrics else 0.0
-        return {
+        final_metrics = {
             "benchmark": self.benchmark.name,
             "final_avg_acc": final_avg_acc,
             "opened_slots": sum(metric["opened_slots"] for metric in self.task_metrics),
@@ -944,3 +746,5 @@ class NHLoRATrainer:
             "task_metrics": deepcopy(self.task_metrics),
             "accuracy_matrix": deepcopy(self.accuracy_matrix),
         }
+        self._save_final_model_artifact(seed=seed, final_metrics=final_metrics)
+        return final_metrics

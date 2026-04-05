@@ -167,7 +167,7 @@ class SyntheticContinualSmokeTest(unittest.TestCase):
         seed_everything(7, deterministic=True)
         benchmark = build_synthetic_benchmark()
         repo_root = Path(__file__).resolve().parents[1]
-        workspace_tmp = repo_root / "outputs" / "test_tmp" / "synthetic_smoke"
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "synthetic_smoke_runtime"
         workspace_tmp.mkdir(parents=True, exist_ok=True)
         config = build_test_config(str(workspace_tmp))
         logger = configure_logger(level=logging.WARNING)

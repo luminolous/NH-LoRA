@@ -40,9 +40,27 @@ class ProjectionBank(nn.Module):
         self.slot_a = nn.ParameterList()
         self.slot_b = nn.ParameterList()
 
-    def add_slot(self) -> int:
-        slot_a = nn.Parameter(torch.empty(self.slot_r_max, self.input_dim))
-        slot_b = nn.Parameter(torch.empty(self.output_dim, self.slot_r_max))
+    def current_device_dtype(self) -> tuple[torch.device, torch.dtype]:
+        return self.shared_a.device, self.shared_a.dtype
+
+    def add_slot(self, device: torch.device | None = None, dtype: torch.dtype | None = None) -> int:
+        current_device, current_dtype = self.current_device_dtype()
+        slot_a = nn.Parameter(
+            torch.empty(
+                self.slot_r_max,
+                self.input_dim,
+                device=device or current_device,
+                dtype=dtype or current_dtype,
+            )
+        )
+        slot_b = nn.Parameter(
+            torch.empty(
+                self.output_dim,
+                self.slot_r_max,
+                device=device or current_device,
+                dtype=dtype or current_dtype,
+            )
+        )
         nn.init.kaiming_uniform_(slot_a, a=5**0.5)
         nn.init.zeros_(slot_b)
         self.slot_a.append(slot_a)
@@ -142,6 +160,9 @@ class NHLoRALayer(nn.Module):
         self.last_structural_action = "reuse_shared"
         self.last_consolidate_flag = False
 
+    def _current_device_dtype(self) -> tuple[torch.device, torch.dtype]:
+        return self.query_proj.weight.device, self.query_proj.weight.dtype
+
     def export_structure_state(self) -> Dict[str, object]:
         return {
             "slot_metadata": [
@@ -164,6 +185,7 @@ class NHLoRALayer(nn.Module):
         }
 
     def load_structure_state(self, state: Dict[str, object]) -> None:
+        layer_device, layer_dtype = self._current_device_dtype()
         self.slot_keys = nn.ParameterList()
         self.slot_metadata = []
         self.slot_snapshots = []
@@ -174,13 +196,16 @@ class NHLoRALayer(nn.Module):
                 shared_rank=bank.shared_rank,
                 slot_r_max=bank.slot_r_max,
             )
+            reset_bank = reset_bank.to(device=layer_device, dtype=layer_dtype)
             reset_bank.shared_a.data.copy_(bank.shared_a.data)
             reset_bank.shared_b.data.copy_(bank.shared_b.data)
             self.point_banks[bank_name] = reset_bank
         for payload in state.get("slot_metadata", []):
             for bank in self.point_banks.values():
-                bank.add_slot()
-            self.slot_keys.append(nn.Parameter(torch.zeros(self.router_dim)))
+                bank.add_slot(device=layer_device, dtype=layer_dtype)
+            self.slot_keys.append(
+                nn.Parameter(torch.zeros(self.router_dim, device=layer_device, dtype=layer_dtype))
+            )
             self.slot_metadata.append(
                 SlotMetadata(
                     rank=int(payload["rank"]),
@@ -208,9 +233,10 @@ class NHLoRALayer(nn.Module):
     def add_slot(self, initial_rank: int, task_id: int) -> int:
         if len(self.slot_metadata) >= self.max_slots:
             raise RuntimeError("Maximum number of slots reached for this layer.")
+        layer_device, layer_dtype = self._current_device_dtype()
         for bank in self.point_banks.values():
-            bank.add_slot()
-        key = nn.Parameter(torch.randn(self.router_dim) * 0.02)
+            bank.add_slot(device=layer_device, dtype=layer_dtype)
+        key = nn.Parameter(torch.randn(self.router_dim, device=layer_device, dtype=layer_dtype) * 0.02)
         self.slot_keys.append(key)
         self.slot_metadata.append(
             SlotMetadata(
@@ -224,7 +250,13 @@ class NHLoRALayer(nn.Module):
 
     def initialize_slot_key(self, slot_id: int, task_embedding: torch.Tensor) -> None:
         with torch.no_grad():
-            normalized = F.normalize(task_embedding.squeeze(0), dim=-1)
+            normalized = F.normalize(
+                task_embedding.squeeze(0).to(
+                    device=self.slot_keys[slot_id].device,
+                    dtype=self.slot_keys[slot_id].dtype,
+                ),
+                dim=-1,
+            )
             self.slot_keys[slot_id].copy_(normalized)
 
     def ensure_bootstrap_slot(self, task_id: int, task_embedding: torch.Tensor | None = None) -> int:

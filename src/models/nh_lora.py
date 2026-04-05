@@ -54,6 +54,8 @@ class NHLoRAModel(nn.Module):
         }
 
     def load_structure_state(self, state: Dict[str, object]) -> None:
+        model_device = self.backbone.core_model.pos_embed.device
+        model_dtype = self.backbone.core_model.pos_embed.dtype
         for block_id in self.selected_blocks:
             layer_state = state.get("layers", {}).get(str(block_id), {})
             self.layers[str(block_id)].load_structure_state(layer_state)
@@ -62,8 +64,8 @@ class NHLoRAModel(nn.Module):
             feature_dim=self.backbone.embed_dim,
             tau=self.classifier.tau,
         )
+        self.classifier = self.classifier.to(device=model_device, dtype=model_dtype)
         self.classifier.expand(classifier_classes)
-        self.classifier.to(next(self.parameters()).device)
 
     def build_bootstrap_plan(self, task_embedding: torch.Tensor) -> Dict[int, MaterializedLayerPlan]:
         del task_embedding
