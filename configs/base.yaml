@@ -29,12 +29,12 @@ model:
   local_smoke_backbone_name: toy_vit_tiny
   local_smoke_backbone_source: internal
   freeze_backbone: true
-  selected_blocks: [8, 9, 10, 11]
-  insertion_points: [q_proj, v_proj]
+  selected_blocks: [6, 7, 8, 9, 10, 11]
+  insertion_points: [q_proj, v_proj, mlp_fc1, mlp_fc2]
   feature_dim: 768
 
 nh_lora:
-  shared_rank: 4
+  shared_rank: 8
   shared_lr_scale: 0.5
   slot_r_max: 16
   slot_init_rank: 4
@@ -87,24 +87,24 @@ classifier:
 
 training:
   optimizer: adamw
-  lr: 0.001
+  lr: 5e-4
   weight_decay: 0.0005
-  epochs_per_task: 20
-  batch_size: 64
+  epochs_per_task: 40
+  batch_size: 128
   grad_clip_norm: 5.0
   use_scheduler: true
   scheduler: cosine
   warmup_epochs: 0
 
 loss:
-  lambda_kd: 1.0
-  lambda_feat: 1.0
+  lambda_kd: 2.0
+  lambda_feat: 1.5
   lambda_orth: 0.1
-  lambda_rank: 0.0001
-  lambda_grow: 0.01
+  lambda_rank: 0.0005
+  lambda_grow: 0.05
   lambda_route: 0.01
   kd_temperature: 2.0
-  retention_layers: [11]
+  retention_layers: [10, 11]
 
 logging:
   log_every_n_steps: 20
