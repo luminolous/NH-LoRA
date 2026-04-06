@@ -480,6 +480,69 @@ class PaperAlignmentUnitTests(unittest.TestCase):
         self.assertAlmostEqual(float(losses["feat"].item()), 0.0, places=7)
         self.assertAlmostEqual(float(losses["grow"].item()), 0.0, places=7)
 
+    def test_normalize_loss_dict_keeps_bootstrap_losses_as_zero(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "loss_normalize_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        logger = configure_logger(level=logging.WARNING)
+        trainer = NHLoRATrainer(config, logger, benchmark=benchmark)
+
+        normalized = trainer._normalize_loss_dict({"total": 1.5, "cls": 1.4, "orth": 0.1, "rank": 0.2, "route": 0.3})
+
+        self.assertEqual(set(normalized.keys()), {"total", "cls", "kd", "feat", "orth", "rank", "grow", "route"})
+        self.assertEqual(normalized["kd"], 0.0)
+        self.assertEqual(normalized["feat"], 0.0)
+        self.assertEqual(normalized["grow"], 0.0)
+
+    def test_forgetting_and_parameter_growth_delta_helpers(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "forgetting_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        logger = configure_logger(level=logging.WARNING)
+        trainer = NHLoRATrainer(config, logger, benchmark=benchmark)
+        trainer.accuracy_matrix = [[0.8], [0.7, 0.6]]
+        trainer.task_metrics = [{"parameter_growth": 128}]
+
+        self.assertAlmostEqual(trainer._compute_forgetting([0.65, 0.55, 0.5]), 0.10, places=6)
+
+        with patch.object(trainer, "_estimate_parameter_growth", return_value=160), patch.object(
+            trainer, "_total_active_rank", return_value=12
+        ):
+            metrics = trainer._summarize_task_metrics(
+                context={"task_number": 2},
+                eval_metrics={"avg_acc": 0.5, "per_task_acc": [0.65, 0.55]},
+                chu_report={
+                    "opened_slots": 1,
+                    "pruned_slots": 0,
+                    "merged_slots": 0,
+                    "frozen_slots": 0,
+                    "kept_slots": 1,
+                },
+                epoch_history=[
+                    {
+                        "loss_total": 1.2,
+                        "loss_cls": 1.0,
+                        "loss_kd": 0.0,
+                        "loss_feat": 0.0,
+                        "loss_orth": 0.1,
+                        "loss_rank": 0.05,
+                        "loss_grow": 0.0,
+                        "loss_route": 0.05,
+                    }
+                ],
+                training_time=4.0,
+                task_wall_time=5.0,
+                inference_overhead=1.1,
+            )
+
+        self.assertEqual(metrics["parameter_growth_delta"], 32)
+        self.assertAlmostEqual(metrics["forgetting"], 0.15, places=6)
+        self.assertEqual(metrics["task_wall_time"], 5.0)
+
     def test_logger_can_disable_file_handler_for_tee_mode(self):
         repo_root = Path(__file__).resolve().parents[1]
         log_path = repo_root / "outputs" / "test_tmp" / "logger_tee" / "tee.log"

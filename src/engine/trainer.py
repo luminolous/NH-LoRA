@@ -38,6 +38,8 @@ from src.models.task_state import (
 from src.utils.checkpoint import save_model_artifact
 from src.utils.io import ensure_output_dirs
 
+LOSS_COMPONENT_KEYS = ("total", "cls", "kd", "feat", "orth", "rank", "grow", "route")
+
 
 class NHLoRATrainer:
     def __init__(
@@ -210,6 +212,173 @@ class NHLoRATrainer:
                 "compatibility_scores": {},
             }
         return profile
+
+    def _sync_if_cuda(self) -> None:
+        if bool(self.config["training"].get("cuda_sync_timing", False)) and self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+
+    def _perf_counter(self) -> float:
+        self._sync_if_cuda()
+        return time.perf_counter()
+
+    def _format_seconds_human_readable(self, seconds: float | None) -> str:
+        if seconds is None:
+            return "n/a"
+        seconds = max(float(seconds), 0.0)
+        total_seconds = int(round(seconds))
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, secs = divmod(remainder, 60)
+        if hours > 0:
+            return f"{hours:02d}h {minutes:02d}m {secs:02d}s"
+        return f"{minutes:02d}m {secs:02d}s"
+
+    def _estimate_eta_for_task(self, epoch_durations: List[float], total_epochs: int, current_epoch: int) -> float | None:
+        if not bool(self.config["training"].get("estimate_eta", True)) or not epoch_durations:
+            return None
+        remaining_epochs = max(total_epochs - current_epoch, 0)
+        average_epoch = sum(epoch_durations) / len(epoch_durations)
+        return remaining_epochs * average_epoch
+
+    def _estimate_eta_for_seed(
+        self,
+        epoch_durations: List[float],
+        total_epochs: int,
+        current_epoch: int,
+        task_index: int,
+        total_tasks: int,
+    ) -> float | None:
+        if not bool(self.config["training"].get("estimate_eta", True)) or not epoch_durations:
+            return None
+        eta_task = self._estimate_eta_for_task(epoch_durations, total_epochs, current_epoch)
+        if eta_task is None:
+            return None
+        current_task_projection = sum(epoch_durations)
+        if current_epoch < total_epochs:
+            average_epoch = sum(epoch_durations) / len(epoch_durations)
+            current_task_projection += (total_epochs - current_epoch) * average_epoch
+        completed_training_times = [float(metric["training_time"]) for metric in self.task_metrics]
+        if completed_training_times:
+            average_task_training_time = sum(completed_training_times) / len(completed_training_times)
+        else:
+            average_task_training_time = current_task_projection
+        remaining_tasks = max(total_tasks - (task_index + 1), 0)
+        return eta_task + (remaining_tasks * average_task_training_time)
+
+    def _normalize_loss_dict(self, loss_values: Dict[str, Any] | None = None) -> Dict[str, float]:
+        normalized = {key: 0.0 for key in LOSS_COMPONENT_KEYS}
+        if not loss_values:
+            return normalized
+        for key in LOSS_COMPONENT_KEYS:
+            value = loss_values.get(key, 0.0)
+            if isinstance(value, torch.Tensor):
+                normalized[key] = float(value.detach().item())
+            else:
+                normalized[key] = float(value)
+        return normalized
+
+    def _summarize_epoch_stats(
+        self,
+        epoch: int,
+        epochs_per_task: int,
+        total_samples: int,
+        correct_predictions: int,
+        loss_sums: Dict[str, float],
+        epoch_time: float,
+        eta_task_seconds: float | None,
+        eta_seed_seconds: float | None,
+    ) -> Dict[str, float | int | None]:
+        denominator = max(total_samples, 1)
+        return {
+            "epoch": int(epoch),
+            "train_loss": loss_sums["total"] / denominator,
+            "train_accuracy": correct_predictions / denominator,
+            "loss_total": loss_sums["total"] / denominator,
+            "loss_cls": loss_sums["cls"] / denominator,
+            "loss_kd": loss_sums["kd"] / denominator,
+            "loss_feat": loss_sums["feat"] / denominator,
+            "loss_orth": loss_sums["orth"] / denominator,
+            "loss_rank": loss_sums["rank"] / denominator,
+            "loss_grow": loss_sums["grow"] / denominator,
+            "loss_route": loss_sums["route"] / denominator,
+            "epoch_time": float(epoch_time),
+            "eta_task_seconds": None if eta_task_seconds is None else float(eta_task_seconds),
+            "eta_seed_seconds": None if eta_seed_seconds is None else float(eta_seed_seconds),
+        }
+
+    def _current_last_task_accuracy(self, per_task_acc: List[float]) -> float:
+        if not per_task_acc:
+            return 0.0
+        return float(per_task_acc[-1])
+
+    def _compute_forgetting(self, current_row: List[float]) -> float:
+        if len(current_row) <= 1 or not self.accuracy_matrix:
+            return 0.0
+        forgetting_values = []
+        for task_idx in range(len(current_row) - 1):
+            prior_scores = [row[task_idx] for row in self.accuracy_matrix if len(row) > task_idx]
+            if not prior_scores:
+                continue
+            forgetting_values.append(max(prior_scores) - current_row[task_idx])
+        if not forgetting_values:
+            return 0.0
+        return float(sum(forgetting_values) / len(forgetting_values))
+
+    def _summarize_task_metrics(
+        self,
+        context: Dict[str, Any],
+        eval_metrics: Dict[str, Any],
+        chu_report: Dict[str, int],
+        epoch_history: List[Dict[str, Any]],
+        training_time: float,
+        task_wall_time: float,
+        inference_overhead: float,
+    ) -> Dict[str, Any]:
+        current_row = list(eval_metrics["per_task_acc"])
+        parameter_growth = self._estimate_parameter_growth()
+        previous_growth = int(self.task_metrics[-1]["parameter_growth"]) if self.task_metrics else 0
+        mean_losses = self._normalize_loss_dict(
+            {
+                "total": sum(float(epoch["loss_total"]) for epoch in epoch_history) / max(len(epoch_history), 1),
+                "cls": sum(float(epoch["loss_cls"]) for epoch in epoch_history) / max(len(epoch_history), 1),
+                "kd": sum(float(epoch["loss_kd"]) for epoch in epoch_history) / max(len(epoch_history), 1),
+                "feat": sum(float(epoch["loss_feat"]) for epoch in epoch_history) / max(len(epoch_history), 1),
+                "orth": sum(float(epoch["loss_orth"]) for epoch in epoch_history) / max(len(epoch_history), 1),
+                "rank": sum(float(epoch["loss_rank"]) for epoch in epoch_history) / max(len(epoch_history), 1),
+                "grow": sum(float(epoch["loss_grow"]) for epoch in epoch_history) / max(len(epoch_history), 1),
+                "route": sum(float(epoch["loss_route"]) for epoch in epoch_history) / max(len(epoch_history), 1),
+            }
+        )
+        return {
+            "task_id": int(context["task_number"]),
+            "avg_acc": float(eval_metrics["avg_acc"]),
+            "last_task_accuracy": self._current_last_task_accuracy(current_row),
+            "forgetting": self._compute_forgetting(current_row),
+            "per_task_acc": current_row,
+            "per_task_accuracy": current_row,
+            "accuracy_matrix_row": current_row,
+            "opened_slots": int(chu_report["opened_slots"]),
+            "pruned_slots": int(chu_report["pruned_slots"]),
+            "merged_slots": int(chu_report["merged_slots"]),
+            "frozen_slots": int(chu_report["frozen_slots"]),
+            "kept_slots": int(chu_report["kept_slots"]),
+            "parameter_growth": parameter_growth,
+            "parameter_growth_delta": parameter_growth - previous_growth,
+            "total_active_rank": self._total_active_rank(),
+            # training_time tracks only the epoch update loop for the task.
+            "training_time": float(training_time),
+            # task_wall_time tracks the end-to-end task wall-clock duration.
+            "task_wall_time": float(task_wall_time),
+            "inference_overhead_ratio": float(inference_overhead),
+            "mean_loss": mean_losses["total"],
+            "mean_loss_cls": mean_losses["cls"],
+            "mean_loss_kd": mean_losses["kd"],
+            "mean_loss_feat": mean_losses["feat"],
+            "mean_loss_orth": mean_losses["orth"],
+            "mean_loss_rank": mean_losses["rank"],
+            "mean_loss_grow": mean_losses["grow"],
+            "mean_loss_route": mean_losses["route"],
+            "epoch_history": epoch_history,
+        }
 
     def _prepare_images_labels(self, batch) -> Tuple[torch.Tensor, torch.Tensor]:
         _, images, labels = batch
@@ -528,14 +697,19 @@ class NHLoRATrainer:
 
         usage_accumulator: Dict[int, Dict[int, float]] = {}
         batch_count = 0
-        loss_history = []
-        start_time = time.perf_counter()
+        epoch_history: List[Dict[str, Any]] = []
+        epoch_durations: List[float] = []
+        training_time_start = self._perf_counter()
 
-        for _epoch in range(epochs_per_task):
+        for epoch in range(1, epochs_per_task + 1):
+            epoch_start = self._perf_counter()
             train_loader = self._build_train_loader(train_dataset)
             self.model.train()
             self.planner.train()
             self.task_state_encoder.train()
+            epoch_loss_sums = {key: 0.0 for key in LOSS_COMPONENT_KEYS}
+            epoch_correct = 0
+            epoch_total = 0
             for batch in train_loader:
                 images, labels = self._prepare_images_labels(batch)
                 optimizer.zero_grad(set_to_none=True)
@@ -553,18 +727,65 @@ class NHLoRATrainer:
                 if outputs["route_info"]:
                     self.last_train_state["router_seen"] = True
 
+                predictions = outputs["logits"].argmax(dim=-1)
+                batch_size = int(labels.size(0))
+                normalized_losses = self._normalize_loss_dict(losses)
+                for key in LOSS_COMPONENT_KEYS:
+                    epoch_loss_sums[key] += normalized_losses[key] * batch_size
+                epoch_correct += int((predictions == labels).sum().item())
+                epoch_total += batch_size
                 self.training_state["global_step"] += 1
                 batch_count += 1
-                loss_history.append(float(losses["total"].detach().item()))
 
             if scheduler is not None:
                 scheduler.step()
 
+            epoch_time = self._perf_counter() - epoch_start
+            epoch_durations.append(epoch_time)
+            eta_task_seconds = self._estimate_eta_for_task(epoch_durations, epochs_per_task, epoch)
+            eta_seed_seconds = self._estimate_eta_for_seed(
+                epoch_durations,
+                epochs_per_task,
+                epoch,
+                task_index=task_index,
+                total_tasks=len(self.benchmark.tasks),
+            )
+            epoch_metrics = self._summarize_epoch_stats(
+                epoch=epoch,
+                epochs_per_task=epochs_per_task,
+                total_samples=epoch_total,
+                correct_predictions=epoch_correct,
+                loss_sums=epoch_loss_sums,
+                epoch_time=epoch_time,
+                eta_task_seconds=eta_task_seconds,
+                eta_seed_seconds=eta_seed_seconds,
+            )
+            epoch_history.append(epoch_metrics)
+            if bool(self.config["training"].get("log_every_epoch", True)):
+                self.logger.info(
+                    "[Task %d][Epoch %d/%d] loss=%.4f acc=%.4f cls=%.4f kd=%.4f feat=%.4f orth=%.4f rank=%.4f grow=%.4f route=%.4f epoch_time=%.2fs eta_task=%s eta_seed=%s",
+                    context["task_number"],
+                    epoch,
+                    epochs_per_task,
+                    epoch_metrics["loss_total"],
+                    epoch_metrics["train_accuracy"],
+                    epoch_metrics["loss_cls"],
+                    epoch_metrics["loss_kd"],
+                    epoch_metrics["loss_feat"],
+                    epoch_metrics["loss_orth"],
+                    epoch_metrics["loss_rank"],
+                    epoch_metrics["loss_grow"],
+                    epoch_metrics["loss_route"],
+                    epoch_metrics["epoch_time"],
+                    self._format_seconds_human_readable(epoch_metrics["eta_task_seconds"]),
+                    self._format_seconds_human_readable(epoch_metrics["eta_seed_seconds"]),
+                )
+
+        training_time = self._perf_counter() - training_time_start
         usage_stats = self._finalize_usage(usage_accumulator, batch_count)
         for block_id, stats in usage_stats.items():
             self.model.layers[str(block_id)].update_usage_statistics(stats)
 
-        task_train_time = time.perf_counter() - start_time
         chu_report = self._run_consolidation(context, usage_stats)
         self.last_train_state["chu_calls_per_task"].append(1)
         self.inference_profile = self.model.build_inference_profile()
@@ -578,24 +799,15 @@ class NHLoRATrainer:
 
         eval_metrics = self._evaluate_up_to(task_index)
         inference_overhead = self._estimate_inference_overhead(task_index)
-        metrics = {
-            "task_id": context["task_number"],
-            "avg_acc": eval_metrics["avg_acc"],
-            "per_task_acc": eval_metrics["per_task_acc"],
-            "opened_slots": chu_report["opened_slots"],
-            "pruned_slots": chu_report["pruned_slots"],
-            "merged_slots": chu_report["merged_slots"],
-            "frozen_slots": chu_report["frozen_slots"],
-            "parameter_growth": self._estimate_parameter_growth(),
-            "total_active_rank": self._total_active_rank(),
-            "training_time": task_train_time,
-            "inference_overhead_ratio": inference_overhead,
-            "mean_loss": sum(loss_history) / max(len(loss_history), 1),
-        }
-        self.task_metrics.append(metrics)
-        self.accuracy_matrix.append(eval_metrics["per_task_acc"])
-        self.total_train_time += task_train_time
-        return metrics
+        return self._summarize_task_metrics(
+            context=context,
+            eval_metrics=eval_metrics,
+            chu_report=chu_report,
+            epoch_history=epoch_history,
+            training_time=training_time,
+            task_wall_time=0.0,
+            inference_overhead=inference_overhead,
+        )
 
     def _run_consolidation(self, context: Dict[str, Any], usage_stats: Dict[int, Dict[int, float]]) -> Dict[str, int]:
         merged_slots = 0
@@ -722,29 +934,73 @@ class NHLoRATrainer:
         if self.training_state["seed"] is None:
             self.training_state["seed"] = int(seed)
 
+        seed_wall_start = self._perf_counter()
         for task_index in range(int(self.training_state["current_task_id"]), len(self.benchmark.tasks)):
+            task_wall_start = self._perf_counter()
             context = self._prepare_task_context(self.benchmark.tasks[task_index])
             metrics = self._train_single_task(context)
+            metrics["task_wall_time"] = self._perf_counter() - task_wall_start
+            self.task_metrics.append(metrics)
+            self.accuracy_matrix.append(metrics["accuracy_matrix_row"])
+            self.total_train_time += float(metrics["training_time"])
             self.training_state["current_task_id"] = task_index + 1
             self.logger.info(
-                "Finished task %d | avg_acc=%.4f | active_rank=%d",
+                "Finished task %d | avg_acc=%.4f | last_task_acc=%.4f | forgetting=%.4f | active_rank=%d | opened=%d | pruned=%d | merged=%d | frozen=%d | kept=%d | param_growth=%d | param_growth_delta=%d | loss=%.4f | task_train_time=%.2fs | task_wall_time=%.2fs",
                 context["task_number"],
                 metrics["avg_acc"],
+                metrics["last_task_accuracy"],
+                metrics["forgetting"],
                 metrics["total_active_rank"],
+                metrics["opened_slots"],
+                metrics["pruned_slots"],
+                metrics["merged_slots"],
+                metrics["frozen_slots"],
+                metrics["kept_slots"],
+                metrics["parameter_growth"],
+                metrics["parameter_growth_delta"],
+                metrics["mean_loss"],
+                metrics["training_time"],
+                metrics["task_wall_time"],
             )
 
         final_avg_acc = self.task_metrics[-1]["avg_acc"] if self.task_metrics else 0.0
+        final_last_task_accuracy = self.task_metrics[-1]["last_task_accuracy"] if self.task_metrics else 0.0
+        final_forgetting = self.task_metrics[-1]["forgetting"] if self.task_metrics else 0.0
+        seed_wall_time_total = self._perf_counter() - seed_wall_start
         final_metrics = {
             "benchmark": self.benchmark.name,
             "final_avg_acc": final_avg_acc,
+            "final_last_task_accuracy": final_last_task_accuracy,
+            "final_forgetting": final_forgetting,
             "opened_slots": sum(metric["opened_slots"] for metric in self.task_metrics),
             "pruned_slots": sum(metric["pruned_slots"] for metric in self.task_metrics),
+            "merged_slots": sum(metric["merged_slots"] for metric in self.task_metrics),
+            "frozen_slots": sum(metric["frozen_slots"] for metric in self.task_metrics),
+            "kept_slots": sum(metric["kept_slots"] for metric in self.task_metrics),
             "parameter_growth": self.task_metrics[-1]["parameter_growth"] if self.task_metrics else 0,
             "total_active_rank": self.task_metrics[-1]["total_active_rank"] if self.task_metrics else 0,
             "training_time_total": self.total_train_time,
+            "seed_wall_time_total": seed_wall_time_total,
             "inference_overhead_ratio": self.task_metrics[-1]["inference_overhead_ratio"] if self.task_metrics else 1.0,
             "task_metrics": deepcopy(self.task_metrics),
             "accuracy_matrix": deepcopy(self.accuracy_matrix),
         }
         self._save_final_model_artifact(seed=seed, final_metrics=final_metrics)
+        average_task_wall_time = (
+            sum(float(metric["task_wall_time"]) for metric in self.task_metrics) / len(self.task_metrics)
+            if self.task_metrics
+            else 0.0
+        )
+        self.logger.info(
+            "Finished seed %d | final_avg_acc=%.4f | final_last_task_acc=%.4f | final_forgetting=%.4f | active_rank=%d | param_growth=%d | training_time_total=%.2fs | seed_wall_time_total=%.2fs | avg_task_wall_time=%.2fs",
+            seed,
+            final_metrics["final_avg_acc"],
+            final_metrics["final_last_task_accuracy"],
+            final_metrics["final_forgetting"],
+            final_metrics["total_active_rank"],
+            final_metrics["parameter_growth"],
+            final_metrics["training_time_total"],
+            final_metrics["seed_wall_time_total"],
+            average_task_wall_time,
+        )
         return final_metrics

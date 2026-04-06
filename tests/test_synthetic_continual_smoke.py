@@ -175,6 +175,11 @@ class SyntheticContinualSmokeTest(unittest.TestCase):
         metrics = trainer.train(seed=7)
 
         self.assertEqual(metrics["benchmark"], "synthetic_smoke")
+        self.assertIn("final_last_task_accuracy", metrics)
+        self.assertIn("final_forgetting", metrics)
+        self.assertIn("training_time_total", metrics)
+        self.assertIn("seed_wall_time_total", metrics)
+        self.assertGreaterEqual(metrics["seed_wall_time_total"], metrics["training_time_total"])
         self.assertEqual(len(trainer.history_bank.entries), 2)
         self.assertTrue(trainer.last_train_state["bootstrap_used"])
         self.assertTrue(trainer.last_train_state["teacher_used_on_task2"])
@@ -204,6 +209,30 @@ class SyntheticContinualSmokeTest(unittest.TestCase):
             "open_new_slot",
             "freeze_old_strong_retention",
         } for action in trainer.last_train_state["task2_actions"].values()))
+
+        self.assertEqual(len(metrics["task_metrics"]), 2)
+        first_task_metrics = metrics["task_metrics"][0]
+        self.assertEqual(first_task_metrics["forgetting"], 0.0)
+        self.assertIn("training_time", first_task_metrics)
+        self.assertIn("task_wall_time", first_task_metrics)
+        self.assertGreaterEqual(first_task_metrics["task_wall_time"], first_task_metrics["training_time"])
+        self.assertTrue(first_task_metrics["epoch_history"])
+        first_epoch = first_task_metrics["epoch_history"][0]
+        for key in (
+            "loss_total",
+            "loss_cls",
+            "loss_kd",
+            "loss_feat",
+            "loss_orth",
+            "loss_rank",
+            "loss_grow",
+            "loss_route",
+        ):
+            self.assertIn(key, first_epoch)
+            self.assertIsInstance(first_epoch[key], float)
+        self.assertEqual(first_epoch["loss_kd"], 0.0)
+        self.assertEqual(first_epoch["loss_feat"], 0.0)
+        self.assertEqual(first_epoch["loss_grow"], 0.0)
 
         for block_id, layer in trainer.model.layers.items():
             self.assertGreaterEqual(len(layer.slot_metadata), 1)

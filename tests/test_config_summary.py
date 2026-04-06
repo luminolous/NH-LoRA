@@ -15,13 +15,30 @@ class ConfigAndSummarySmokeTest(unittest.TestCase):
         self.assertEqual(config["benchmark"]["name"], "cifar100")
         self.assertEqual(config["model"]["backbone_name"], "vit_base_patch16_224_in21k")
 
-        workspace_tmp = repo_root / "outputs" / "test_tmp" / "config_summary"
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "config_summary_runtime"
         workspace_tmp.mkdir(parents=True, exist_ok=True)
         output_file = workspace_tmp / "summary.json"
         write_summary(
             [
-                {"benchmark": "demo", "seed": 1, "final_avg_acc": 0.5, "opened_slots": 2},
-                {"benchmark": "demo", "seed": 2, "final_avg_acc": 0.7, "opened_slots": 4},
+                {
+                    "benchmark": "demo",
+                    "seed": 1,
+                    "final_avg_acc": 0.5,
+                    "final_last_task_accuracy": 0.6,
+                    "training_time_total": 10.0,
+                    "opened_slots": 2,
+                    "seed_wall_time_total": 12.0,
+                    "kept_slots": 1,
+                },
+                {
+                    "benchmark": "demo",
+                    "seed": 2,
+                    "final_avg_acc": 0.7,
+                    "final_last_task_accuracy": 0.8,
+                    "training_time_total": 14.0,
+                    "opened_slots": 4,
+                    "seed_wall_time_total": 16.0,
+                },
             ],
             output_file,
             extras={"benchmark": "demo"},
@@ -29,7 +46,12 @@ class ConfigAndSummarySmokeTest(unittest.TestCase):
         payload = json.loads(output_file.read_text(encoding="utf-8"))
         self.assertEqual(payload["benchmark"], "demo")
         self.assertAlmostEqual(payload["final_avg_acc_mean"], 0.6, places=5)
+        self.assertAlmostEqual(payload["final_last_task_accuracy_mean"], 0.7, places=5)
+        self.assertAlmostEqual(payload["training_time_total_mean"], 12.0, places=5)
         self.assertIn("opened_slots_std", payload)
+        self.assertNotIn("seed_mean", payload)
+        self.assertNotIn("seed_wall_time_total_mean", payload)
+        self.assertNotIn("kept_slots_mean", payload)
 
 
 if __name__ == "__main__":
