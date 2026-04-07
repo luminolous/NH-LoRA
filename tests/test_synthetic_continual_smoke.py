@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 import unittest
 from pathlib import Path
 
@@ -9,8 +8,18 @@ import numpy as np
 from src.datasets.base import ContinualBenchmark, SampleRecord, TaskDefinition
 from src.datasets.transforms import build_cifar_test_transform
 from src.engine.trainer import NHLoRATrainer
-from src.utils.logging_utils import configure_logger
 from src.utils.seeding import seed_everything
+
+
+class ListLogger:
+    def __init__(self):
+        self.messages = []
+
+    def info(self, message, *args):
+        self.messages.append(message % args if args else message)
+
+    def warning(self, message, *args):
+        self.messages.append(message % args if args else message)
 
 
 def make_image_bytes(label: int, sample_id: int, size: int = 32) -> bytes:
@@ -148,6 +157,7 @@ def build_test_config(output_root: str):
             "epochs_per_task": 1,
             "batch_size": 4,
             "grad_clip_norm": 5.0,
+            "debug_eval_around_consolidation": False,
         },
         "loss": {
             "lambda_kd": 0.5,
@@ -170,7 +180,8 @@ class SyntheticContinualSmokeTest(unittest.TestCase):
         workspace_tmp = repo_root / "outputs" / "test_tmp" / "synthetic_smoke_runtime"
         workspace_tmp.mkdir(parents=True, exist_ok=True)
         config = build_test_config(str(workspace_tmp))
-        logger = configure_logger(level=logging.WARNING)
+        config["training"]["debug_eval_around_consolidation"] = True
+        logger = ListLogger()
         trainer = NHLoRATrainer(config, logger, benchmark=benchmark)
         metrics = trainer.train(seed=7)
 
@@ -233,6 +244,11 @@ class SyntheticContinualSmokeTest(unittest.TestCase):
         self.assertEqual(first_epoch["loss_kd"], 0.0)
         self.assertEqual(first_epoch["loss_feat"], 0.0)
         self.assertEqual(first_epoch["loss_grow"], 0.0)
+        joined_logs = "\n".join(logger.messages)
+        self.assertIn("per_task_acc=[", joined_logs)
+        self.assertIn("Seed 7 config:", joined_logs)
+        self.assertIn("[Debug][Task 1] pre-consolidation", joined_logs)
+        self.assertIn("[Debug][Task 1] post-consolidation", joined_logs)
 
         for block_id, layer in trainer.model.layers.items():
             self.assertGreaterEqual(len(layer.slot_metadata), 1)

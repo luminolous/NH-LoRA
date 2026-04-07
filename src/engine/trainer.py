@@ -232,6 +232,74 @@ class NHLoRATrainer:
             return f"{hours:02d}h {minutes:02d}m {secs:02d}s"
         return f"{minutes:02d}m {secs:02d}s"
 
+    def _format_per_task_acc(self, per_task_acc: List[float]) -> str:
+        return "[" + ", ".join(f"{float(value):.4f}" for value in per_task_acc) + "]"
+
+    def _log_seed_config(self, seed: int) -> None:
+        benchmark_cfg = self.config.get("benchmark", {})
+        model_cfg = self.config.get("model", {})
+        training_cfg = self.config.get("training", {})
+        loss_cfg = self.config.get("loss", {})
+        planner_cfg = self.config.get("planner", {})
+        nh_lora_cfg = self.config.get("nh_lora", {})
+        chu_cfg = self.config.get("chu", {})
+        self.logger.info("Seed %d config:", seed)
+        self.logger.info("  benchmark=%s", self.benchmark.name)
+        self.logger.info("  dataset=%s", benchmark_cfg.get("dataset_name", benchmark_cfg.get("name", self.benchmark.name)))
+        self.logger.info("  seed=%d", seed)
+        self.logger.info("  backbone=%s", model_cfg.get("backbone_name", "n/a"))
+        self.logger.info("  selected_blocks=%s", model_cfg.get("selected_blocks", "n/a"))
+        self.logger.info("  target_modules=%s", model_cfg.get("insertion_points", "n/a"))
+        self.logger.info("  num_tasks=%s", benchmark_cfg.get("num_tasks", len(self.benchmark.tasks)))
+        self.logger.info(
+            "  epochs_per_task=%s batch_size=%s optimizer=%s lr=%s weight_decay=%s",
+            training_cfg.get("epochs_per_task", "n/a"),
+            training_cfg.get("batch_size", "n/a"),
+            training_cfg.get("optimizer", "n/a"),
+            training_cfg.get("lr", "n/a"),
+            training_cfg.get("weight_decay", "n/a"),
+        )
+        self.logger.info(
+            "  losses lam_kd=%s lam_feat=%s lam_orth=%s lam_rank=%s lam_grow=%s lam_route=%s",
+            loss_cfg.get("lambda_kd", "n/a"),
+            loss_cfg.get("lambda_feat", "n/a"),
+            loss_cfg.get("lambda_orth", "n/a"),
+            loss_cfg.get("lambda_rank", "n/a"),
+            loss_cfg.get("lambda_grow", "n/a"),
+            loss_cfg.get("lambda_route", "n/a"),
+        )
+        self.logger.info(
+            "  planner tau_novelty=%s tau_conflict=%s tau_consolidate=%s rank_min=%s rank_max=%s",
+            planner_cfg.get("tau_novelty", "n/a"),
+            planner_cfg.get("tau_conflict", "n/a"),
+            planner_cfg.get("tau_consolidate", "n/a"),
+            planner_cfg.get("rank_min", "n/a"),
+            planner_cfg.get("rank_max", "n/a"),
+        )
+        self.logger.info(
+            "  nh_lora router_topk=%s shared_rank=%s bootstrap_slot_rank=%s slot_r_max=%s max_slots_per_block=%s",
+            nh_lora_cfg.get("router_topk", "n/a"),
+            nh_lora_cfg.get("shared_rank", "n/a"),
+            nh_lora_cfg.get("bootstrap_slot_rank", "n/a"),
+            nh_lora_cfg.get("slot_r_max", "n/a"),
+            nh_lora_cfg.get("max_slots_per_block", "n/a"),
+        )
+        self.logger.info(
+            "  chu merge_rate=%s freeze_on_keep=%s usage_high_threshold=%s usage_low_threshold=%s redundancy_threshold=%s stability_threshold=%s",
+            chu_cfg.get("merge_rate", "n/a"),
+            chu_cfg.get("freeze_on_keep", "n/a"),
+            chu_cfg.get("usage_high_threshold", "n/a"),
+            chu_cfg.get("usage_low_threshold", "n/a"),
+            chu_cfg.get("redundancy_threshold", "n/a"),
+            chu_cfg.get("stability_threshold", "n/a"),
+        )
+        self.logger.info(
+            "  logging estimate_eta=%s cuda_sync_timing=%s debug_eval_around_consolidation=%s",
+            training_cfg.get("estimate_eta", True),
+            training_cfg.get("cuda_sync_timing", False),
+            training_cfg.get("debug_eval_around_consolidation", False),
+        )
+
     def _estimate_eta_for_task(self, epoch_durations: List[float], total_epochs: int, current_epoch: int) -> float | None:
         if not bool(self.config["training"].get("estimate_eta", True)) or not epoch_durations:
             return None
@@ -322,6 +390,18 @@ class NHLoRATrainer:
         if not forgetting_values:
             return 0.0
         return float(sum(forgetting_values) / len(forgetting_values))
+
+    def _mask_old_classifier_gradients(self, context: Dict[str, Any]) -> None:
+        old_num_classes = int(context.get("old_num_classes", 0))
+        if old_num_classes <= 0:
+            return
+        classifier = self.model.classifier
+        if classifier.weight.grad is not None:
+            # Prevent old classifier prototypes from drifting under new-task CE updates.
+            classifier.weight.grad[:old_num_classes].zero_()
+        bias = getattr(classifier, "bias", None)
+        if bias is not None and getattr(bias, "grad", None) is not None:
+            bias.grad[:old_num_classes].zero_()
 
     def _summarize_task_metrics(
         self,
@@ -586,6 +666,7 @@ class NHLoRATrainer:
             for block_id, runtime_cfg in applied_plans.items()
             if bool(runtime_cfg.get("strong_retention", False))
         }
+        old_num_classes = self.model.classifier.num_classes
         self._expand_classifier_for_task(task_definition, task_state)
         optimizer = self._build_optimizer()
         scheduler = self._build_scheduler(optimizer)
@@ -603,6 +684,7 @@ class NHLoRATrainer:
             "optimizer": optimizer,
             "scheduler": scheduler,
             "warmup_info": warmup_info,
+            "old_num_classes": old_num_classes,
         }
 
     def _accumulate_usage(self, accumulator: Dict[int, Dict[int, float]], route_info: Dict[int, Dict[str, object]]) -> None:
@@ -717,6 +799,7 @@ class NHLoRATrainer:
                 outputs["images"] = images
                 losses = self._compute_loss(context, outputs, labels)
                 losses["total"].backward()
+                self._mask_old_classifier_gradients(context)
                 if grad_clip_norm > 0:
                     nn.utils.clip_grad_norm_(
                         list(self.model.parameters()) + list(self.planner.parameters()) + list(self.task_state_encoder.parameters()),
@@ -786,6 +869,17 @@ class NHLoRATrainer:
         for block_id, stats in usage_stats.items():
             self.model.layers[str(block_id)].update_usage_statistics(stats)
 
+        debug_eval = bool(self.config["training"].get("debug_eval_around_consolidation", False))
+        if debug_eval:
+            pre_profile = self.model.build_inference_profile()
+            pre_metrics = self._evaluate_up_to(task_index, planner_out=pre_profile)
+            self.logger.info(
+                "[Debug][Task %d] pre-consolidation avg_acc=%.4f per_task_acc=%s",
+                context["task_number"],
+                pre_metrics["avg_acc"],
+                self._format_per_task_acc(pre_metrics["per_task_acc"]),
+            )
+
         chu_report = self._run_consolidation(context, usage_stats)
         self.last_train_state["chu_calls_per_task"].append(1)
         self.inference_profile = self.model.build_inference_profile()
@@ -798,6 +892,13 @@ class NHLoRATrainer:
         self.last_train_state["history_sizes"].append(len(self.history_bank.entries))
 
         eval_metrics = self._evaluate_up_to(task_index)
+        if debug_eval:
+            self.logger.info(
+                "[Debug][Task %d] post-consolidation avg_acc=%.4f per_task_acc=%s",
+                context["task_number"],
+                eval_metrics["avg_acc"],
+                self._format_per_task_acc(eval_metrics["per_task_acc"]),
+            )
         inference_overhead = self._estimate_inference_overhead(task_index)
         return self._summarize_task_metrics(
             context=context,
@@ -857,9 +958,10 @@ class NHLoRATrainer:
         )
         self.history_bank.append(entry)
 
-    def _evaluate_up_to(self, task_index: int) -> Dict[str, Any]:
+    def _evaluate_up_to(self, task_index: int, planner_out: Dict[int, Dict[str, object]] | None = None) -> Dict[str, Any]:
         self.model.eval()
         per_task_acc = []
+        eval_profile = self.inference_profile if planner_out is None else planner_out
         with torch.no_grad():
             for eval_task_id in range(task_index + 1):
                 _, test_dataset = self.benchmark.build_task_datasets(eval_task_id)
@@ -868,7 +970,7 @@ class NHLoRATrainer:
                 total = 0
                 for batch in loader:
                     images, labels = self._prepare_images_labels(batch)
-                    outputs = self.model.forward_with_state(images, task_state=None, planner_out=self.inference_profile)
+                    outputs = self.model.forward_with_state(images, task_state=None, planner_out=eval_profile)
                     predictions = outputs["logits"].argmax(dim=-1)
                     correct += int((predictions == labels).sum().item())
                     total += int(labels.numel())
@@ -934,6 +1036,7 @@ class NHLoRATrainer:
         if self.training_state["seed"] is None:
             self.training_state["seed"] = int(seed)
 
+        self._log_seed_config(seed)
         seed_wall_start = self._perf_counter()
         for task_index in range(int(self.training_state["current_task_id"]), len(self.benchmark.tasks)):
             task_wall_start = self._perf_counter()
@@ -945,11 +1048,12 @@ class NHLoRATrainer:
             self.total_train_time += float(metrics["training_time"])
             self.training_state["current_task_id"] = task_index + 1
             self.logger.info(
-                "Finished task %d | avg_acc=%.4f | last_task_acc=%.4f | forgetting=%.4f | active_rank=%d | opened=%d | pruned=%d | merged=%d | frozen=%d | kept=%d | param_growth=%d | param_growth_delta=%d | loss=%.4f | task_train_time=%.2fs | task_wall_time=%.2fs",
+                "Finished task %d | avg_acc=%.4f | last_task_acc=%.4f | forgetting=%.4f | per_task_acc=%s | active_rank=%d | opened=%d | pruned=%d | merged=%d | frozen=%d | kept=%d | param_growth=%d | param_growth_delta=%d | loss=%.4f | task_train_time=%.2fs | task_wall_time=%.2fs",
                 context["task_number"],
                 metrics["avg_acc"],
                 metrics["last_task_accuracy"],
                 metrics["forgetting"],
+                self._format_per_task_acc(metrics["per_task_acc"]),
                 metrics["total_active_rank"],
                 metrics["opened_slots"],
                 metrics["pruned_slots"],

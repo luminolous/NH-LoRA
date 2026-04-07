@@ -178,6 +178,17 @@ class _DummyModel(nn.Module):
         self.layers = nn.ModuleDict({"0": layer})
 
 
+class _ListLogger:
+    def __init__(self):
+        self.messages = []
+
+    def info(self, message, *args):
+        self.messages.append(message % args if args else message)
+
+    def warning(self, message, *args):
+        self.messages.append(message % args if args else message)
+
+
 class PaperAlignmentUnitTests(unittest.TestCase):
     def test_dynamic_slot_params_follow_layer_device(self):
         target_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -495,6 +506,55 @@ class PaperAlignmentUnitTests(unittest.TestCase):
         self.assertEqual(normalized["kd"], 0.0)
         self.assertEqual(normalized["feat"], 0.0)
         self.assertEqual(normalized["grow"], 0.0)
+
+    def test_old_classifier_row_gradient_masking(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "classifier_mask_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        logger = configure_logger(level=logging.WARNING)
+        trainer = NHLoRATrainer(config, logger, benchmark=benchmark)
+        trainer.model.classifier.expand(4)
+        trainer.model.classifier.weight.grad = torch.ones_like(trainer.model.classifier.weight)
+
+        trainer._mask_old_classifier_gradients({"old_num_classes": 2})
+
+        self.assertTrue(torch.allclose(trainer.model.classifier.weight.grad[:2], torch.zeros_like(trainer.model.classifier.weight.grad[:2])))
+        self.assertTrue(torch.allclose(trainer.model.classifier.weight.grad[2:], torch.ones_like(trainer.model.classifier.weight.grad[2:])))
+
+    def test_task1_classifier_gradient_masking_is_noop(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "classifier_mask_noop_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        logger = configure_logger(level=logging.WARNING)
+        trainer = NHLoRATrainer(config, logger, benchmark=benchmark)
+        trainer.model.classifier.expand(2)
+        trainer.model.classifier.weight.grad = torch.ones_like(trainer.model.classifier.weight)
+
+        trainer._mask_old_classifier_gradients({"old_num_classes": 0})
+
+        self.assertTrue(torch.allclose(trainer.model.classifier.weight.grad, torch.ones_like(trainer.model.classifier.weight.grad)))
+
+    def test_seed_config_logging_tolerates_missing_optional_fields(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "seed_config_log_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        config["training"].pop("debug_eval_around_consolidation", None)
+        config["training"].pop("estimate_eta", None)
+        config["training"].pop("cuda_sync_timing", None)
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        logger = _ListLogger()
+        trainer = NHLoRATrainer(config, logger, benchmark=benchmark)
+
+        trainer._log_seed_config(seed=3)
+
+        joined_messages = "\n".join(logger.messages)
+        self.assertIn("Seed 3 config:", joined_messages)
+        self.assertIn("benchmark=tiny_alignment", joined_messages)
 
     def test_forgetting_and_parameter_growth_delta_helpers(self):
         repo_root = Path(__file__).resolve().parents[1]

@@ -95,6 +95,7 @@ training:
   use_scheduler: true
   scheduler: cosine
   warmup_epochs: 0
+  debug_eval_around_consolidation: false
 
 loss:
   lambda_kd: 2.0
