@@ -15,7 +15,7 @@ from src.datasets.transforms import build_cifar_test_transform
 from src.engine.trainer import NHLoRATrainer
 from src.models.chu import ConsolidationHomeostasisUnit
 from src.models.lora import NHLoRALayer
-from src.models.losses import growth_penalty, rank_penalty, routing_balance_loss, slot_orthogonality
+from src.models.losses import feature_retention, growth_penalty, rank_penalty, routing_balance_loss, slot_orthogonality
 from src.models.nh_lora import NHLoRAModel
 from src.models.planner import HorizonPlanner, MaterializedLayerPlan, PlannerSignals, materialize_action
 from src.utils.logging_utils import configure_logger
@@ -162,6 +162,10 @@ def _build_test_config(output_root: str):
             "scheduler": "cosine",
             "freeze_old_classifier_weights": True,
             "retention_debug_logging": True,
+            "retention_feature_diff_logging": False,
+            "retention_feature_diff_max_epochs": 3,
+            "routing_debug_logging": False,
+            "routing_debug_max_epochs": 3,
         },
         "loss": {
             "lambda_kd": 0.5,
@@ -172,6 +176,7 @@ def _build_test_config(output_root: str):
             "lambda_route": 0.01,
             "kd_temperature": 2.0,
             "retention_layers": [1],
+            "retention_feature_representation": "cls",
         },
     }
 
@@ -600,6 +605,86 @@ class PaperAlignmentUnitTests(unittest.TestCase):
         self.assertEqual(profile[1]["active_slot_candidates"], [first_slot, second_slot])
         self.assertFalse(profile[1]["shared_only"])
 
+    def test_retention_feature_representation_modes(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        images = torch.randn(2, 3, 32, 32)
+        expected_shapes = {
+            "cls": (2, 128),
+            "mean_pool_tokens": (2, 128),
+            "full_tokens": (2, 65, 128),
+        }
+        for mode, expected_shape in expected_shapes.items():
+            config = _build_test_config(str(repo_root / "outputs" / "test_tmp" / f"retention_repr_{mode}"))
+            config["loss"]["retention_feature_representation"] = mode
+            model = NHLoRAModel(config)
+            model.classifier.expand(2)
+
+            outputs = model.forward_with_state(images, task_state=None, planner_out=None)
+
+            self.assertEqual(tuple(outputs["layer_features"][1].shape), expected_shape)
+
+    def test_invalid_retention_feature_representation_fails_fast(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        config = _build_test_config(str(repo_root / "outputs" / "test_tmp" / "retention_repr_invalid"))
+        config["loss"]["retention_feature_representation"] = "bad_mode"
+
+        with self.assertRaises(ValueError):
+            NHLoRAModel(config)
+
+    def test_feature_retention_supports_full_token_tensors(self):
+        student_features = {1: torch.zeros(2, 3, 4)}
+        teacher_features = {1: torch.ones(2, 3, 4)}
+
+        loss = feature_retention(student_features, teacher_features, layers=[1], device=torch.device("cpu"))
+
+        self.assertGreater(float(loss.item()), 0.0)
+
+    def test_feature_retention_diff_diagnostics_reports_matching_and_missing_layers(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "feature_diff_diag_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        config["training"]["retention_feature_diff_logging"] = True
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        logger = _ListLogger()
+        trainer = NHLoRATrainer(config, logger, benchmark=benchmark)
+        context = {"task_number": 2, "current_epoch": 1}
+
+        trainer._log_feature_retention_diff(
+            context=context,
+            current_features={1: torch.ones(2, 4)},
+            teacher_features={1: torch.zeros(2, 4)},
+            retention_layers=[1, 2],
+        )
+
+        joined_messages = "\n".join(logger.messages)
+        self.assertIn("requested_layers=[1, 2]", joined_messages)
+        self.assertIn("matched_layers=[1]", joined_messages)
+        self.assertIn("missing_student=[2]", joined_messages)
+        self.assertIn("missing_teacher=[2]", joined_messages)
+        self.assertIn("mean_abs_diff=", joined_messages)
+
+    def test_feature_retention_diff_diagnostics_warns_on_no_matched_layers(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "feature_diff_missing_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        config["training"]["retention_feature_diff_logging"] = True
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        logger = _ListLogger()
+        trainer = NHLoRATrainer(config, logger, benchmark=benchmark)
+
+        trainer._log_feature_retention_diff(
+            context={"task_number": 2, "current_epoch": 1},
+            current_features={1: torch.ones(2, 4)},
+            teacher_features={1: torch.zeros(2, 4)},
+            retention_layers=[2],
+        )
+
+        joined_messages = "\n".join(logger.messages)
+        self.assertIn("matched_layers=[]", joined_messages)
+        self.assertIn("no matched retention layers", joined_messages)
+
     def test_bootstrap_task1_invariants(self):
         seed_everything(5, deterministic=True)
         repo_root = Path(__file__).resolve().parents[1]
@@ -735,6 +820,59 @@ class PaperAlignmentUnitTests(unittest.TestCase):
         )
         self.assertNotIn("last_retention_debug", context)
 
+    def test_retention_debug_includes_old_logit_differences(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "retention_head_debug_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        logger = configure_logger(level=logging.WARNING)
+        trainer = NHLoRATrainer(config, logger, benchmark=benchmark)
+        context = {"old_num_classes": 2}
+
+        trainer._update_retention_debug(
+            context=context,
+            outputs={"logits": torch.tensor([[1.0, 2.0, 9.0], [3.0, 4.0, 9.0]])},
+            teacher_outputs={"logits": torch.tensor([[1.5, 2.0], [2.0, 6.0]])},
+            teacher_num_classes=2,
+            retention_layers=[1],
+            kd_term=torch.tensor(0.5),
+            feat_term=torch.tensor(0.25),
+        )
+
+        self.assertIn("old_logits_mean_abs_diff", context["last_retention_debug"])
+        self.assertIn("old_logits_max_abs_diff", context["last_retention_debug"])
+        self.assertGreater(context["last_retention_debug"]["old_logits_max_abs_diff"], 0.0)
+
+    def test_routing_debug_logging_summarizes_epoch(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "routing_debug_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        config["training"]["routing_debug_logging"] = True
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        logger = _ListLogger()
+        trainer = NHLoRATrainer(config, logger, benchmark=benchmark)
+        context = {"task_number": 2, "current_epoch": 1}
+
+        trainer._update_routing_debug(
+            context,
+            {
+                1: {
+                    "candidate_slots": [0, 1],
+                    "shared_only": False,
+                    "routing_weights": torch.tensor([[0.7, 0.3], [0.6, 0.4]]),
+                    "routing_distribution": torch.tensor([[0.7, 0.3], [0.6, 0.4]]),
+                }
+            },
+        )
+        trainer._log_routing_debug(context)
+
+        joined_messages = "\n".join(logger.messages)
+        self.assertIn("[Routing][Task 2][Epoch 1][Layer 1]", joined_messages)
+        self.assertIn("avg_candidate_count=2.00", joined_messages)
+        self.assertIn("avg_topk=2.00", joined_messages)
+
     def test_seed_config_logging_tolerates_missing_optional_fields(self):
         repo_root = Path(__file__).resolve().parents[1]
         workspace_tmp = repo_root / "outputs" / "test_tmp" / "seed_config_log_unit"
@@ -752,6 +890,25 @@ class PaperAlignmentUnitTests(unittest.TestCase):
         joined_messages = "\n".join(logger.messages)
         self.assertIn("Seed 3 config:", joined_messages)
         self.assertIn("benchmark=tiny_alignment", joined_messages)
+        self.assertIn("retention_feature_representation=cls", joined_messages)
+        self.assertIn("retention_feature_diff_logging=", joined_messages)
+        self.assertIn("routing_debug_logging=", joined_messages)
+
+    def test_seed_config_warns_for_full_token_retention_features(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "seed_config_full_tokens_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        config["loss"]["retention_feature_representation"] = "full_tokens"
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        logger = _ListLogger()
+        trainer = NHLoRATrainer(config, logger, benchmark=benchmark)
+
+        trainer._log_seed_config(seed=3)
+
+        joined_messages = "\n".join(logger.messages)
+        self.assertIn("retention_feature_representation=full_tokens", joined_messages)
+        self.assertIn("can use substantially more memory", joined_messages)
 
     def test_forgetting_and_parameter_growth_delta_helpers(self):
         repo_root = Path(__file__).resolve().parents[1]

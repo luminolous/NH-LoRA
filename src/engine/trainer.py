@@ -260,13 +260,14 @@ class NHLoRATrainer:
             training_cfg.get("weight_decay", "n/a"),
         )
         self.logger.info(
-            "  losses lam_kd=%s lam_feat=%s lam_orth=%s lam_rank=%s lam_grow=%s lam_route=%s",
+            "  losses lam_kd=%s lam_feat=%s lam_orth=%s lam_rank=%s lam_grow=%s lam_route=%s retention_feature_representation=%s",
             loss_cfg.get("lambda_kd", "n/a"),
             loss_cfg.get("lambda_feat", "n/a"),
             loss_cfg.get("lambda_orth", "n/a"),
             loss_cfg.get("lambda_rank", "n/a"),
             loss_cfg.get("lambda_grow", "n/a"),
             loss_cfg.get("lambda_route", "n/a"),
+            loss_cfg.get("retention_feature_representation", "cls"),
         )
         self.logger.info(
             "  planner tau_novelty=%s tau_conflict=%s tau_consolidate=%s rank_min=%s rank_max=%s",
@@ -295,13 +296,19 @@ class NHLoRATrainer:
             chu_cfg.get("stability_threshold", "n/a"),
         )
         self.logger.info(
-            "  logging estimate_eta=%s cuda_sync_timing=%s debug_eval_around_consolidation=%s retention_debug_logging=%s freeze_old_classifier_weights=%s",
+            "  logging estimate_eta=%s cuda_sync_timing=%s debug_eval_around_consolidation=%s retention_debug_logging=%s retention_feature_diff_logging=%s routing_debug_logging=%s freeze_old_classifier_weights=%s",
             training_cfg.get("estimate_eta", True),
             training_cfg.get("cuda_sync_timing", False),
             training_cfg.get("debug_eval_around_consolidation", False),
             training_cfg.get("retention_debug_logging", True),
+            training_cfg.get("retention_feature_diff_logging", False),
+            training_cfg.get("routing_debug_logging", False),
             training_cfg.get("freeze_old_classifier_weights", True),
         )
+        if str(loss_cfg.get("retention_feature_representation", "cls")).lower() == "full_tokens":
+            self.logger.warning(
+                "  retention_feature_representation=full_tokens can use substantially more memory and produce heavier debug logs than cls or mean_pool_tokens."
+            )
 
     def _estimate_eta_for_task(self, epoch_durations: List[float], total_epochs: int, current_epoch: int) -> float | None:
         if not bool(self.config["training"].get("estimate_eta", True)) or not epoch_durations:
@@ -417,6 +424,103 @@ class NHLoRATrainer:
         retention_layers.update(int(layer_id) for layer_id in context["strong_retention_layers"])
         return sorted(retention_layers)
 
+    def _epoch_debug_enabled(self, context: Dict[str, Any], flag_key: str, max_epoch_key: str) -> bool:
+        if int(context.get("task_number", 1)) <= 1:
+            return False
+        if not bool(self.config["training"].get(flag_key, False)):
+            return False
+        epoch = int(context.get("current_epoch", 0))
+        max_epochs = int(self.config["training"].get(max_epoch_key, 3))
+        return epoch > 0 and epoch <= max(max_epochs, 0)
+
+    def _retention_feature_layer_match(
+        self,
+        current_features: Dict[int, torch.Tensor],
+        teacher_features: Dict[int, torch.Tensor],
+        retention_layers: List[int],
+    ) -> Dict[str, List[int]]:
+        student_keys = sorted(int(layer_id) for layer_id in current_features.keys())
+        teacher_keys = sorted(int(layer_id) for layer_id in teacher_features.keys())
+        matched = [
+            int(layer_id)
+            for layer_id in retention_layers
+            if layer_id in current_features and layer_id in teacher_features
+        ]
+        missing_student = [int(layer_id) for layer_id in retention_layers if layer_id not in current_features]
+        missing_teacher = [int(layer_id) for layer_id in retention_layers if layer_id not in teacher_features]
+        return {
+            "requested": [int(layer_id) for layer_id in retention_layers],
+            "student_keys": student_keys,
+            "teacher_keys": teacher_keys,
+            "matched": matched,
+            "missing_student": missing_student,
+            "missing_teacher": missing_teacher,
+        }
+
+    def _log_feature_retention_diff(
+        self,
+        context: Dict[str, Any],
+        current_features: Dict[int, torch.Tensor],
+        teacher_features: Dict[int, torch.Tensor],
+        retention_layers: List[int],
+    ) -> None:
+        if not self._epoch_debug_enabled(
+            context,
+            flag_key="retention_feature_diff_logging",
+            max_epoch_key="retention_feature_diff_max_epochs",
+        ):
+            return
+        epoch = int(context["current_epoch"])
+        if context.get("last_feature_diff_epoch") == epoch:
+            return
+        context["last_feature_diff_epoch"] = epoch
+        match_info = self._retention_feature_layer_match(current_features, teacher_features, retention_layers)
+        context["last_feature_diff_debug"] = match_info
+        self.logger.info(
+            "[RetentionFeatures][Task %d][Epoch %d] requested_layers=%s student_keys=%s teacher_keys=%s matched_layers=%s missing_student=%s missing_teacher=%s",
+            context["task_number"],
+            epoch,
+            match_info["requested"],
+            match_info["student_keys"],
+            match_info["teacher_keys"],
+            match_info["matched"],
+            match_info["missing_student"],
+            match_info["missing_teacher"],
+        )
+        if not match_info["matched"]:
+            self.logger.warning(
+                "[RetentionFeatures][Task %d][Epoch %d] no matched retention layers; feature_retention will be zero unless configuration changes.",
+                context["task_number"],
+                epoch,
+            )
+            return
+        for layer_id in match_info["matched"]:
+            student_feature = current_features[layer_id].detach()
+            teacher_feature = teacher_features[layer_id].detach()
+            if student_feature.shape != teacher_feature.shape:
+                self.logger.warning(
+                    "[RetentionFeatures][Task %d][Epoch %d][Layer %d] shape mismatch student_shape=%s teacher_shape=%s; feature_retention may fail if this configuration is used.",
+                    context["task_number"],
+                    epoch,
+                    layer_id,
+                    tuple(student_feature.shape),
+                    tuple(teacher_feature.shape),
+                )
+                continue
+            diff = (student_feature - teacher_feature).abs()
+            self.logger.info(
+                "[RetentionFeatures][Task %d][Epoch %d][Layer %d] student_shape=%s teacher_shape=%s student_norm=%.4e teacher_norm=%.4e mean_abs_diff=%.4e max_abs_diff=%.4e",
+                context["task_number"],
+                epoch,
+                layer_id,
+                tuple(student_feature.shape),
+                tuple(teacher_feature.shape),
+                float(student_feature.norm().item()),
+                float(teacher_feature.norm().item()),
+                float(diff.mean().item()),
+                float(diff.max().item()),
+            )
+
     def _update_retention_debug(
         self,
         context: Dict[str, Any],
@@ -431,12 +535,17 @@ class NHLoRATrainer:
             return
         if teacher_num_classes <= 0:
             return
+        teacher_old_logits = teacher_outputs["logits"].detach()
+        student_old_logits = outputs["logits"][:, :teacher_num_classes].detach()
+        old_logit_diff = (student_old_logits - teacher_old_logits).abs()
         context["last_retention_debug"] = {
             "teacher_num_classes": int(teacher_num_classes),
             "old_num_classes": int(context.get("old_num_classes", 0)),
             "retention_layers": list(retention_layers),
-            "teacher_old_logits_norm": float(teacher_outputs["logits"].detach().norm(dim=-1).mean().item()),
-            "student_old_logits_norm": float(outputs["logits"][:, :teacher_num_classes].detach().norm(dim=-1).mean().item()),
+            "teacher_old_logits_norm": float(teacher_old_logits.norm(dim=-1).mean().item()),
+            "student_old_logits_norm": float(student_old_logits.norm(dim=-1).mean().item()),
+            "old_logits_mean_abs_diff": float(old_logit_diff.mean().item()),
+            "old_logits_max_abs_diff": float(old_logit_diff.max().item()),
             "kd_raw": float(kd_term.detach().item()),
             "feat_raw": float(feat_term.detach().item()),
         }
@@ -752,6 +861,75 @@ class NHLoRATrainer:
             }
         return finalized
 
+    def _update_routing_debug(self, context: Dict[str, Any], route_info: Dict[int, Dict[str, object]]) -> None:
+        if not self._epoch_debug_enabled(
+            context,
+            flag_key="routing_debug_logging",
+            max_epoch_key="routing_debug_max_epochs",
+        ):
+            return
+        accumulator = context.setdefault("routing_debug_accumulator", {})
+        for block_id, layer_state in route_info.items():
+            candidate_slots = list(layer_state.get("candidate_slots", []))
+            distribution = layer_state.get("routing_distribution")
+            weights = layer_state.get("routing_weights")
+            if isinstance(weights, torch.Tensor) and weights.ndim > 1:
+                topk_size = int(weights.shape[-1])
+            else:
+                topk_size = 0
+            entropy = 0.0
+            mean_distribution: List[float] = []
+            if isinstance(distribution, torch.Tensor) and distribution.numel() > 0:
+                mean_tensor = distribution.detach().mean(dim=0)
+                normalized = mean_tensor / mean_tensor.sum().clamp_min(1e-8)
+                entropy = float(-(normalized * normalized.clamp_min(1e-8).log()).sum().item())
+                mean_distribution = [float(value) for value in normalized.cpu().tolist()]
+            entry = accumulator.setdefault(
+                int(block_id),
+                {
+                    "batches": 0,
+                    "candidate_count_sum": 0.0,
+                    "shared_only_count": 0.0,
+                    "topk_sum": 0.0,
+                    "entropy_sum": 0.0,
+                    "last_candidates": [],
+                    "last_mean_distribution": [],
+                },
+            )
+            entry["batches"] += 1
+            entry["candidate_count_sum"] += float(len(candidate_slots))
+            entry["shared_only_count"] += float(bool(layer_state.get("shared_only", False)))
+            entry["topk_sum"] += float(topk_size)
+            entry["entropy_sum"] += float(entropy)
+            entry["last_candidates"] = [int(slot_id) for slot_id in candidate_slots]
+            entry["last_mean_distribution"] = mean_distribution
+
+    def _log_routing_debug(self, context: Dict[str, Any]) -> None:
+        if not self._epoch_debug_enabled(
+            context,
+            flag_key="routing_debug_logging",
+            max_epoch_key="routing_debug_max_epochs",
+        ):
+            return
+        epoch = int(context["current_epoch"])
+        accumulator = context.get("routing_debug_accumulator", {})
+        for block_id in sorted(accumulator):
+            entry = accumulator[block_id]
+            batches = max(int(entry.get("batches", 0)), 1)
+            distribution = "[" + ", ".join(f"{float(value):.4f}" for value in entry.get("last_mean_distribution", [])) + "]"
+            self.logger.info(
+                "[Routing][Task %d][Epoch %d][Layer %d] avg_candidate_count=%.2f shared_only_ratio=%.2f avg_topk=%.2f avg_entropy=%.4f last_candidates=%s mean_distribution=%s",
+                context["task_number"],
+                epoch,
+                int(block_id),
+                float(entry.get("candidate_count_sum", 0.0)) / batches,
+                float(entry.get("shared_only_count", 0.0)) / batches,
+                float(entry.get("topk_sum", 0.0)) / batches,
+                float(entry.get("entropy_sum", 0.0)) / batches,
+                entry.get("last_candidates", []),
+                distribution,
+            )
+
     def _compute_loss(
         self,
         context: Dict[str, Any],
@@ -791,6 +969,12 @@ class NHLoRATrainer:
                 )
                 total_loss = total_loss + float(loss_cfg["lambda_kd"]) * kd_term
             retention_layers = self._active_retention_layers(context)
+            self._log_feature_retention_diff(
+                context=context,
+                current_features=outputs["layer_features"],
+                teacher_features=teacher_outputs["layer_features"],
+                retention_layers=retention_layers,
+            )
             feat_term = feature_retention(
                 outputs["layer_features"],
                 teacher_outputs["layer_features"],
@@ -838,6 +1022,8 @@ class NHLoRATrainer:
 
         for epoch in range(1, epochs_per_task + 1):
             epoch_start = self._perf_counter()
+            context["current_epoch"] = epoch
+            context["routing_debug_accumulator"] = {}
             train_loader = self._build_train_loader(train_dataset)
             self.model.train()
             self.planner.train()
@@ -860,6 +1046,7 @@ class NHLoRATrainer:
                     )
                 optimizer.step()
                 self._accumulate_usage(usage_accumulator, outputs["route_info"])
+                self._update_routing_debug(context, outputs["route_info"])
                 if outputs["route_info"]:
                     self.last_train_state["router_seen"] = True
 
@@ -919,7 +1106,7 @@ class NHLoRATrainer:
                 if bool(self.config["training"].get("retention_debug_logging", True)) and context.get("last_retention_debug"):
                     debug = context["last_retention_debug"]
                     self.logger.info(
-                        "[Retention][Task %d][Epoch %d] teacher_classes=%d old_classes=%d layers=%s teacher_logit_norm=%.4e student_logit_norm=%.4e kd_raw=%.4e feat_raw=%.4e",
+                        "[Retention][Task %d][Epoch %d] teacher_classes=%d old_classes=%d layers=%s teacher_logit_norm=%.4e student_logit_norm=%.4e old_logit_mean_abs_diff=%.4e old_logit_max_abs_diff=%.4e kd_raw=%.4e feat_raw=%.4e",
                         context["task_number"],
                         epoch,
                         debug["teacher_num_classes"],
@@ -927,9 +1114,12 @@ class NHLoRATrainer:
                         debug["retention_layers"],
                         debug["teacher_old_logits_norm"],
                         debug["student_old_logits_norm"],
+                        debug["old_logits_mean_abs_diff"],
+                        debug["old_logits_max_abs_diff"],
                         debug["kd_raw"],
                         debug["feat_raw"],
                     )
+                self._log_routing_debug(context)
 
         training_time = self._perf_counter() - training_time_start
         usage_stats = self._finalize_usage(usage_accumulator, batch_count)

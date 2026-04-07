@@ -14,11 +14,23 @@ from src.models.task_state import TaskState
 
 
 class NHLoRAModel(nn.Module):
+    VALID_RETENTION_FEATURE_REPRESENTATIONS = {"cls", "mean_pool_tokens", "full_tokens"}
+
     def __init__(self, config: Dict[str, object]):
         super().__init__()
         model_cfg = config["model"]
         benchmark_cfg = config["benchmark"]
         nh_cfg = config["nh_lora"]
+        loss_cfg = config.get("loss", {})
+        self.retention_feature_representation = str(
+            loss_cfg.get("retention_feature_representation", "cls")
+        ).lower()
+        if self.retention_feature_representation not in self.VALID_RETENTION_FEATURE_REPRESENTATIONS:
+            raise ValueError(
+                "Unsupported retention_feature_representation: "
+                f"{self.retention_feature_representation}. Expected one of "
+                f"{sorted(self.VALID_RETENTION_FEATURE_REPRESENTATIONS)}."
+            )
         self.backbone = FrozenVisionTransformerBackbone.build(model_cfg, benchmark_cfg)
         self.selected_blocks = [int(block_id) for block_id in model_cfg["selected_blocks"]]
         self.insertion_points = [str(point) for point in model_cfg["insertion_points"]]
@@ -143,10 +155,19 @@ class NHLoRAModel(nn.Module):
     def encode(self, images: torch.Tensor, task_state: TaskState | None = None, planner_out=None):
         return self.backbone.forward_features(images, self.nh_layers_by_block() if planner_out is not None else None, task_state, planner_out)
 
+    def _retention_feature_tensor(self, tokens: torch.Tensor) -> torch.Tensor:
+        if self.retention_feature_representation == "cls":
+            return tokens[:, 0]
+        if self.retention_feature_representation == "mean_pool_tokens":
+            return tokens.mean(dim=1)
+        if self.retention_feature_representation == "full_tokens":
+            return tokens
+        raise RuntimeError(f"Invalid retention feature representation: {self.retention_feature_representation}")
+
     def forward_with_state(self, images: torch.Tensor, task_state: TaskState | None, planner_out):
         features_dict = self.encode(images, task_state=task_state, planner_out=planner_out)
         layer_features = {
-            int(block_id): tokens[:, 0]
+            int(block_id): self._retention_feature_tensor(tokens)
             for block_id, tokens in features_dict["block_outputs"].items()
         }
         logits = self.classifier(features_dict["features"])

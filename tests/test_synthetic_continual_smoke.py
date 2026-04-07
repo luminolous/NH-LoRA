@@ -160,6 +160,10 @@ def build_test_config(output_root: str):
             "grad_clip_norm": 5.0,
             "debug_eval_around_consolidation": False,
             "retention_debug_logging": True,
+            "retention_feature_diff_logging": False,
+            "retention_feature_diff_max_epochs": 3,
+            "routing_debug_logging": False,
+            "routing_debug_max_epochs": 3,
             "freeze_old_classifier_weights": True,
         },
         "loss": {
@@ -171,6 +175,7 @@ def build_test_config(output_root: str):
             "lambda_route": 0.01,
             "kd_temperature": 2.0,
             "retention_layers": [3],
+            "retention_feature_representation": "cls",
         },
     }
 
@@ -184,6 +189,9 @@ class SyntheticContinualSmokeTest(unittest.TestCase):
         workspace_tmp.mkdir(parents=True, exist_ok=True)
         config = build_test_config(str(workspace_tmp))
         config["training"]["debug_eval_around_consolidation"] = True
+        config["training"]["retention_feature_diff_logging"] = True
+        config["training"]["routing_debug_logging"] = True
+        config["loss"]["retention_feature_representation"] = "mean_pool_tokens"
         logger = ListLogger()
         trainer = NHLoRATrainer(config, logger, benchmark=benchmark)
         metrics = trainer.train(seed=7)
@@ -253,6 +261,10 @@ class SyntheticContinualSmokeTest(unittest.TestCase):
         self.assertIn("[Debug][Task 1] pre-consolidation", joined_logs)
         self.assertIn("[Debug][Task 1] post-consolidation", joined_logs)
         self.assertIn("[Retention][Task 2][Epoch 1]", joined_logs)
+        self.assertIn("retention_feature_representation=mean_pool_tokens", joined_logs)
+        self.assertIn("[RetentionFeatures][Task 2][Epoch 1]", joined_logs)
+        self.assertIn("matched_layers=[3]", joined_logs)
+        self.assertIn("[Routing][Task 2][Epoch 1]", joined_logs)
 
         for block_id, layer in trainer.model.layers.items():
             self.assertGreaterEqual(len(layer.slot_metadata), 1)

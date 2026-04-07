@@ -98,6 +98,10 @@ training:
   warmup_epochs: 0
   debug_eval_around_consolidation: false
   retention_debug_logging: true
+  retention_feature_diff_logging: false
+  retention_feature_diff_max_epochs: 3
+  routing_debug_logging: false
+  routing_debug_max_epochs: 3
   freeze_old_classifier_weights: true
 
 loss:
@@ -109,6 +113,7 @@ loss:
   lambda_route: 0.01
   kd_temperature: 2.0
   retention_layers: []
+  retention_feature_representation: cls
 
 logging:
   log_every_n_steps: 20
