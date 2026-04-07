@@ -10,8 +10,8 @@ benchmark:
   image_size: 224
 
 training:
-  batch_size: 96
-  epochs_per_task: 40
+  batch_size: 64
+  epochs_per_task: 30
   lr: 5e-4
 
 runtime:

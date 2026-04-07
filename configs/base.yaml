@@ -30,7 +30,7 @@ model:
   local_smoke_backbone_source: internal
   freeze_backbone: true
   selected_blocks: [6, 7, 8, 9, 10, 11]
-  insertion_points: [q_proj, v_proj, mlp_fc1, mlp_fc2]
+  insertion_points: [q_proj, v_proj]
   feature_dim: 768
 
 nh_lora:
@@ -73,12 +73,12 @@ planner:
   use_history_aggregation: true
 
 chu:
-  merge_rate: 0.5
+  merge_rate: 0
   usage_high_threshold: 0.20
   usage_low_threshold: 0.01
   stability_threshold: 0.80
   redundancy_threshold: 0.95
-  freeze_on_keep: true
+  freeze_on_keep: false
 
 classifier:
   type: cosine
@@ -89,13 +89,13 @@ training:
   optimizer: adamw
   lr: 5e-4
   weight_decay: 0.0005
-  epochs_per_task: 40
-  batch_size: 128
+  epochs_per_task: 30
+  batch_size: 64
   grad_clip_norm: 5.0
   use_scheduler: true
   scheduler: cosine
   warmup_epochs: 0
-  debug_eval_around_consolidation: false
+  debug_eval_around_consolidation: true
 
 loss:
   lambda_kd: 2.0
