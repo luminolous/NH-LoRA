@@ -56,6 +56,22 @@ def compute_slot_compatibility(slot_bank, task_embedding: torch.Tensor) -> Dict[
     return compatibility
 
 
+def select_compatible_slot_pool(slot_bank, task_embedding: torch.Tensor, pool_size: int | None = None) -> List[int]:
+    compatibility_scores = compute_slot_compatibility(slot_bank, task_embedding)
+    if not compatibility_scores:
+        return []
+    requested_pool = pool_size if pool_size is not None else max(int(getattr(slot_bank, "router_topk", 1)), 3)
+    effective_pool_size = min(max(int(requested_pool), 1), len(compatibility_scores))
+    return [
+        slot_id
+        for slot_id, _ in sorted(
+            compatibility_scores.items(),
+            key=lambda item: item[1],
+            reverse=True,
+        )[:effective_pool_size]
+    ]
+
+
 def select_most_compatible_slot(slot_bank, task_embedding: torch.Tensor) -> int | None:
     compatibility_scores = compute_slot_compatibility(slot_bank, task_embedding)
     if not compatibility_scores:
@@ -71,10 +87,12 @@ def materialize_action(
     task_id: int,
     max_slots_per_block: int,
     tau_consolidate: float = 0.5,
+    router_candidate_pool: int | None = None,
 ) -> MaterializedLayerPlan:
     del task_id
     live_slots = slot_bank.live_slot_ids()
     compatibility_scores = compute_slot_compatibility(slot_bank, task_embedding)
+    candidate_pool = select_compatible_slot_pool(slot_bank, task_embedding, pool_size=router_candidate_pool)
     shared_gate = float(signals.shared_gate.item())
     consolidate_flag = bool(signals.consolidate.item() >= tau_consolidate)
     rank_budget = max(1, signals.rank_budget)
@@ -124,7 +142,7 @@ def materialize_action(
                 rank_delta=0,
                 create_new_slot=True,
                 new_slot_rank=rank_budget,
-                candidate_slots=[],
+                candidate_slots=candidate_pool,
                 compatibility_scores=compatibility_scores,
                 shared_gate=shared_gate,
                 consolidate_flag=consolidate_flag,
@@ -142,7 +160,7 @@ def materialize_action(
             rank_delta=max(target_rank - current_rank, 0),
             create_new_slot=False,
             new_slot_rank=None,
-            candidate_slots=[selected_slot],
+            candidate_slots=candidate_pool,
             compatibility_scores=compatibility_scores,
             shared_gate=shared_gate,
             consolidate_flag=consolidate_flag,
@@ -160,7 +178,7 @@ def materialize_action(
                 rank_delta=0,
                 create_new_slot=True,
                 new_slot_rank=rank_budget,
-                candidate_slots=[],
+                candidate_slots=candidate_pool,
                 compatibility_scores=compatibility_scores,
                 shared_gate=shared_gate,
                 consolidate_flag=consolidate_flag,
@@ -180,7 +198,7 @@ def materialize_action(
             rank_delta=max(target_rank - current_rank, 0),
             create_new_slot=False,
             new_slot_rank=None,
-            candidate_slots=[selected_slot],
+            candidate_slots=candidate_pool,
             compatibility_scores=compatibility_scores,
             shared_gate=shared_gate,
             consolidate_flag=consolidate_flag,

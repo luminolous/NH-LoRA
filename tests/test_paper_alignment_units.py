@@ -13,6 +13,7 @@ from torch import nn
 from src.datasets.base import ContinualBenchmark, SampleRecord, TaskDefinition
 from src.datasets.transforms import build_cifar_test_transform
 from src.engine.trainer import NHLoRATrainer
+from src.models.chu import ConsolidationHomeostasisUnit
 from src.models.lora import NHLoRALayer
 from src.models.losses import growth_penalty, rank_penalty, routing_balance_loss, slot_orthogonality
 from src.models.nh_lora import NHLoRAModel
@@ -115,6 +116,7 @@ def _build_test_config(output_root: str):
             "bootstrap_slot_rank": 1,
             "max_slots_per_block": 2,
             "router_topk": 1,
+            "router_candidate_pool": 3,
             "router_temperature": 1.0,
             "use_rank_mask": True,
         },
@@ -158,6 +160,8 @@ def _build_test_config(output_root: str):
             "grad_clip_norm": 5.0,
             "use_scheduler": True,
             "scheduler": "cosine",
+            "freeze_old_classifier_weights": True,
+            "retention_debug_logging": True,
         },
         "loss": {
             "lambda_kd": 0.5,
@@ -400,6 +404,136 @@ class PaperAlignmentUnitTests(unittest.TestCase):
         self.assertEqual(materialized.selected_slot, 0)
         self.assertIn(0, materialized.compatibility_scores)
 
+    def test_materialize_action_preserves_candidate_pool(self):
+        layer = NHLoRALayer(
+            embed_dim=8,
+            selected_points=["q_proj"],
+            shared_rank=2,
+            slot_r_max=4,
+            slot_init_rank=1,
+            bootstrap_slot_rank=1,
+            max_slots=4,
+            router_topk=1,
+            router_temperature=1.0,
+            task_embedding_dim=8,
+        )
+        task_embedding = torch.randn(1, 8)
+        for task_id in range(3):
+            slot_id = layer.add_slot(initial_rank=1, task_id=task_id + 1)
+            layer.initialize_slot_key(slot_id, task_embedding + float(task_id) * 0.01)
+        signals = PlannerSignals(
+            novelty=torch.tensor([[0.9]]),
+            conflict=torch.tensor([[0.2]]),
+            rank_score=torch.tensor([[0.75]]),
+            rank_budget=2,
+            consolidate=torch.tensor([[0.6]]),
+            shared_gate=torch.tensor([[0.4]]),
+        )
+
+        materialized = materialize_action(
+            action="expand_rank_existing_slot",
+            signals=signals,
+            slot_bank=layer,
+            task_embedding=task_embedding,
+            task_id=4,
+            max_slots_per_block=4,
+            router_candidate_pool=3,
+        )
+
+        self.assertEqual(len(materialized.candidate_slots), 3)
+        self.assertIn(materialized.selected_slot, materialized.candidate_slots)
+
+    def test_apply_structure_change_keeps_created_slot_in_candidate_pool(self):
+        layer = NHLoRALayer(
+            embed_dim=8,
+            selected_points=["q_proj"],
+            shared_rank=2,
+            slot_r_max=4,
+            slot_init_rank=1,
+            bootstrap_slot_rank=1,
+            max_slots=4,
+            router_topk=2,
+            router_temperature=1.0,
+            task_embedding_dim=8,
+        )
+        task_embedding = torch.randn(1, 8)
+        first_slot = layer.add_slot(initial_rank=1, task_id=1)
+        second_slot = layer.add_slot(initial_rank=1, task_id=2)
+        open_plan = MaterializedLayerPlan(
+            requested_action="open_new_slot",
+            action="open_new_slot",
+            selected_slot=None,
+            target_rank=None,
+            rank_delta=0,
+            create_new_slot=True,
+            new_slot_rank=1,
+            candidate_slots=[first_slot, second_slot],
+        )
+
+        runtime = layer.apply_structure_change(open_plan, task_embedding, task_id=3)
+
+        self.assertEqual(len(layer.slot_metadata), 3)
+        self.assertIn(2, runtime["active_slot_candidates"])
+        self.assertEqual(len(runtime["active_slot_candidates"]), 3)
+
+    def test_route_uses_sparse_distribution_for_candidate_pool(self):
+        layer = NHLoRALayer(
+            embed_dim=8,
+            selected_points=["q_proj"],
+            shared_rank=2,
+            slot_r_max=4,
+            slot_init_rank=1,
+            bootstrap_slot_rank=1,
+            max_slots=4,
+            router_topk=2,
+            router_temperature=1.0,
+            task_embedding_dim=8,
+        )
+        for task_id in range(3):
+            layer.add_slot(initial_rank=1, task_id=task_id + 1)
+        tokens = torch.randn(4, 5, 8)
+
+        route_state = layer.route(
+            tokens,
+            planner_cfg={"active_slot_candidates": [0, 1, 2], "deterministic": False, "shared_only": False},
+            task_state=None,
+        )
+
+        self.assertEqual(route_state["routing_distribution"].shape, (4, 3))
+        self.assertEqual(route_state["routing_weights"].shape[-1], 2)
+        self.assertIn("topk_indices", route_state)
+
+    def test_chu_merge_rate_zero_keeps_merge_candidate_for_inference(self):
+        layer = NHLoRALayer(
+            embed_dim=8,
+            selected_points=["q_proj"],
+            shared_rank=2,
+            slot_r_max=4,
+            slot_init_rank=1,
+            bootstrap_slot_rank=1,
+            max_slots=2,
+            router_topk=1,
+            router_temperature=1.0,
+        )
+        slot_id = layer.add_slot(initial_rank=1, task_id=1)
+        layer.capture_pre_task_snapshot()
+        chu = ConsolidationHomeostasisUnit(
+            {
+                "merge_rate": 0.0,
+                "usage_high_threshold": 0.1,
+                "usage_low_threshold": 0.0,
+                "stability_threshold": 0.0,
+                "redundancy_threshold": 1.0,
+                "freeze_on_keep": False,
+            }
+        )
+
+        report = chu.consolidate_layer(layer, {"consolidate_flag": True}, {slot_id: 1.0})
+
+        self.assertEqual(report.merged_slots, 0)
+        self.assertEqual(report.kept_slots, 1)
+        self.assertTrue(layer.slot_metadata[slot_id].retained_for_inference)
+
     def test_losses_follow_target_formulations(self):
         layer = NHLoRALayer(
             embed_dim=8,
@@ -449,20 +583,22 @@ class PaperAlignmentUnitTests(unittest.TestCase):
         layer = model.layers["1"]
         first_slot = layer.add_slot(initial_rank=1, task_id=1)
         second_slot = layer.add_slot(initial_rank=1, task_id=2)
-        layer.slot_metadata[first_slot].retained_for_inference = False
+        layer.slot_metadata[first_slot].retained_for_inference = True
         layer.slot_metadata[first_slot].usage_ema = 0.9
         layer.slot_metadata[second_slot].retained_for_inference = True
         layer.slot_metadata[second_slot].usage_ema = 0.2
         layer.last_shared_gate = 0.35
         layer.last_structural_action = "expand_rank_existing_slot"
         profile = model.build_inference_profile()
-        self.assertEqual(profile[1]["active_slot_candidates"], [second_slot])
+        self.assertEqual(profile[1]["active_slot_candidates"], [first_slot, second_slot])
+        self.assertIsNone(profile[1]["selected_slot"])
+        self.assertFalse(profile[1]["deterministic"])
         self.assertAlmostEqual(profile[1]["shared_gate"], 0.35, places=6)
 
         layer.last_structural_action = "reuse_shared"
         profile = model.build_inference_profile()
-        self.assertEqual(profile[1]["active_slot_candidates"], [])
-        self.assertTrue(profile[1]["shared_only"])
+        self.assertEqual(profile[1]["active_slot_candidates"], [first_slot, second_slot])
+        self.assertFalse(profile[1]["shared_only"])
 
     def test_bootstrap_task1_invariants(self):
         seed_everything(5, deterministic=True)
@@ -479,6 +615,10 @@ class PaperAlignmentUnitTests(unittest.TestCase):
         self.assertEqual(context["raw_planner"], {})
         self.assertAlmostEqual(float(context["task_state"].similarity.item()), 0.0, places=6)
         self.assertTrue(all(plan["created_new_slot"] for plan in context["applied_plans"].values()))
+        for layer in trainer.model.layers.values():
+            for slot_id in layer.live_slot_ids():
+                self.assertTrue(layer.slot_snapshots[slot_id])
+                self.assertIn(slot_id, layer.estimate_slot_stability())
 
         train_dataset, _ = benchmark.build_task_datasets(0)
         loader = trainer._build_eval_loader(train_dataset)
@@ -537,6 +677,63 @@ class PaperAlignmentUnitTests(unittest.TestCase):
         trainer._mask_old_classifier_gradients({"old_num_classes": 0})
 
         self.assertTrue(torch.allclose(trainer.model.classifier.weight.grad, torch.ones_like(trainer.model.classifier.weight.grad)))
+
+    def test_old_classifier_gradient_masking_can_be_disabled(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "classifier_mask_disabled_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        config["training"]["freeze_old_classifier_weights"] = False
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        logger = configure_logger(level=logging.WARNING)
+        trainer = NHLoRATrainer(config, logger, benchmark=benchmark)
+        trainer.model.classifier.expand(4)
+        trainer.model.classifier.weight.grad = torch.ones_like(trainer.model.classifier.weight)
+
+        trainer._mask_old_classifier_gradients({"old_num_classes": 2})
+
+        self.assertTrue(torch.allclose(trainer.model.classifier.weight.grad, torch.ones_like(trainer.model.classifier.weight.grad)))
+
+    def test_teacher_profile_is_built_from_teacher_model(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "teacher_profile_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        logger = configure_logger(level=logging.WARNING)
+        trainer = NHLoRATrainer(config, logger, benchmark=benchmark)
+        layer = trainer.model.layers["1"]
+        first_slot = layer.add_slot(initial_rank=1, task_id=1)
+        second_slot = layer.add_slot(initial_rank=1, task_id=2)
+        layer.last_structural_action = "reuse_shared"
+        trainer.inference_profile = {1: {"active_slot_candidates": []}}
+
+        _, teacher_profile = trainer._build_teacher_payload()
+
+        self.assertEqual(teacher_profile[1]["active_slot_candidates"], [first_slot, second_slot])
+
+    def test_retention_debug_logging_can_be_disabled(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "retention_debug_disabled_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        config["training"]["retention_debug_logging"] = False
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        logger = configure_logger(level=logging.WARNING)
+        trainer = NHLoRATrainer(config, logger, benchmark=benchmark)
+        context = {"strong_retention_layers": set()}
+
+        self.assertEqual(trainer._active_retention_layers(context), [1])
+        trainer._update_retention_debug(
+            context=context,
+            outputs={"logits": torch.ones(2, 2)},
+            teacher_outputs={"logits": torch.ones(2, 2)},
+            teacher_num_classes=2,
+            retention_layers=[1],
+            kd_term=torch.tensor(0.5),
+            feat_term=torch.tensor(0.25),
+        )
+        self.assertNotIn("last_retention_debug", context)
 
     def test_seed_config_logging_tolerates_missing_optional_fields(self):
         repo_root = Path(__file__).resolve().parents[1]

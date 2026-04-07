@@ -67,7 +67,12 @@ class ConsolidationHomeostasisUnit:
         redundancy: float,
         consolidate_flag: bool,
     ) -> CHUDecision:
-        should_merge = consolidate_flag and usage >= self.usage_high_threshold and stability >= self.stability_threshold
+        should_merge = (
+            self.merge_rate > 0
+            and consolidate_flag
+            and usage >= self.usage_high_threshold
+            and stability >= self.stability_threshold
+        )
         should_prune = usage <= self.usage_low_threshold and redundancy >= self.redundancy_threshold
         should_keep_or_freeze = not should_merge and not should_prune
         return CHUDecision(

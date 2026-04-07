@@ -323,14 +323,13 @@ class NHLoRALayer(nn.Module):
         self.last_structural_action = effective_action
         self.last_consolidate_flag = plan.consolidate_flag
 
-        if effective_action == "reuse_shared":
-            candidate_slots: List[int] = []
-        elif effective_action == "freeze_old_strong_retention":
-            candidate_slots = []
-        elif selected_slot is None:
-            candidate_slots = []
-        else:
-            candidate_slots = [selected_slot]
+        candidate_slots: List[int] = []
+        if not plan.shared_only:
+            for slot_id in plan.candidate_slots:
+                if slot_id in self.live_slot_ids() and slot_id not in candidate_slots:
+                    candidate_slots.append(slot_id)
+            if selected_slot is not None and selected_slot in self.live_slot_ids() and selected_slot not in candidate_slots:
+                candidate_slots.append(selected_slot)
 
         rank_cfg = {slot_id: self.slot_metadata[slot_id].rank for slot_id in self.live_slot_ids()}
         return {

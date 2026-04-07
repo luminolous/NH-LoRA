@@ -41,6 +41,7 @@ nh_lora:
   bootstrap_slot_rank: 4
   max_slots_per_block: 8
   router_topk: 2
+  router_candidate_pool: 3
   router_temperature: 1.0
   use_rank_mask: true
   rank_mask_type: prefix
@@ -95,7 +96,9 @@ training:
   use_scheduler: true
   scheduler: cosine
   warmup_epochs: 0
-  debug_eval_around_consolidation: true
+  debug_eval_around_consolidation: false
+  retention_debug_logging: true
+  freeze_old_classifier_weights: true
 
 loss:
   lambda_kd: 2.0
@@ -105,7 +108,7 @@ loss:
   lambda_grow: 0.05
   lambda_route: 0.01
   kd_temperature: 2.0
-  retention_layers: [10, 11]
+  retention_layers: []
 
 logging:
   log_every_n_steps: 20

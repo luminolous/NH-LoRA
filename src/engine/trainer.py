@@ -277,8 +277,9 @@ class NHLoRATrainer:
             planner_cfg.get("rank_max", "n/a"),
         )
         self.logger.info(
-            "  nh_lora router_topk=%s shared_rank=%s bootstrap_slot_rank=%s slot_r_max=%s max_slots_per_block=%s",
+            "  nh_lora router_topk=%s router_candidate_pool=%s shared_rank=%s bootstrap_slot_rank=%s slot_r_max=%s max_slots_per_block=%s",
             nh_lora_cfg.get("router_topk", "n/a"),
+            nh_lora_cfg.get("router_candidate_pool", "n/a"),
             nh_lora_cfg.get("shared_rank", "n/a"),
             nh_lora_cfg.get("bootstrap_slot_rank", "n/a"),
             nh_lora_cfg.get("slot_r_max", "n/a"),
@@ -294,10 +295,12 @@ class NHLoRATrainer:
             chu_cfg.get("stability_threshold", "n/a"),
         )
         self.logger.info(
-            "  logging estimate_eta=%s cuda_sync_timing=%s debug_eval_around_consolidation=%s",
+            "  logging estimate_eta=%s cuda_sync_timing=%s debug_eval_around_consolidation=%s retention_debug_logging=%s freeze_old_classifier_weights=%s",
             training_cfg.get("estimate_eta", True),
             training_cfg.get("cuda_sync_timing", False),
             training_cfg.get("debug_eval_around_consolidation", False),
+            training_cfg.get("retention_debug_logging", True),
+            training_cfg.get("freeze_old_classifier_weights", True),
         )
 
     def _estimate_eta_for_task(self, epoch_durations: List[float], total_epochs: int, current_epoch: int) -> float | None:
@@ -392,6 +395,8 @@ class NHLoRATrainer:
         return float(sum(forgetting_values) / len(forgetting_values))
 
     def _mask_old_classifier_gradients(self, context: Dict[str, Any]) -> None:
+        if not bool(self.config["training"].get("freeze_old_classifier_weights", True)):
+            return
         old_num_classes = int(context.get("old_num_classes", 0))
         if old_num_classes <= 0:
             return
@@ -402,6 +407,39 @@ class NHLoRATrainer:
         bias = getattr(classifier, "bias", None)
         if bias is not None and getattr(bias, "grad", None) is not None:
             bias.grad[:old_num_classes].zero_()
+
+    def _active_retention_layers(self, context: Dict[str, Any]) -> List[int]:
+        configured_layers = self.config["loss"].get("retention_layers")
+        if configured_layers:
+            retention_layers = {int(layer_id) for layer_id in configured_layers}
+        else:
+            retention_layers = {int(layer_id) for layer_id in self.model.selected_blocks}
+        retention_layers.update(int(layer_id) for layer_id in context["strong_retention_layers"])
+        return sorted(retention_layers)
+
+    def _update_retention_debug(
+        self,
+        context: Dict[str, Any],
+        outputs: Dict[str, Any],
+        teacher_outputs: Dict[str, Any],
+        teacher_num_classes: int,
+        retention_layers: List[int],
+        kd_term: torch.Tensor,
+        feat_term: torch.Tensor,
+    ) -> None:
+        if not bool(self.config["training"].get("retention_debug_logging", True)):
+            return
+        if teacher_num_classes <= 0:
+            return
+        context["last_retention_debug"] = {
+            "teacher_num_classes": int(teacher_num_classes),
+            "old_num_classes": int(context.get("old_num_classes", 0)),
+            "retention_layers": list(retention_layers),
+            "teacher_old_logits_norm": float(teacher_outputs["logits"].detach().norm(dim=-1).mean().item()),
+            "student_old_logits_norm": float(outputs["logits"][:, :teacher_num_classes].detach().norm(dim=-1).mean().item()),
+            "kd_raw": float(kd_term.detach().item()),
+            "feat_raw": float(feat_term.detach().item()),
+        }
 
     def _summarize_task_metrics(
         self,
@@ -601,6 +639,12 @@ class NHLoRATrainer:
                 task_id=task_id,
                 max_slots_per_block=int(self.config["nh_lora"]["max_slots_per_block"]),
                 tau_consolidate=float(self.config["planner"].get("tau_consolidate", 0.5)),
+                router_candidate_pool=int(
+                    self.config["nh_lora"].get(
+                        "router_candidate_pool",
+                        max(int(self.config["nh_lora"].get("router_topk", 1)), 3),
+                    )
+                ),
             )
         return plans
 
@@ -616,7 +660,7 @@ class NHLoRATrainer:
 
     def _build_teacher_payload(self):
         teacher_model = self.model.make_teacher_snapshot()
-        teacher_profile = deepcopy(self.inference_profile)
+        teacher_profile = teacher_model.build_inference_profile()
         return teacher_model, teacher_profile
 
     def _prepare_task_context(self, task_definition: TaskDefinition) -> Dict[str, Any]:
@@ -666,6 +710,7 @@ class NHLoRATrainer:
             for block_id, runtime_cfg in applied_plans.items()
             if bool(runtime_cfg.get("strong_retention", False))
         }
+        self.model.capture_pre_task_snapshots()
         old_num_classes = self.model.classifier.num_classes
         self._expand_classifier_for_task(task_definition, task_state)
         optimizer = self._build_optimizer()
@@ -745,17 +790,25 @@ class NHLoRATrainer:
                     temperature=float(loss_cfg["kd_temperature"]),
                 )
                 total_loss = total_loss + float(loss_cfg["lambda_kd"]) * kd_term
-            retention_layers = set(int(layer_id) for layer_id in loss_cfg.get("retention_layers", []))
-            retention_layers.update(int(layer_id) for layer_id in context["strong_retention_layers"])
+            retention_layers = self._active_retention_layers(context)
             feat_term = feature_retention(
                 outputs["layer_features"],
                 teacher_outputs["layer_features"],
-                layers=sorted(retention_layers),
+                layers=retention_layers,
                 device=self.device,
             )
             total_loss = total_loss + float(loss_cfg["lambda_feat"]) * feat_term
             grow_term = growth_penalty(context["applied_plans"], self.device)
             total_loss = total_loss + float(loss_cfg["lambda_grow"]) * grow_term
+            self._update_retention_debug(
+                context=context,
+                outputs=outputs,
+                teacher_outputs=teacher_outputs,
+                teacher_num_classes=teacher_num_classes,
+                retention_layers=retention_layers,
+                kd_term=kd_term,
+                feat_term=feat_term,
+            )
 
         return {
             "total": total_loss,
@@ -846,7 +899,7 @@ class NHLoRATrainer:
             epoch_history.append(epoch_metrics)
             if bool(self.config["training"].get("log_every_epoch", True)):
                 self.logger.info(
-                    "[Task %d][Epoch %d/%d] loss=%.4f acc=%.4f cls=%.4f kd=%.4f feat=%.4f orth=%.4f rank=%.4f grow=%.4f route=%.4f epoch_time=%.2fs eta_task=%s eta_seed=%s",
+                    "[Task %d][Epoch %d/%d] loss=%.4f acc=%.4f cls=%.4f kd=%.4e feat=%.4e orth=%.4f rank=%.4f grow=%.4f route=%.4f epoch_time=%.2fs eta_task=%s eta_seed=%s",
                     context["task_number"],
                     epoch,
                     epochs_per_task,
@@ -863,6 +916,20 @@ class NHLoRATrainer:
                     self._format_seconds_human_readable(epoch_metrics["eta_task_seconds"]),
                     self._format_seconds_human_readable(epoch_metrics["eta_seed_seconds"]),
                 )
+                if bool(self.config["training"].get("retention_debug_logging", True)) and context.get("last_retention_debug"):
+                    debug = context["last_retention_debug"]
+                    self.logger.info(
+                        "[Retention][Task %d][Epoch %d] teacher_classes=%d old_classes=%d layers=%s teacher_logit_norm=%.4e student_logit_norm=%.4e kd_raw=%.4e feat_raw=%.4e",
+                        context["task_number"],
+                        epoch,
+                        debug["teacher_num_classes"],
+                        debug["old_num_classes"],
+                        debug["retention_layers"],
+                        debug["teacher_old_logits_norm"],
+                        debug["student_old_logits_norm"],
+                        debug["kd_raw"],
+                        debug["feat_raw"],
+                    )
 
         training_time = self._perf_counter() - training_time_start
         usage_stats = self._finalize_usage(usage_accumulator, batch_count)

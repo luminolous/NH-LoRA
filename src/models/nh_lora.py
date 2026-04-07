@@ -115,14 +115,12 @@ class NHLoRAModel(nn.Module):
                     layer.slot_metadata[slot_id].cumulative_usage,
                 ),
                 reverse=True,
-            )[: layer.router_topk]
-            if layer.last_structural_action in {"reuse_shared", "freeze_old_strong_retention"}:
-                live_slots = []
+            )
             profile[block_id] = {
                 "action": "inference_profile",
                 "requested_action": layer.last_structural_action,
                 "active_slot_candidates": live_slots,
-                "selected_slot": live_slots[0] if live_slots else None,
+                "selected_slot": live_slots[0] if len(live_slots) == 1 else None,
                 "rank_cfg": {slot_id: layer.slot_metadata[slot_id].rank for slot_id in layer.live_slot_ids()},
                 "shared_gate": layer.last_shared_gate,
                 "consolidate_flag": layer.last_consolidate_flag,

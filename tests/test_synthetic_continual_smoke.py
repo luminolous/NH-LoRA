@@ -116,6 +116,7 @@ def build_test_config(output_root: str):
             "bootstrap_slot_rank": 2,
             "max_slots_per_block": 4,
             "router_topk": 2,
+            "router_candidate_pool": 3,
             "router_temperature": 1.0,
             "use_rank_mask": True,
         },
@@ -158,6 +159,8 @@ def build_test_config(output_root: str):
             "batch_size": 4,
             "grad_clip_norm": 5.0,
             "debug_eval_around_consolidation": False,
+            "retention_debug_logging": True,
+            "freeze_old_classifier_weights": True,
         },
         "loss": {
             "lambda_kd": 0.5,
@@ -249,16 +252,19 @@ class SyntheticContinualSmokeTest(unittest.TestCase):
         self.assertIn("Seed 7 config:", joined_logs)
         self.assertIn("[Debug][Task 1] pre-consolidation", joined_logs)
         self.assertIn("[Debug][Task 1] post-consolidation", joined_logs)
+        self.assertIn("[Retention][Task 2][Epoch 1]", joined_logs)
 
         for block_id, layer in trainer.model.layers.items():
             self.assertGreaterEqual(len(layer.slot_metadata), 1)
             inference_profile = trainer.inference_profile[int(block_id)]
-            self.assertLessEqual(len(inference_profile["active_slot_candidates"]), layer.router_topk)
-            if layer.last_structural_action in {"reuse_shared", "freeze_old_strong_retention"}:
-                self.assertEqual(inference_profile["active_slot_candidates"], [])
-            else:
-                for slot_id in inference_profile["active_slot_candidates"]:
-                    self.assertTrue(layer.slot_metadata[slot_id].retained_for_inference)
+            retained_live_slots = [
+                slot_id
+                for slot_id in layer.live_slot_ids()
+                if layer.slot_metadata[slot_id].retained_for_inference
+            ]
+            self.assertEqual(set(inference_profile["active_slot_candidates"]), set(retained_live_slots))
+            for slot_id in inference_profile["active_slot_candidates"]:
+                self.assertTrue(layer.slot_metadata[slot_id].retained_for_inference)
 
 
 if __name__ == "__main__":
