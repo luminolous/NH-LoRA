@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import unittest
+from copy import deepcopy
 from pathlib import Path
 from unittest.mock import patch
 
@@ -1006,6 +1007,189 @@ class PaperAlignmentUnitTests(unittest.TestCase):
         self.assertIn("[Routing][Task 2][Epoch 1][Layer 1]", joined_messages)
         self.assertIn("avg_candidate_count=2.00", joined_messages)
         self.assertIn("avg_topk=2.00", joined_messages)
+
+    def test_stage5_slot_lifecycle_summary_exposes_slot_ids_without_mutating_inputs(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "stage5_slot_lifecycle_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        logger = _ListLogger()
+        trainer = NHLoRATrainer(config, logger, benchmark=benchmark)
+        layer = trainer.model.layers["1"]
+        first_slot = layer.add_slot(initial_rank=1, task_id=1)
+        second_slot = layer.add_slot(initial_rank=1, task_id=2)
+        layer.slot_metadata[first_slot].retained_for_inference = False
+        layer.slot_metadata[first_slot].usage_ema = 0.1
+        layer.slot_metadata[second_slot].usage_ema = 0.7
+        layer.freeze_slot(second_slot)
+        config_like = {
+            "active_slot_candidates": [second_slot],
+            "selected_slot": second_slot,
+            "shared_only": False,
+            "fallback_action": None,
+        }
+        before_config = deepcopy(config_like)
+        before_state = deepcopy(layer.export_structure_state())
+
+        summary = trainer._slot_lifecycle_summary(1, config_like=config_like)
+
+        self.assertEqual(summary["live_slot_ids"], [first_slot, second_slot])
+        self.assertEqual(summary["retained_slot_ids"], [second_slot])
+        self.assertEqual(summary["candidate_slot_ids"], [second_slot])
+        self.assertEqual(summary["selected_slot_id"], second_slot)
+        self.assertEqual(summary["frozen_slot_ids"], [second_slot])
+        self.assertEqual(summary["fallback_reason"], "none")
+        self.assertEqual(config_like, before_config)
+        self.assertEqual(layer.export_structure_state(), before_state)
+
+    def test_stage5_profile_summary_uses_retained_live_slots_for_shared_only(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "stage5_profile_summary_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        logger = _ListLogger()
+        trainer = NHLoRATrainer(config, logger, benchmark=benchmark)
+        layer = trainer.model.layers["1"]
+        first_slot = layer.add_slot(initial_rank=1, task_id=1)
+        second_slot = layer.add_slot(initial_rank=1, task_id=2)
+        layer.slot_metadata[first_slot].retained_for_inference = False
+        layer.slot_metadata[second_slot].retained_for_inference = True
+
+        profile = trainer.model.build_inference_profile()
+        summary = trainer._slot_lifecycle_summary(1, config_like=profile[1])
+
+        self.assertEqual(summary["live_slot_ids"], [first_slot, second_slot])
+        self.assertEqual(summary["retained_slot_ids"], [second_slot])
+        self.assertEqual(summary["candidate_slot_ids"], [second_slot])
+        self.assertFalse(profile[1]["shared_only"])
+
+        layer.slot_metadata[second_slot].retained_for_inference = False
+        empty_profile = trainer.model.build_inference_profile()
+        empty_summary = trainer._slot_lifecycle_summary(1, config_like=empty_profile[1])
+
+        self.assertEqual(empty_summary["retained_slot_ids"], [])
+        self.assertEqual(empty_summary["candidate_slot_ids"], [])
+        self.assertTrue(empty_profile[1]["shared_only"])
+
+    def test_stage5_route_comparison_flags_empty_applied_nonempty_profile(self):
+        flags = NHLoRATrainer._route_comparison_flags(
+            applied_candidates=[],
+            train_candidates=[],
+            eval_applied_candidates=[],
+            profile_candidates=[0],
+            eval_profile_candidates=[0],
+        )
+
+        self.assertTrue(flags["applied_empty_profile_nonempty"])
+        self.assertFalse(flags["train_eval_applied_mismatch"])
+        self.assertFalse(flags["eval_profile_mismatch"])
+
+    def test_stage5_plan_debug_does_not_mutate_plan_or_profile_state(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "stage5_no_mutation_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        config["training"]["routing_debug_logging"] = True
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        logger = _ListLogger()
+        trainer = NHLoRATrainer(config, logger, benchmark=benchmark)
+        layer = trainer.model.layers["1"]
+        slot_id = layer.add_slot(initial_rank=1, task_id=1)
+        materialized_plan = MaterializedLayerPlan(
+            requested_action="expand_rank_existing_slot",
+            action="expand_rank_existing_slot",
+            selected_slot=slot_id,
+            target_rank=2,
+            rank_delta=1,
+            create_new_slot=False,
+            new_slot_rank=None,
+            candidate_slots=[slot_id],
+            shared_only=False,
+        )
+        applied_plan = {
+            "action": "expand_rank_existing_slot",
+            "requested_action": "expand_rank_existing_slot",
+            "active_slot_candidates": [slot_id],
+            "selected_slot": slot_id,
+            "rank_cfg": {slot_id: 1},
+            "shared_only": False,
+            "deterministic": True,
+            "created_new_slot": False,
+            "fallback_action": None,
+        }
+        profile = trainer.model.build_inference_profile()
+        before_materialized = deepcopy(materialized_plan)
+        before_applied = deepcopy(applied_plan)
+        before_profile = deepcopy(profile)
+        before_state = deepcopy(layer.export_structure_state())
+        context = {
+            "task_number": 2,
+            "raw_planner": {},
+            "materialized_plans": {1: materialized_plan},
+            "applied_plans": {1: applied_plan},
+        }
+
+        trainer._log_stage5_plan_debug(context)
+        trainer._log_stage5_lifecycle_for_profile(context, "Profile", profile)
+
+        self.assertEqual(materialized_plan, before_materialized)
+        self.assertEqual(applied_plan, before_applied)
+        self.assertEqual(profile, before_profile)
+        self.assertEqual(layer.export_structure_state(), before_state)
+        self.assertIn("[MaterializedPlan][Task 2][Layer 1]", "\n".join(logger.messages))
+
+    def test_stage5_train_eval_comparison_uses_same_input_and_restores_rng(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "stage5_mode_compare_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        config["training"]["routing_debug_logging"] = True
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        logger = _ListLogger()
+        trainer = NHLoRATrainer(config, logger, benchmark=benchmark)
+        trainer.model.classifier.expand(2)
+        layer = trainer.model.layers["1"]
+        slot_id = layer.add_slot(initial_rank=1, task_id=1)
+        applied_plan = {
+            "active_slot_candidates": [slot_id],
+            "selected_slot": slot_id,
+            "rank_cfg": {slot_id: 1},
+            "shared_only": False,
+            "deterministic": True,
+        }
+        materialized_plan = MaterializedLayerPlan(
+            requested_action="expand_rank_existing_slot",
+            action="expand_rank_existing_slot",
+            selected_slot=slot_id,
+            target_rank=1,
+            rank_delta=0,
+            create_new_slot=False,
+            new_slot_rank=None,
+            candidate_slots=[slot_id],
+        )
+        trainer.inference_profile = trainer.model.build_inference_profile()
+        trainer.model.train()
+        torch.manual_seed(1505)
+        probe_images = torch.randn(2, 3, 32, 32)
+        rng_before = torch.random.get_rng_state().clone()
+        context = {
+            "task_number": 2,
+            "task_state": None,
+            "applied_plans": {1: applied_plan},
+            "materialized_plans": {1: materialized_plan},
+            "routing_debug_probe_images": probe_images,
+            "routing_debug_probe_source": "unit-same-input",
+        }
+
+        trainer._log_stage5_train_eval_comparison(context)
+
+        self.assertTrue(trainer.model.training)
+        self.assertTrue(torch.equal(torch.random.get_rng_state(), rng_before))
+        joined_messages = "\n".join(logger.messages)
+        self.assertIn("[RouteModeCompare][Task 2] input_source=unit-same-input", joined_messages)
+        self.assertIn("[RouteModeCompare][Task 2][Layer 1]", joined_messages)
 
     def test_stage4_zero_lora_block_parity_preserves_out_proj_semantics(self):
         torch.manual_seed(1404)

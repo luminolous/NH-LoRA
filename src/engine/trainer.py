@@ -467,6 +467,371 @@ class NHLoRATrainer:
         max_epochs = int(self.config["training"].get(max_epoch_key, 3))
         return epoch > 0 and epoch <= max(max_epochs, 0)
 
+    def _routing_audit_enabled(self) -> bool:
+        return bool(self.config["training"].get("routing_debug_logging", False))
+
+    @staticmethod
+    def _int_list(values) -> List[int]:
+        if values is None:
+            return []
+        return [int(value) for value in values]
+
+    @staticmethod
+    def _float_dict(values: Dict[int, float]) -> Dict[int, float]:
+        return {int(key): float(value) for key, value in values.items()}
+
+    @staticmethod
+    def _candidate_slot_ids(config_like: Dict[str, object] | None) -> List[int]:
+        if not config_like:
+            return []
+        if "active_slot_candidates" in config_like:
+            return NHLoRATrainer._int_list(config_like.get("active_slot_candidates"))
+        if "candidate_slots" in config_like:
+            return NHLoRATrainer._int_list(config_like.get("candidate_slots"))
+        return []
+
+    @staticmethod
+    def _selected_slot_id(config_like: Dict[str, object] | None) -> int | None:
+        if not config_like:
+            return None
+        selected_slot = config_like.get("selected_slot")
+        return None if selected_slot is None else int(selected_slot)
+
+    @staticmethod
+    def _fallback_reason(
+        *,
+        shared_only: bool,
+        fallback_action: object,
+        candidate_slot_ids: List[int],
+        live_slot_ids: List[int],
+    ) -> str:
+        if fallback_action:
+            return str(fallback_action)
+        if shared_only:
+            return "shared_only"
+        if not live_slot_ids:
+            return "no_live_slots"
+        if not candidate_slot_ids:
+            return "empty_candidates"
+        return "none"
+
+    def _slot_lifecycle_summary(
+        self,
+        block_id: int,
+        config_like: Dict[str, object] | None = None,
+    ) -> Dict[str, object]:
+        layer = self.model.layers[str(block_id)]
+        live_slot_ids = self._int_list(layer.live_slot_ids())
+        retained_slot_ids = [
+            slot_id
+            for slot_id in live_slot_ids
+            if layer.slot_metadata[slot_id].retained_for_inference
+        ]
+        frozen_slot_ids = [
+            slot_id
+            for slot_id in live_slot_ids
+            if layer.slot_metadata[slot_id].frozen
+        ]
+        pruned_slot_ids = [
+            int(slot_id)
+            for slot_id, metadata in enumerate(layer.slot_metadata)
+            if metadata.pruned
+        ]
+        candidate_slot_ids = self._candidate_slot_ids(config_like)
+        selected_slot_id = self._selected_slot_id(config_like)
+        shared_only = bool(config_like.get("shared_only", False)) if config_like else False
+        fallback_action = config_like.get("fallback_action") if config_like else None
+        return {
+            "live_slot_ids": live_slot_ids,
+            "retained_slot_ids": retained_slot_ids,
+            "frozen_slot_ids": frozen_slot_ids,
+            "pruned_slot_ids": pruned_slot_ids,
+            "candidate_slot_ids": candidate_slot_ids,
+            "selected_slot_id": selected_slot_id,
+            "rank_by_slot": {slot_id: int(layer.slot_metadata[slot_id].rank) for slot_id in live_slot_ids},
+            "usage_ema_by_slot": self._float_dict({slot_id: layer.slot_metadata[slot_id].usage_ema for slot_id in live_slot_ids}),
+            "cumulative_usage_by_slot": self._float_dict(
+                {slot_id: layer.slot_metadata[slot_id].cumulative_usage for slot_id in live_slot_ids}
+            ),
+            "shared_only": shared_only,
+            "fallback_action": None if fallback_action is None else str(fallback_action),
+            "fallback_reason": self._fallback_reason(
+                shared_only=shared_only,
+                fallback_action=fallback_action,
+                candidate_slot_ids=candidate_slot_ids,
+                live_slot_ids=live_slot_ids,
+            ),
+        }
+
+    def _log_slot_lifecycle_summary(
+        self,
+        *,
+        context: Dict[str, Any],
+        label: str,
+        block_id: int,
+        config_like: Dict[str, object] | None = None,
+    ) -> Dict[str, object]:
+        summary = self._slot_lifecycle_summary(block_id, config_like=config_like)
+        self.logger.info(
+            "[SlotLifecycle][Task %d][%s][Layer %d] live=%s retained=%s candidates=%s selected=%s shared_only=%s fallback=%s frozen=%s pruned=%s ranks=%s usage_ema=%s cumulative_usage=%s",
+            context["task_number"],
+            label,
+            int(block_id),
+            summary["live_slot_ids"],
+            summary["retained_slot_ids"],
+            summary["candidate_slot_ids"],
+            summary["selected_slot_id"],
+            summary["shared_only"],
+            summary["fallback_reason"],
+            summary["frozen_slot_ids"],
+            summary["pruned_slot_ids"],
+            summary["rank_by_slot"],
+            summary["usage_ema_by_slot"],
+            summary["cumulative_usage_by_slot"],
+        )
+        return summary
+
+    def _log_stage5_plan_debug(self, context: Dict[str, Any]) -> None:
+        if not self._routing_audit_enabled():
+            return
+        raw_planner = context.get("raw_planner", {})
+        materialized_plans = context.get("materialized_plans", {})
+        applied_plans = context.get("applied_plans", {})
+        context.setdefault("stage5_slot_lifecycle", {})
+        for block_id in self.model.selected_blocks:
+            signals = raw_planner.get(block_id)
+            if signals is not None:
+                action = self.planner.decide_action(signals)
+                self.logger.info(
+                    "[RawPlanner][Task %d][Layer %d] action=%s novelty=%.4f conflict=%.4f shared_gate=%.4f consolidate=%.4f rank_budget=%d",
+                    context["task_number"],
+                    int(block_id),
+                    action,
+                    float(signals.novelty.item()),
+                    float(signals.conflict.item()),
+                    float(signals.shared_gate.item()),
+                    float(signals.consolidate.item()),
+                    int(signals.rank_budget),
+                )
+            plan = materialized_plans.get(block_id)
+            if plan is not None:
+                plan_config = {
+                    "candidate_slots": list(plan.candidate_slots),
+                    "selected_slot": plan.selected_slot,
+                    "shared_only": plan.shared_only,
+                    "fallback_action": plan.fallback_action,
+                }
+                live_slot_ids = self._slot_lifecycle_summary(block_id)["live_slot_ids"]
+                fallback_reason = self._fallback_reason(
+                    shared_only=bool(plan.shared_only),
+                    fallback_action=plan.fallback_action,
+                    candidate_slot_ids=self._int_list(plan.candidate_slots),
+                    live_slot_ids=live_slot_ids,
+                )
+                self.logger.info(
+                    "[MaterializedPlan][Task %d][Layer %d] action=%s requested=%s shared_only=%s fallback=%s live=%s candidates=%s selected=%s create_new_slot=%s",
+                    context["task_number"],
+                    int(block_id),
+                    plan.action,
+                    plan.requested_action,
+                    bool(plan.shared_only),
+                    fallback_reason,
+                    live_slot_ids,
+                    self._int_list(plan.candidate_slots),
+                    None if plan.selected_slot is None else int(plan.selected_slot),
+                    bool(plan.create_new_slot),
+                )
+                context["stage5_slot_lifecycle"].setdefault("materialized", {})[int(block_id)] = self._log_slot_lifecycle_summary(
+                    context=context,
+                    label="Materialized",
+                    block_id=int(block_id),
+                    config_like=plan_config,
+                )
+            applied = applied_plans.get(block_id)
+            if applied is not None:
+                self.logger.info(
+                    "[AppliedPlan][Task %d][Layer %d] action=%s requested=%s shared_only=%s deterministic=%s fallback=%s candidates=%s selected=%s created_new_slot=%s",
+                    context["task_number"],
+                    int(block_id),
+                    applied.get("action"),
+                    applied.get("requested_action"),
+                    bool(applied.get("shared_only", False)),
+                    bool(applied.get("deterministic", False)),
+                    self._slot_lifecycle_summary(block_id, applied)["fallback_reason"],
+                    self._candidate_slot_ids(applied),
+                    self._selected_slot_id(applied),
+                    bool(applied.get("created_new_slot", False)),
+                )
+                context["stage5_slot_lifecycle"].setdefault("applied", {})[int(block_id)] = self._log_slot_lifecycle_summary(
+                    context=context,
+                    label="Applied",
+                    block_id=int(block_id),
+                    config_like=applied,
+                )
+
+    def _log_stage5_lifecycle_for_profile(self, context: Dict[str, Any], label: str, profile: Dict[int, Dict[str, object]]) -> None:
+        if not self._routing_audit_enabled():
+            return
+        lifecycle = context.setdefault("stage5_slot_lifecycle", {}).setdefault(label, {})
+        for block_id in self.model.selected_blocks:
+            layer_profile = profile.get(block_id, {})
+            summary = self._log_slot_lifecycle_summary(
+                context=context,
+                label=label,
+                block_id=int(block_id),
+                config_like=layer_profile,
+            )
+            lifecycle[int(block_id)] = summary
+            self.logger.info(
+                "[InferenceProfile][Task %d][%s][Layer %d] active_candidates=%s selected=%s retained=%s retained_count=%d shared_only=%s deterministic=%s",
+                context["task_number"],
+                label,
+                int(block_id),
+                summary["candidate_slot_ids"],
+                summary["selected_slot_id"],
+                summary["retained_slot_ids"],
+                len(summary["retained_slot_ids"]),
+                bool(layer_profile.get("shared_only", False)),
+                bool(layer_profile.get("deterministic", False)),
+            )
+
+    def _dropout_training_count(self) -> int:
+        return sum(1 for module in self.model.modules() if isinstance(module, nn.Dropout) and module.training)
+
+    @staticmethod
+    def _route_comparison_flags(
+        *,
+        applied_candidates: List[int],
+        train_candidates: List[int],
+        eval_applied_candidates: List[int],
+        profile_candidates: List[int],
+        eval_profile_candidates: List[int],
+    ) -> Dict[str, bool]:
+        return {
+            "applied_empty_profile_nonempty": bool(not applied_candidates and profile_candidates),
+            "train_eval_applied_mismatch": bool(train_candidates != eval_applied_candidates),
+            "eval_profile_mismatch": bool(profile_candidates != eval_profile_candidates),
+        }
+
+    def _route_probe_forward(
+        self,
+        *,
+        images: torch.Tensor,
+        planner_out: Dict[int, Dict[str, object]],
+        task_state: TaskState | None,
+        train_mode: bool,
+    ) -> Dict[str, object]:
+        previous_mode = self.model.training
+        try:
+            self.model.train(mode=train_mode)
+            dropout_training_count = self._dropout_training_count()
+            with torch.no_grad():
+                grad_enabled = torch.is_grad_enabled()
+                outputs = self.model.forward_with_state(images, task_state=task_state, planner_out=planner_out)
+            return {
+                "model_training": bool(self.model.training),
+                "grad_enabled": bool(grad_enabled),
+                "dropout_training_count": int(dropout_training_count),
+                "route_info": outputs["route_info"],
+            }
+        finally:
+            self.model.train(mode=previous_mode)
+
+    def _log_stage5_train_eval_comparison(self, context: Dict[str, Any]) -> None:
+        if not self._routing_audit_enabled() or int(context.get("task_number", 1)) <= 1:
+            return
+        probe_images = context.get("routing_debug_probe_images")
+        if not isinstance(probe_images, torch.Tensor):
+            self.logger.warning(
+                "[RouteModeCompare][Task %d] skipped: no same-input train batch was captured.",
+                context["task_number"],
+            )
+            return
+        input_source = str(context.get("routing_debug_probe_source", "unknown"))
+        images = probe_images.to(self.device)
+        applied_plans = context["applied_plans"]
+        inference_profile = self.inference_profile
+        cpu_rng_state = torch.random.get_rng_state()
+        cuda_rng_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        try:
+            train_probe = self._route_probe_forward(
+                images=images,
+                planner_out=applied_plans,
+                task_state=context["task_state"],
+                train_mode=True,
+            )
+            eval_applied_probe = self._route_probe_forward(
+                images=images,
+                planner_out=applied_plans,
+                task_state=context["task_state"],
+                train_mode=False,
+            )
+            eval_profile_probe = self._route_probe_forward(
+                images=images,
+                planner_out=inference_profile,
+                task_state=None,
+                train_mode=False,
+            )
+        finally:
+            torch.random.set_rng_state(cpu_rng_state)
+            if cuda_rng_state is not None:
+                torch.cuda.set_rng_state_all(cuda_rng_state)
+        self.logger.info(
+            "[RouteModeCompare][Task %d] input_source=%s train_mode=%s train_grad_enabled=%s train_dropout_modules=%d eval_applied_mode=%s eval_applied_grad_enabled=%s eval_applied_dropout_modules=%d eval_profile_mode=%s eval_profile_grad_enabled=%s eval_profile_dropout_modules=%d",
+            context["task_number"],
+            input_source,
+            train_probe["model_training"],
+            train_probe["grad_enabled"],
+            train_probe["dropout_training_count"],
+            eval_applied_probe["model_training"],
+            eval_applied_probe["grad_enabled"],
+            eval_applied_probe["dropout_training_count"],
+            eval_profile_probe["model_training"],
+            eval_profile_probe["grad_enabled"],
+            eval_profile_probe["dropout_training_count"],
+        )
+        train_route = train_probe["route_info"]
+        eval_applied_route = eval_applied_probe["route_info"]
+        eval_profile_route = eval_profile_probe["route_info"]
+        for block_id in self.model.selected_blocks:
+            train_layer = train_route.get(block_id, {})
+            eval_applied_layer = eval_applied_route.get(block_id, {})
+            eval_profile_layer = eval_profile_route.get(block_id, {})
+            materialized_plan = context["materialized_plans"].get(block_id)
+            materialized_candidates = self._int_list(materialized_plan.candidate_slots) if materialized_plan is not None else []
+            applied_candidates = self._candidate_slot_ids(applied_plans.get(block_id, {}))
+            profile_candidates = self._candidate_slot_ids(inference_profile.get(block_id, {}))
+            train_candidates = self._candidate_slot_ids(train_layer)
+            eval_applied_candidates = self._candidate_slot_ids(eval_applied_layer)
+            eval_profile_candidates = self._candidate_slot_ids(eval_profile_layer)
+            retained_slots = self._slot_lifecycle_summary(block_id, inference_profile.get(block_id, {}))["retained_slot_ids"]
+            comparison_flags = self._route_comparison_flags(
+                applied_candidates=applied_candidates,
+                train_candidates=train_candidates,
+                eval_applied_candidates=eval_applied_candidates,
+                profile_candidates=profile_candidates,
+                eval_profile_candidates=eval_profile_candidates,
+            )
+            self.logger.info(
+                "[RouteModeCompare][Task %d][Layer %d] materialized_candidates=%s applied_candidates=%s train_candidates=%s eval_applied_candidates=%s profile_candidates=%s eval_profile_candidates=%s retained=%s selected_train=%s selected_eval_profile=%s shared_only_train=%s shared_only_profile=%s mismatch_applied_empty_profile_nonempty=%s mismatch_train_eval_applied=%s mismatch_eval_profile=%s",
+                context["task_number"],
+                int(block_id),
+                materialized_candidates,
+                applied_candidates,
+                train_candidates,
+                eval_applied_candidates,
+                profile_candidates,
+                eval_profile_candidates,
+                retained_slots,
+                self._int_list(train_layer.get("selected_slots", [])),
+                self._int_list(eval_profile_layer.get("selected_slots", [])),
+                bool(applied_plans.get(block_id, {}).get("shared_only", False)),
+                bool(inference_profile.get(block_id, {}).get("shared_only", False)),
+                comparison_flags["applied_empty_profile_nonempty"],
+                comparison_flags["train_eval_applied_mismatch"],
+                comparison_flags["eval_profile_mismatch"],
+            )
+
     def _plans_for_training_forward(self, context: Dict[str, Any]) -> Dict[int, Dict[str, object]]:
         if not self._epoch_debug_enabled(
             context,
@@ -1109,7 +1474,7 @@ class NHLoRATrainer:
         optimizer = self._build_optimizer()
         scheduler = self._build_scheduler(optimizer)
 
-        return {
+        context = {
             "task_definition": task_definition,
             "task_number": task_number,
             "task_state": detach_task_state(task_state),
@@ -1125,6 +1490,8 @@ class NHLoRATrainer:
             "old_num_classes": old_num_classes,
             "old_classifier_weight_snapshot": old_classifier_weight_snapshot,
         }
+        self._log_stage5_plan_debug(context)
+        return context
 
     def _accumulate_usage(self, accumulator: Dict[int, Dict[int, float]], route_info: Dict[int, Dict[str, object]]) -> None:
         for block_id, layer_state in route_info.items():
@@ -1325,6 +1692,11 @@ class NHLoRATrainer:
             epoch_total = 0
             for batch in train_loader:
                 images, labels = self._prepare_images_labels(batch)
+                if self._routing_audit_enabled() and "routing_debug_probe_images" not in context:
+                    context["routing_debug_probe_images"] = images.detach().clone()
+                    context["routing_debug_probe_source"] = (
+                        f"task={context['task_number']} epoch={epoch} batch_index={batch_count}"
+                    )
                 optimizer.zero_grad(set_to_none=True)
                 planner_out = self._plans_for_training_forward(context)
                 outputs = self.model.forward_with_state(images, context["task_state"], planner_out)
@@ -1423,6 +1795,12 @@ class NHLoRATrainer:
         usage_stats = self._finalize_usage(usage_accumulator, batch_count)
         for block_id, stats in usage_stats.items():
             self.model.layers[str(block_id)].update_usage_statistics(stats)
+        if self._routing_audit_enabled():
+            self._log_stage5_lifecycle_for_profile(
+                context=context,
+                label="PreCHUProfile",
+                profile=self.model.build_inference_profile(),
+            )
 
         debug_eval = bool(self.config["training"].get("debug_eval_around_consolidation", False))
         if debug_eval:
@@ -1443,6 +1821,12 @@ class NHLoRATrainer:
             for block_id, layer_profile in self.inference_profile.items()
             if bool(layer_profile.get("shared_only", False))
         ]
+        self._log_stage5_lifecycle_for_profile(
+            context=context,
+            label="PostCHUProfile",
+            profile=self.inference_profile,
+        )
+        self._log_stage5_train_eval_comparison(context)
         self._append_history(context, usage_stats)
         self.last_train_state["history_sizes"].append(len(self.history_bank.entries))
 

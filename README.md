@@ -59,6 +59,11 @@ Optional Stage 2 diagnostic knobs live under `training`: `classifier_lr_scale`,
 baseline behavior and are intended for head-dominance ablation, not as a change to
 the NH-LoRA paper objective.
 
+Optional Stage 5 routing diagnostics are enabled by `training.routing_debug_logging`.
+They log planner/materialized/applied routing state, slot ids, retained inference
+profile slots, and same-input train-vs-eval route comparisons without changing
+planner, CHU, loss, or inference policy.
+
 ## Bootstrap Task 1
 
 Task 1 is intentionally special:

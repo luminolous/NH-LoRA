@@ -72,6 +72,11 @@ The design paper is the primary source of truth. When paper detail was ambiguous
   and `training.freeze_all_classifier_epochs` are default-off Stage 2 ablation knobs for
   testing head dominance. They do not add rehearsal memory or alter the paper objective
   when left at defaults.
+- Routing audit note: `training.routing_debug_logging` also enables Stage 5
+  diagnostics that report raw planner decisions, materialized/applied candidate slot ids,
+  retained inference-profile slot ids, and same-input train-vs-eval route comparisons.
+  These logs are observational and do not change planner, CHU, objective, or inference
+  policy.
 
 ### CHU
 
