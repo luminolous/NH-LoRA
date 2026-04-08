@@ -23,6 +23,15 @@ class PlannerSignals:
 
 
 @dataclass
+class PlannerControlOutputs:
+    shared_gate: torch.Tensor
+    history_attention: torch.Tensor | None = None
+    history_context: torch.Tensor | None = None
+    planner_input: torch.Tensor | None = None
+    planner_representation: torch.Tensor | None = None
+
+
+@dataclass
 class MaterializedLayerPlan:
     requested_action: str
     action: str
@@ -210,7 +219,7 @@ def materialize_action(
     raise ValueError(f"Unsupported planner action: {action}")
 
 
-class HorizonPlanner(nn.Module):
+class _PlannerBranchBase(nn.Module):
     def __init__(
         self,
         selected_blocks: List[int],
@@ -218,17 +227,10 @@ class HorizonPlanner(nn.Module):
         history_dim: int,
         hidden_dim: int,
         layer_embedding_dim: int,
-        rank_min: int,
-        rank_max: int,
-        tau_novelty: float,
-        tau_conflict: float,
+        output_dim: int,
     ):
         super().__init__()
         self.selected_blocks = list(selected_blocks)
-        self.rank_min = rank_min
-        self.rank_max = rank_max
-        self.tau_novelty = tau_novelty
-        self.tau_conflict = tau_conflict
         self.layer_embeddings = nn.Embedding(max(selected_blocks) + 1, layer_embedding_dim)
         self.history_query = nn.Linear(task_embedding_dim, task_embedding_dim)
         self.history_key = nn.Linear(history_dim, task_embedding_dim)
@@ -241,7 +243,7 @@ class HorizonPlanner(nn.Module):
                 nn.Linear(input_dim, hidden_dim),
                 nn.GELU(),
             )
-            self.output_heads[str(block_id)] = nn.Linear(hidden_dim, 5)
+            self.output_heads[str(block_id)] = nn.Linear(hidden_dim, output_dim)
 
     def aggregate_history(self, task_embedding: torch.Tensor, history_summary: torch.Tensor | None):
         if history_summary is None or history_summary.numel() == 0:
@@ -277,11 +279,52 @@ class HorizonPlanner(nn.Module):
             dim=-1,
         )
 
-    def forward(self, block_id: int, task_embedding: torch.Tensor, history_summary: torch.Tensor | None) -> PlannerSignals:
+    def forward_branch(
+        self,
+        block_id: int,
+        task_embedding: torch.Tensor,
+        history_summary: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor]:
         history_context, history_attention = self.aggregate_history(task_embedding, history_summary)
         planner_input = self.compose_layer_input(block_id, task_embedding, history_context)
         planner_representation = self.trunks[str(block_id)](planner_input)
         outputs = self.output_heads[str(block_id)](planner_representation)
+        return outputs, history_context, history_attention, planner_input, planner_representation
+
+
+class PlannerPolicyBranch(_PlannerBranchBase):
+    def __init__(
+        self,
+        selected_blocks: List[int],
+        task_embedding_dim: int,
+        history_dim: int,
+        hidden_dim: int,
+        layer_embedding_dim: int,
+        rank_min: int,
+        rank_max: int,
+    ):
+        super().__init__(
+            selected_blocks=selected_blocks,
+            task_embedding_dim=task_embedding_dim,
+            history_dim=history_dim,
+            hidden_dim=hidden_dim,
+            layer_embedding_dim=layer_embedding_dim,
+            output_dim=5,
+        )
+        self.rank_min = rank_min
+        self.rank_max = rank_max
+
+    def forward_policy(
+        self,
+        block_id: int,
+        task_embedding: torch.Tensor,
+        history_summary: torch.Tensor | None,
+    ) -> PlannerSignals:
+        outputs, history_context, history_attention, planner_input, planner_representation = self.forward_branch(
+            block_id,
+            task_embedding,
+            history_summary,
+        )
         novelty = torch.sigmoid(outputs[:, 0:1])
         conflict = torch.sigmoid(outputs[:, 1:2])
         rank_score = torch.sigmoid(outputs[:, 2:3])
@@ -300,6 +343,140 @@ class HorizonPlanner(nn.Module):
             planner_input=planner_input,
             planner_representation=planner_representation,
         )
+
+
+class PlannerControlBranch(_PlannerBranchBase):
+    def __init__(
+        self,
+        selected_blocks: List[int],
+        task_embedding_dim: int,
+        history_dim: int,
+        hidden_dim: int,
+        layer_embedding_dim: int,
+    ):
+        super().__init__(
+            selected_blocks=selected_blocks,
+            task_embedding_dim=task_embedding_dim,
+            history_dim=history_dim,
+            hidden_dim=hidden_dim,
+            layer_embedding_dim=layer_embedding_dim,
+            output_dim=1,
+        )
+
+    def forward_control(
+        self,
+        block_id: int,
+        task_embedding: torch.Tensor,
+        history_summary: torch.Tensor | None,
+    ) -> PlannerControlOutputs:
+        outputs, history_context, history_attention, planner_input, planner_representation = self.forward_branch(
+            block_id,
+            task_embedding,
+            history_summary,
+        )
+        return PlannerControlOutputs(
+            shared_gate=torch.sigmoid(outputs[:, 0:1]),
+            history_attention=history_attention,
+            history_context=history_context,
+            planner_input=planner_input,
+            planner_representation=planner_representation,
+        )
+
+
+class HorizonPlanner(nn.Module):
+    def __init__(
+        self,
+        selected_blocks: List[int],
+        task_embedding_dim: int,
+        history_dim: int,
+        hidden_dim: int,
+        layer_embedding_dim: int,
+        rank_min: int,
+        rank_max: int,
+        tau_novelty: float,
+        tau_conflict: float,
+    ):
+        super().__init__()
+        self.selected_blocks = list(selected_blocks)
+        self.rank_min = rank_min
+        self.rank_max = rank_max
+        self.tau_novelty = tau_novelty
+        self.tau_conflict = tau_conflict
+        self.policy_branch = PlannerPolicyBranch(
+            selected_blocks=selected_blocks,
+            task_embedding_dim=task_embedding_dim,
+            history_dim=history_dim,
+            hidden_dim=hidden_dim,
+            layer_embedding_dim=layer_embedding_dim,
+            rank_min=rank_min,
+            rank_max=rank_max,
+        )
+        self.control_branch = PlannerControlBranch(
+            selected_blocks=selected_blocks,
+            task_embedding_dim=task_embedding_dim,
+            history_dim=history_dim,
+            hidden_dim=hidden_dim,
+            layer_embedding_dim=layer_embedding_dim,
+        )
+        # Keep legacy attribute names available for tests and existing diagnostics.
+        self.layer_embeddings = self.policy_branch.layer_embeddings
+        self.history_query = self.policy_branch.history_query
+        self.history_key = self.policy_branch.history_key
+        self.history_value = self.policy_branch.history_value
+        self.trunks = self.policy_branch.trunks
+        self.output_heads = self.policy_branch.output_heads
+
+    def aggregate_history(self, task_embedding: torch.Tensor, history_summary: torch.Tensor | None):
+        return self.policy_branch.aggregate_history(task_embedding, history_summary)
+
+    def compose_layer_input(
+        self,
+        block_id: int,
+        task_embedding: torch.Tensor,
+        history_context: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.policy_branch.compose_layer_input(block_id, task_embedding, history_context)
+
+    def forward_policy(
+        self,
+        block_id: int,
+        task_embedding: torch.Tensor,
+        history_summary: torch.Tensor | None,
+    ) -> PlannerSignals:
+        return self.policy_branch.forward_policy(block_id, task_embedding, history_summary)
+
+    def forward_control(
+        self,
+        block_id: int,
+        task_embedding: torch.Tensor,
+        history_summary: torch.Tensor | None,
+    ) -> PlannerControlOutputs:
+        return self.control_branch.forward_control(block_id, task_embedding, history_summary)
+
+    def policy_parameters(self):
+        return self.policy_branch.parameters()
+
+    def control_parameters(self):
+        return self.control_branch.parameters()
+
+    def freeze_policy_branch(self) -> None:
+        for parameter in self.policy_branch.parameters():
+            parameter.requires_grad = False
+
+    def unfreeze_policy_branch(self) -> None:
+        for parameter in self.policy_branch.parameters():
+            parameter.requires_grad = True
+
+    def freeze_control_branch(self) -> None:
+        for parameter in self.control_branch.parameters():
+            parameter.requires_grad = False
+
+    def unfreeze_control_branch(self) -> None:
+        for parameter in self.control_branch.parameters():
+            parameter.requires_grad = True
+
+    def forward(self, block_id: int, task_embedding: torch.Tensor, history_summary: torch.Tensor | None) -> PlannerSignals:
+        return self.forward_policy(block_id, task_embedding, history_summary)
 
     def decide_action(self, signals: PlannerSignals) -> str:
         novelty = float(signals.novelty.item())

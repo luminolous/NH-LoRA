@@ -67,8 +67,13 @@ class ProjectionBank(nn.Module):
         self.slot_b.append(slot_b)
         return len(self.slot_a) - 1
 
-    def shared_delta(self, hidden_states: torch.Tensor, shared_gate: float) -> torch.Tensor:
+    def shared_delta(self, hidden_states: torch.Tensor, shared_gate: float | torch.Tensor) -> torch.Tensor:
         delta = F.linear(F.linear(hidden_states, self.shared_a), self.shared_b)
+        if isinstance(shared_gate, torch.Tensor):
+            gate = shared_gate.to(device=delta.device, dtype=delta.dtype)
+            while gate.dim() < delta.dim():
+                gate = gate.unsqueeze(-1)
+            return delta * gate
         return delta * float(shared_gate)
 
     def slot_delta(self, hidden_states: torch.Tensor, slot_id: int, rank: int) -> torch.Tensor:
@@ -441,7 +446,7 @@ class NHLoRALayer(nn.Module):
         if point_name not in self.selected_points:
             return hidden_states.new_zeros(*hidden_states.shape[:-1], self._point_output_dim(point_name))
         bank = self.point_banks[sanitize_key(point_name)]
-        delta = bank.shared_delta(hidden_states, shared_gate=float(planner_cfg.get("shared_gate", 1.0)))
+        delta = bank.shared_delta(hidden_states, shared_gate=planner_cfg.get("shared_gate", 1.0))
         self._record_delta_debug("shared", point_name, delta, planner_cfg)
         return delta
 

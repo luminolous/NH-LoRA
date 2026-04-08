@@ -69,6 +69,13 @@ They log planner threshold margins, action trajectories, optimizer membership,
 pre-step planner grad statistics, parameter drift from initialization and post-Task-1,
 and task-state/planner-input summaries without changing planner behavior.
 
+Stage 8 adds an opt-in hybrid planner mode via `training.planner_mode=hybrid`.
+In hybrid mode, structural policy remains pre-task and non-differentiable, while a
+separate planner control branch recomputes learned shared-gate values during training
+forward passes so task loss can update the control path honestly. Stage 8 Checkpoint A
+does not change planner thresholds, CHU, or discrete structural actions, and it defers
+soft-rank training.
+
 ## Bootstrap Task 1
 
 Task 1 is intentionally special:

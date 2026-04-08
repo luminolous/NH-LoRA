@@ -18,6 +18,14 @@ class ConfigAndSummarySmokeTest(unittest.TestCase):
         self.assertEqual(config["training"]["freeze_new_classifier_epochs"], 0)
         self.assertEqual(config["training"]["freeze_all_classifier_epochs"], 0)
         self.assertFalse(config["training"]["planner_audit_logging"])
+        self.assertEqual(config["training"]["planner_mode"], "legacy")
+        self.assertEqual(config["training"]["planner_control_recompute"], "per_batch")
+        self.assertFalse(config["training"]["planner_policy_trainable"])
+        self.assertTrue(config["training"]["planner_control_trainable"])
+        self.assertTrue(config["training"]["planner_use_learned_shared_gate"])
+        self.assertFalse(config["training"]["planner_soft_rank_training"])
+        self.assertAlmostEqual(config["training"]["planner_soft_rank_temperature"], 0.5, places=6)
+        self.assertTrue(config["training"]["planner_hard_rank_eval"])
 
         workspace_tmp = repo_root / "outputs" / "test_tmp" / "config_summary_runtime"
         workspace_tmp.mkdir(parents=True, exist_ok=True)

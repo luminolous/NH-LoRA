@@ -103,6 +103,14 @@ training:
   routing_debug_logging: false
   routing_debug_max_epochs: 3
   planner_audit_logging: false
+  planner_mode: legacy
+  planner_control_recompute: per_batch
+  planner_policy_trainable: false
+  planner_control_trainable: true
+  planner_use_learned_shared_gate: true
+  planner_soft_rank_training: false
+  planner_soft_rank_temperature: 0.5
+  planner_hard_rank_eval: true
   adapter_delta_debug_logging: false
   adapter_delta_debug_max_epochs: 3
   final_feature_diff_debug_logging: false

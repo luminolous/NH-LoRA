@@ -164,6 +164,15 @@ def build_test_config(output_root: str):
             "retention_feature_diff_max_epochs": 3,
             "routing_debug_logging": False,
             "routing_debug_max_epochs": 3,
+            "planner_audit_logging": False,
+            "planner_mode": "legacy",
+            "planner_control_recompute": "per_batch",
+            "planner_policy_trainable": False,
+            "planner_control_trainable": True,
+            "planner_use_learned_shared_gate": True,
+            "planner_soft_rank_training": False,
+            "planner_soft_rank_temperature": 0.5,
+            "planner_hard_rank_eval": True,
             "freeze_old_classifier_weights": True,
         },
         "loss": {
@@ -277,6 +286,27 @@ class SyntheticContinualSmokeTest(unittest.TestCase):
             self.assertEqual(set(inference_profile["active_slot_candidates"]), set(retained_live_slots))
             for slot_id in inference_profile["active_slot_candidates"]:
                 self.assertTrue(layer.slot_metadata[slot_id].retained_for_inference)
+
+    def test_two_task_hybrid_planner_smoke(self):
+        seed_everything(9, deterministic=True)
+        benchmark = build_synthetic_benchmark()
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "synthetic_smoke_hybrid_runtime"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = build_test_config(str(workspace_tmp))
+        config["training"]["planner_mode"] = "hybrid"
+        logger = ListLogger()
+        trainer = NHLoRATrainer(config, logger, benchmark=benchmark)
+        metrics = trainer.train(seed=9)
+
+        self.assertEqual(metrics["benchmark"], "synthetic_smoke")
+        self.assertIn("final_avg_acc", metrics)
+        joined_logs = "\n".join(logger.messages)
+        self.assertIn("[HybridPlannerConfig][Task 1]", joined_logs)
+        self.assertIn("[PlannerPolicyTrainPath][Task 1]", joined_logs)
+        self.assertIn("[PlannerControlTrainPath][Task 1]", joined_logs)
+        self.assertIn("[PlannerControlValues][Task 2][Epoch 1][Layer 1]", joined_logs)
+        self.assertIn("[PlannerControlParamDrift][Task 2]", joined_logs)
 
 
 if __name__ == "__main__":

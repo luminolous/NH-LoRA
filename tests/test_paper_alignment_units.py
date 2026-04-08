@@ -172,6 +172,14 @@ def _build_test_config(output_root: str):
             "routing_debug_logging": False,
             "routing_debug_max_epochs": 3,
             "planner_audit_logging": False,
+            "planner_mode": "legacy",
+            "planner_control_recompute": "per_batch",
+            "planner_policy_trainable": False,
+            "planner_control_trainable": True,
+            "planner_use_learned_shared_gate": True,
+            "planner_soft_rank_training": False,
+            "planner_soft_rank_temperature": 0.5,
+            "planner_hard_rank_eval": True,
             "adapter_delta_debug_logging": False,
             "adapter_delta_debug_max_epochs": 3,
             "final_feature_diff_debug_logging": False,
@@ -294,6 +302,33 @@ class PaperAlignmentUnitTests(unittest.TestCase):
             dim=-1,
         )
         self.assertTrue(torch.allclose(signals.planner_input, expected, atol=1e-6))
+
+    def test_hybrid_planner_exposes_separate_policy_and_control_params(self):
+        planner = HorizonPlanner(
+            selected_blocks=[0],
+            task_embedding_dim=4,
+            history_dim=6,
+            hidden_dim=8,
+            layer_embedding_dim=3,
+            rank_min=1,
+            rank_max=4,
+            tau_novelty=0.5,
+            tau_conflict=0.5,
+        )
+        policy_param_ids = {id(parameter) for parameter in planner.policy_parameters()}
+        control_param_ids = {id(parameter) for parameter in planner.control_parameters()}
+
+        self.assertTrue(policy_param_ids)
+        self.assertTrue(control_param_ids)
+        self.assertTrue(policy_param_ids.isdisjoint(control_param_ids))
+
+        task_embedding = torch.randn(1, 4)
+        history_summary = torch.randn(1, 6)
+        policy_outputs = planner.forward_policy(0, task_embedding=task_embedding, history_summary=history_summary)
+        control_outputs = planner.forward_control(0, task_embedding=task_embedding, history_summary=history_summary)
+
+        self.assertEqual(tuple(policy_outputs.shared_gate.shape), (1, 1))
+        self.assertEqual(tuple(control_outputs.shared_gate.shape), (1, 1))
 
     def test_materialize_action_is_pure_and_reuse_shared_is_shared_only(self):
         layer = NHLoRALayer(
@@ -1402,6 +1437,30 @@ class PaperAlignmentUnitTests(unittest.TestCase):
         self.assertIn("norm_sum", accumulator[7]["q_proj"]["shared"])
         self.assertIn("mean_abs_sum", accumulator[7]["q_proj"]["slot"])
 
+    def test_shared_gate_tensor_changes_effective_shared_delta(self):
+        layer = NHLoRALayer(
+            embed_dim=8,
+            selected_points=["q_proj"],
+            shared_rank=2,
+            slot_r_max=4,
+            slot_init_rank=1,
+            bootstrap_slot_rank=1,
+            max_slots=2,
+            router_topk=1,
+            router_temperature=1.0,
+            task_embedding_dim=8,
+        )
+        bank = layer.point_banks["q_proj"]
+        with torch.no_grad():
+            bank.shared_b.fill_(0.05)
+        hidden_states = torch.randn(2, 5, 8)
+
+        low_gate = layer._shared_delta("q_proj", hidden_states, {"shared_gate": torch.tensor([[0.2]])})
+        high_gate = layer._shared_delta("q_proj", hidden_states, {"shared_gate": torch.tensor([[0.8]])})
+
+        self.assertFalse(torch.allclose(low_gate, high_gate))
+        self.assertGreater(float(high_gate.norm().item()), float(low_gate.norm().item()))
+
     def test_stage1_debug_helpers_are_config_gated_and_log_expected_records(self):
         repo_root = Path(__file__).resolve().parents[1]
         workspace_tmp = repo_root / "outputs" / "test_tmp" / "stage1_debug_helpers_unit"
@@ -1523,6 +1582,13 @@ class PaperAlignmentUnitTests(unittest.TestCase):
         self.assertIn("classifier_lr_scale=", joined_messages)
         self.assertIn("freeze_new_classifier_epochs=", joined_messages)
         self.assertIn("freeze_all_classifier_epochs=", joined_messages)
+        self.assertIn("planner_mode=", joined_messages)
+        self.assertIn("planner_control_recompute=", joined_messages)
+        self.assertIn("planner_policy_trainable=", joined_messages)
+        self.assertIn("planner_control_trainable=", joined_messages)
+        self.assertIn("planner_use_learned_shared_gate=", joined_messages)
+        self.assertIn("planner_soft_rank_training=", joined_messages)
+        self.assertIn("planner_hard_rank_eval=", joined_messages)
 
     def test_seed_config_warns_for_full_token_retention_features(self):
         repo_root = Path(__file__).resolve().parents[1]
@@ -1719,6 +1785,89 @@ class PaperAlignmentUnitTests(unittest.TestCase):
         self.assertIn("grad_present_batches=1/1", joined_messages)
         self.assertIn("grad_nonzero_batches=1/1", joined_messages)
         self.assertIn("optimizer_steps=1", joined_messages)
+
+    def test_hybrid_optimizer_excludes_policy_branch_and_tracks_control_branch(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "hybrid_optimizer_membership_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        config["training"]["planner_mode"] = "hybrid"
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        logger = configure_logger(level=logging.WARNING)
+        trainer = NHLoRATrainer(config, logger, benchmark=benchmark)
+
+        optimizer = trainer._build_optimizer()
+        policy_summary = trainer._planner_policy_optimizer_membership(optimizer)
+        control_summary = trainer._planner_control_optimizer_membership(optimizer)
+
+        self.assertFalse(policy_summary["in_optimizer"])
+        self.assertEqual(policy_summary["requires_grad_parameters"], 0)
+        self.assertEqual(policy_summary["matched_parameters"], 0)
+        self.assertTrue(control_summary["in_optimizer"])
+        self.assertGreater(control_summary["requires_grad_parameters"], 0)
+        self.assertGreater(control_summary["matched_parameters"], 0)
+
+    def test_hybrid_planner_control_receives_gradients_and_drifts(self):
+        seed_everything(11, deterministic=True)
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "hybrid_control_grad_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        config["training"]["planner_mode"] = "hybrid"
+        benchmark = _build_tiny_benchmark(num_tasks=2)
+        logger = configure_logger(level=logging.WARNING)
+        trainer = NHLoRATrainer(config, logger, benchmark=benchmark)
+        context = trainer._prepare_task_context(benchmark.tasks[1])
+        layer = trainer.model.layers["1"]
+        with torch.no_grad():
+            for point_name in ("q_proj", "v_proj"):
+                bank = layer.point_banks[point_name]
+                bank.shared_b.fill_(0.05)
+
+        train_dataset, _ = benchmark.build_task_datasets(1)
+        loader = trainer._build_train_loader(train_dataset)
+        batch = next(iter(loader))
+        images, labels = trainer._prepare_images_labels(batch)
+        optimizer = context["optimizer"]
+        optimizer.zero_grad(set_to_none=True)
+        before_snapshot = trainer._snapshot_named_parameters(trainer.planner.control_branch)
+        planner_out = trainer._plans_for_training_forward(context)
+        self.assertIsInstance(planner_out[1]["shared_gate"], torch.Tensor)
+        self.assertTrue(planner_out[1]["shared_gate"].requires_grad)
+
+        outputs = trainer.model.forward_with_state(images, context["task_state"], planner_out)
+        loss = F.cross_entropy(outputs["logits"], labels)
+        loss.backward()
+
+        control_grad_norm = sum(
+            float(parameter.grad.norm().item())
+            for parameter in trainer.planner.control_parameters()
+            if parameter.grad is not None
+        )
+        policy_grads = [
+            parameter.grad for parameter in trainer.planner.policy_parameters() if parameter.grad is not None
+        ]
+        self.assertGreater(control_grad_norm, 0.0)
+        self.assertEqual(policy_grads, [])
+
+        optimizer.step()
+        after_snapshot = trainer._snapshot_named_parameters(trainer.planner.control_branch)
+        drift = trainer._parameter_distance_summary(after_snapshot, before_snapshot)
+        self.assertIsNotNone(drift)
+        self.assertGreater(float(drift["l2"]), 0.0)
+
+    def test_hybrid_mode_rejects_soft_rank_training_for_stage8a(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "hybrid_soft_rank_guardrail_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        config["training"]["planner_mode"] = "hybrid"
+        config["training"]["planner_soft_rank_training"] = True
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        logger = configure_logger(level=logging.WARNING)
+
+        with self.assertRaises(ValueError):
+            NHLoRATrainer(config, logger, benchmark=benchmark)
 
     def test_forgetting_and_parameter_growth_delta_helpers(self):
         repo_root = Path(__file__).resolve().parents[1]

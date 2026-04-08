@@ -25,7 +25,13 @@ from src.models.losses import (
     slot_orthogonality,
 )
 from src.models.nh_lora import NHLoRAModel
-from src.models.planner import HorizonPlanner, MaterializedLayerPlan, PlannerSignals, materialize_action
+from src.models.planner import (
+    HorizonPlanner,
+    MaterializedLayerPlan,
+    PlannerControlOutputs,
+    PlannerSignals,
+    materialize_action,
+)
 from src.models.task_state import (
     HistoryBank,
     TaskState,
@@ -79,6 +85,8 @@ class NHLoRATrainer:
             tau_novelty=float(planner_cfg["tau_novelty"]),
             tau_conflict=float(planner_cfg["tau_conflict"]),
         ).to(self.device)
+        self._validate_planner_mode_config()
+        self._configure_planner_trainability()
         self.chu = ConsolidationHomeostasisUnit(config["chu"])
         self.history_bank = HistoryBank()
         self.inference_profile = self.model.build_inference_profile()
@@ -114,6 +122,8 @@ class NHLoRATrainer:
         }
         self._planner_init_snapshot = self._snapshot_named_parameters(self.planner)
         self._planner_post_task1_snapshot = None
+        self._planner_control_init_snapshot = self._snapshot_named_parameters(self.planner.control_branch)
+        self._planner_control_post_task1_snapshot = None
         self._planner_action_history: Dict[int, List[Dict[str, Any]]] = {
             int(block_id): [] for block_id in self.model.selected_blocks
         }
@@ -133,6 +143,80 @@ class NHLoRATrainer:
     def _classifier_lr_scale(self) -> float:
         return float(self.config["training"].get("classifier_lr_scale", 1.0))
 
+    def _planner_mode(self) -> str:
+        return str(self.config["training"].get("planner_mode", "legacy")).lower()
+
+    def _hybrid_planner_enabled(self) -> bool:
+        return self._planner_mode() == "hybrid"
+
+    def _planner_control_recompute_mode(self) -> str:
+        return str(self.config["training"].get("planner_control_recompute", "per_batch")).lower()
+
+    def _planner_policy_trainable(self) -> bool:
+        return bool(self.config["training"].get("planner_policy_trainable", False))
+
+    def _planner_control_trainable(self) -> bool:
+        return bool(self.config["training"].get("planner_control_trainable", True))
+
+    def _planner_use_learned_shared_gate(self) -> bool:
+        return bool(self.config["training"].get("planner_use_learned_shared_gate", True))
+
+    def _planner_soft_rank_training_enabled(self) -> bool:
+        return bool(self.config["training"].get("planner_soft_rank_training", False))
+
+    def _planner_hard_rank_eval(self) -> bool:
+        return bool(self.config["training"].get("planner_hard_rank_eval", True))
+
+    def _validate_planner_mode_config(self) -> None:
+        planner_mode = self._planner_mode()
+        if planner_mode not in {"legacy", "hybrid"}:
+            raise ValueError(f"Unsupported planner_mode: {planner_mode}")
+        if planner_mode != "hybrid":
+            return
+        if self._planner_policy_trainable():
+            raise ValueError(
+                "Stage 8 hybrid mode does not task-loss-train the planner policy branch. "
+                "Set training.planner_policy_trainable=false."
+            )
+        if not self._planner_control_trainable():
+            raise ValueError(
+                "Stage 8 hybrid mode requires training.planner_control_trainable=true "
+                "to keep the control branch optimizer-updated."
+            )
+        if not self._planner_use_learned_shared_gate():
+            raise ValueError(
+                "Stage 8 hybrid mode requires training.planner_use_learned_shared_gate=true."
+            )
+        if self._planner_soft_rank_training_enabled():
+            raise ValueError(
+                "Stage 8 Checkpoint A defers training.planner_soft_rank_training=true. "
+                "Leave it false for this pass."
+            )
+        if not self._planner_hard_rank_eval():
+            raise ValueError(
+                "Stage 8 Checkpoint A requires training.planner_hard_rank_eval=true."
+            )
+        if self._planner_control_recompute_mode() != "per_batch":
+            raise ValueError(
+                "Stage 8 Checkpoint A currently supports training.planner_control_recompute=per_batch only."
+            )
+
+    def _configure_planner_trainability(self) -> None:
+        if self._hybrid_planner_enabled():
+            self.planner.freeze_policy_branch()
+            if self._planner_control_trainable():
+                self.planner.unfreeze_control_branch()
+            else:
+                self.planner.freeze_control_branch()
+            return
+        self.planner.unfreeze_policy_branch()
+        self.planner.freeze_control_branch()
+
+    def _planner_trainable_parameters(self) -> List[nn.Parameter]:
+        if self._hybrid_planner_enabled():
+            return [parameter for parameter in self.planner.control_parameters() if parameter.requires_grad]
+        return [parameter for parameter in self.planner.parameters() if parameter.requires_grad]
+
     def _build_optimizer(self):
         shared_params = []
         classifier_params = []
@@ -147,7 +231,7 @@ class NHLoRATrainer:
                 classifier_params.append(parameter)
             else:
                 other_params.append(parameter)
-        other_params.extend([parameter for parameter in self.planner.parameters() if parameter.requires_grad])
+        other_params.extend(self._planner_trainable_parameters())
         other_params.extend([parameter for parameter in self.task_state_encoder.parameters() if parameter.requires_grad])
         parameter_groups = []
         if other_params:
@@ -315,7 +399,7 @@ class NHLoRATrainer:
             chu_cfg.get("stability_threshold", "n/a"),
         )
         self.logger.info(
-            "  logging estimate_eta=%s cuda_sync_timing=%s debug_eval_around_consolidation=%s retention_debug_logging=%s retention_feature_diff_logging=%s routing_debug_logging=%s planner_audit_logging=%s adapter_delta_debug_logging=%s final_feature_diff_debug_logging=%s classifier_drift_debug_logging=%s grad_norm_debug_logging=%s logit_margin_debug_logging=%s freeze_old_classifier_weights=%s classifier_lr_scale=%s freeze_new_classifier_epochs=%s freeze_all_classifier_epochs=%s",
+            "  logging estimate_eta=%s cuda_sync_timing=%s debug_eval_around_consolidation=%s retention_debug_logging=%s retention_feature_diff_logging=%s routing_debug_logging=%s planner_audit_logging=%s adapter_delta_debug_logging=%s final_feature_diff_debug_logging=%s classifier_drift_debug_logging=%s grad_norm_debug_logging=%s logit_margin_debug_logging=%s freeze_old_classifier_weights=%s classifier_lr_scale=%s freeze_new_classifier_epochs=%s freeze_all_classifier_epochs=%s planner_mode=%s planner_control_recompute=%s planner_policy_trainable=%s planner_control_trainable=%s planner_use_learned_shared_gate=%s planner_soft_rank_training=%s planner_hard_rank_eval=%s",
             training_cfg.get("estimate_eta", True),
             training_cfg.get("cuda_sync_timing", False),
             training_cfg.get("debug_eval_around_consolidation", False),
@@ -332,6 +416,13 @@ class NHLoRATrainer:
             training_cfg.get("classifier_lr_scale", 1.0),
             training_cfg.get("freeze_new_classifier_epochs", 0),
             training_cfg.get("freeze_all_classifier_epochs", 0),
+            training_cfg.get("planner_mode", "legacy"),
+            training_cfg.get("planner_control_recompute", "per_batch"),
+            training_cfg.get("planner_policy_trainable", False),
+            training_cfg.get("planner_control_trainable", True),
+            training_cfg.get("planner_use_learned_shared_gate", True),
+            training_cfg.get("planner_soft_rank_training", False),
+            training_cfg.get("planner_hard_rank_eval", True),
         )
         if str(loss_cfg.get("retention_feature_representation", "cls")).lower() == "full_tokens":
             self.logger.warning(
@@ -551,9 +642,13 @@ class NHLoRATrainer:
         return "freeze_old_strong_retention"
 
     def _planner_optimizer_membership(self, optimizer) -> Dict[str, object]:
-        planner_param_ids = {id(parameter) for parameter in self.planner.parameters()}
-        total_parameters = sum(1 for _ in self.planner.parameters())
-        requires_grad_parameters = sum(1 for parameter in self.planner.parameters() if parameter.requires_grad)
+        return self._optimizer_membership_for_parameters(optimizer, self.planner.parameters())
+
+    def _optimizer_membership_for_parameters(self, optimizer, parameters) -> Dict[str, object]:
+        tracked_parameters = list(parameters)
+        planner_param_ids = {id(parameter) for parameter in tracked_parameters}
+        total_parameters = len(tracked_parameters)
+        requires_grad_parameters = sum(1 for parameter in tracked_parameters if parameter.requires_grad)
         matched_group_indices = []
         matched_group_lrs = []
         matched_parameter_count = 0
@@ -572,6 +667,12 @@ class NHLoRATrainer:
             "requires_grad_parameters": int(requires_grad_parameters),
             "matched_parameters": int(matched_parameter_count),
         }
+
+    def _planner_policy_optimizer_membership(self, optimizer) -> Dict[str, object]:
+        return self._optimizer_membership_for_parameters(optimizer, self.planner.policy_parameters())
+
+    def _planner_control_optimizer_membership(self, optimizer) -> Dict[str, object]:
+        return self._optimizer_membership_for_parameters(optimizer, self.planner.control_parameters())
 
     @staticmethod
     def _int_list(values) -> List[int]:
@@ -939,12 +1040,60 @@ class NHLoRATrainer:
             )
         self._log_planner_layer_focus(context)
 
-    def _compute_planner_grad_stats(self) -> Dict[str, float | int]:
+    def _log_hybrid_planner_prepare(self, context: Dict[str, Any]) -> None:
+        if not self._hybrid_planner_enabled():
+            return
+        optimizer = context["optimizer"]
+        policy_summary = context.setdefault(
+            "planner_policy_optimizer_summary",
+            self._planner_policy_optimizer_membership(optimizer),
+        )
+        control_summary = context.setdefault(
+            "planner_control_optimizer_summary",
+            self._planner_control_optimizer_membership(optimizer),
+        )
+        self.logger.info(
+            "[HybridPlannerConfig][Task %d] planner_mode=%s policy_trainable=%s control_trainable=%s control_recompute=%s learned_shared_gate=%s soft_rank_enabled=%s soft_rank_temperature=%s hard_rank_eval=%s",
+            context["task_number"],
+            self._planner_mode(),
+            self._planner_policy_trainable(),
+            self._planner_control_trainable(),
+            self._planner_control_recompute_mode(),
+            self._planner_use_learned_shared_gate(),
+            self._planner_soft_rank_training_enabled(),
+            float(self.config["training"].get("planner_soft_rank_temperature", 0.5)),
+            self._planner_hard_rank_eval(),
+        )
+        self.logger.info(
+            "[PlannerPolicyTrainPath][Task %d] task_loss_trainable=%s in_optimizer=%s group_indices=%s group_lrs=%s requires_grad=%d/%d matched_parameters=%d",
+            context["task_number"],
+            False,
+            bool(policy_summary["in_optimizer"]),
+            policy_summary["group_indices"],
+            policy_summary["group_lrs"],
+            int(policy_summary["requires_grad_parameters"]),
+            int(policy_summary["total_parameters"]),
+            int(policy_summary["matched_parameters"]),
+        )
+        self.logger.info(
+            "[PlannerControlTrainPath][Task %d] task_loss_trainable=%s in_optimizer=%s group_indices=%s group_lrs=%s requires_grad=%d/%d matched_parameters=%d",
+            context["task_number"],
+            True,
+            bool(control_summary["in_optimizer"]),
+            control_summary["group_indices"],
+            control_summary["group_lrs"],
+            int(control_summary["requires_grad_parameters"]),
+            int(control_summary["total_parameters"]),
+            int(control_summary["matched_parameters"]),
+        )
+
+    @staticmethod
+    def _compute_module_grad_stats(module: nn.Module) -> Dict[str, float | int]:
         squared_sum = 0.0
         max_abs = 0.0
         present_params = 0
         nonzero_params = 0
-        for parameter in self.planner.parameters():
+        for parameter in module.parameters():
             if parameter.grad is None:
                 continue
             grad = parameter.grad.detach()
@@ -961,6 +1110,9 @@ class NHLoRATrainer:
             "present_params": present_params,
             "nonzero_params": nonzero_params,
         }
+
+    def _compute_planner_grad_stats(self) -> Dict[str, float | int]:
+        return self._compute_module_grad_stats(self.planner)
 
     def _accumulate_planner_audit_pre_step(self, context: Dict[str, Any]) -> None:
         if not self._planner_audit_enabled():
@@ -999,6 +1151,56 @@ class NHLoRATrainer:
         )
         accumulator["optimizer_steps"] += 1
 
+    def _accumulate_planner_control_pre_step(self, context: Dict[str, Any]) -> None:
+        if not self._hybrid_planner_enabled():
+            return
+        accumulator = context.setdefault(
+            "planner_control_epoch_accumulator",
+            {
+                "batches": 0,
+                "grad_l2_sum": 0.0,
+                "grad_l2_max": 0.0,
+                "grad_present_batches": 0,
+                "grad_nonzero_batches": 0,
+                "optimizer_steps": 0,
+                "shared_gate": {},
+            },
+        )
+        stats = self._compute_module_grad_stats(self.planner.control_branch)
+        accumulator["batches"] += 1
+        accumulator["grad_l2_sum"] += float(stats["l2"])
+        accumulator["grad_l2_max"] = max(float(accumulator["grad_l2_max"]), float(stats["max_abs"]))
+        accumulator["grad_present_batches"] += int(int(stats["present_params"]) > 0)
+        accumulator["grad_nonzero_batches"] += int(int(stats["nonzero_params"]) > 0)
+        control_outputs = context.get("planner_control_last_outputs", {})
+        for block_id, outputs in control_outputs.items():
+            gate_value = float(outputs.shared_gate.detach().mean().item())
+            gate_stats = accumulator["shared_gate"].setdefault(
+                int(block_id),
+                {"sum": 0.0, "min": gate_value, "max": gate_value, "count": 0},
+            )
+            gate_stats["sum"] += gate_value
+            gate_stats["min"] = min(float(gate_stats["min"]), gate_value)
+            gate_stats["max"] = max(float(gate_stats["max"]), gate_value)
+            gate_stats["count"] += 1
+
+    def _record_planner_control_optimizer_step(self, context: Dict[str, Any]) -> None:
+        if not self._hybrid_planner_enabled():
+            return
+        accumulator = context.setdefault(
+            "planner_control_epoch_accumulator",
+            {
+                "batches": 0,
+                "grad_l2_sum": 0.0,
+                "grad_l2_max": 0.0,
+                "grad_present_batches": 0,
+                "grad_nonzero_batches": 0,
+                "optimizer_steps": 0,
+                "shared_gate": {},
+            },
+        )
+        accumulator["optimizer_steps"] += 1
+
     def _log_planner_epoch_audit(self, context: Dict[str, Any]) -> None:
         if not self._planner_audit_enabled():
             return
@@ -1023,6 +1225,44 @@ class NHLoRATrainer:
             float(accumulator.get("grad_l2_max", 0.0)),
         )
 
+    def _log_planner_control_epoch(self, context: Dict[str, Any]) -> None:
+        if not self._hybrid_planner_enabled():
+            return
+        accumulator = context.get("planner_control_epoch_accumulator", {})
+        batches = max(int(accumulator.get("batches", 0)), 1)
+        optimizer_summary = context.get("planner_control_optimizer_summary") or self._planner_control_optimizer_membership(
+            context["optimizer"]
+        )
+        self.logger.info(
+            "[PlannerControlTrainPath][Task %d][Epoch %d] in_optimizer=%s group_indices=%s group_lrs=%s requires_grad=%d/%d grad_present_batches=%d/%d grad_nonzero_batches=%d/%d optimizer_steps=%d pre_step_grad_l2_mean=%.4e pre_step_grad_l2_max=%.4e",
+            context["task_number"],
+            int(context["current_epoch"]),
+            bool(optimizer_summary["in_optimizer"]),
+            optimizer_summary["group_indices"],
+            optimizer_summary["group_lrs"],
+            int(optimizer_summary["requires_grad_parameters"]),
+            int(optimizer_summary["total_parameters"]),
+            int(accumulator.get("grad_present_batches", 0)),
+            batches,
+            int(accumulator.get("grad_nonzero_batches", 0)),
+            batches,
+            int(accumulator.get("optimizer_steps", 0)),
+            float(accumulator.get("grad_l2_sum", 0.0)) / batches,
+            float(accumulator.get("grad_l2_max", 0.0)),
+        )
+        for block_id in sorted(accumulator.get("shared_gate", {})):
+            stats = accumulator["shared_gate"][block_id]
+            count = max(int(stats.get("count", 0)), 1)
+            self.logger.info(
+                "[PlannerControlValues][Task %d][Epoch %d][Layer %d] beta_mean=%.4f beta_min=%.4f beta_max=%.4f",
+                context["task_number"],
+                int(context["current_epoch"]),
+                int(block_id),
+                float(stats.get("sum", 0.0)) / count,
+                float(stats.get("min", 0.0)),
+                float(stats.get("max", 0.0)),
+            )
+
     def _log_planner_parameter_drift(self, context: Dict[str, Any]) -> None:
         if not self._planner_audit_enabled():
             return
@@ -1040,6 +1280,24 @@ class NHLoRATrainer:
         if int(context["task_number"]) == 1 and self._planner_post_task1_snapshot is None:
             self._planner_post_task1_snapshot = current_snapshot
             self.logger.info("[PlannerParamDrift][Task 1] stored_post_task1_reference=True")
+
+    def _log_planner_control_parameter_drift(self, context: Dict[str, Any]) -> None:
+        if not self._hybrid_planner_enabled():
+            return
+        current_snapshot = self._snapshot_named_parameters(self.planner.control_branch)
+        from_init = self._parameter_distance_summary(current_snapshot, self._planner_control_init_snapshot)
+        from_post_task1 = self._parameter_distance_summary(current_snapshot, self._planner_control_post_task1_snapshot)
+        self.logger.info(
+            "[PlannerControlParamDrift][Task %d] from_init_l2=%.4e from_init_max_abs=%.4e from_post_task1_l2=%s from_post_task1_max_abs=%s",
+            context["task_number"],
+            0.0 if from_init is None else float(from_init["l2"]),
+            0.0 if from_init is None else float(from_init["max_abs"]),
+            "n/a" if from_post_task1 is None else f"{float(from_post_task1['l2']):.4e}",
+            "n/a" if from_post_task1 is None else f"{float(from_post_task1['max_abs']):.4e}",
+        )
+        if int(context["task_number"]) == 1 and self._planner_control_post_task1_snapshot is None:
+            self._planner_control_post_task1_snapshot = current_snapshot
+            self.logger.info("[PlannerControlParamDrift][Task 1] stored_post_task1_reference=True")
 
     def _log_stage5_lifecycle_for_profile(self, context: Dict[str, Any], label: str, profile: Dict[int, Dict[str, object]]) -> None:
         if not self._routing_audit_enabled():
@@ -1204,21 +1462,57 @@ class NHLoRATrainer:
                 comparison_flags["eval_profile_mismatch"],
             )
 
-    def _plans_for_training_forward(self, context: Dict[str, Any]) -> Dict[int, Dict[str, object]]:
+    def _decorate_plans_for_debug(
+        self,
+        context: Dict[str, Any],
+        plans: Dict[int, Dict[str, object]],
+    ) -> Dict[int, Dict[str, object]]:
         if not self._epoch_debug_enabled(
             context,
             flag_key="adapter_delta_debug_logging",
             max_epoch_key="adapter_delta_debug_max_epochs",
         ):
-            return context["applied_plans"]
+            return plans
         accumulator = context.setdefault("adapter_delta_debug_accumulator", {})
         debug_plans = {}
-        for block_id, planner_cfg in context["applied_plans"].items():
+        for block_id, planner_cfg in plans.items():
             layer_cfg = dict(planner_cfg)
             layer_cfg["_debug_delta_stats"] = accumulator
             layer_cfg["_debug_block_id"] = int(block_id)
             debug_plans[int(block_id)] = layer_cfg
         return debug_plans
+
+    def _hybrid_plans_for_training_forward(self, context: Dict[str, Any]) -> Dict[int, Dict[str, object]]:
+        control_context = context.get("planner_control_context")
+        if not isinstance(control_context, dict):
+            return context["applied_plans"]
+        task_embedding = control_context.get("task_embedding")
+        history_summary = control_context.get("history_summary")
+        if not isinstance(task_embedding, torch.Tensor):
+            return context["applied_plans"]
+        control_outputs_by_block: Dict[int, PlannerControlOutputs] = {}
+        hybrid_plans: Dict[int, Dict[str, object]] = {}
+        for block_id, planner_cfg in context["applied_plans"].items():
+            layer_cfg = dict(planner_cfg)
+            control_outputs = self.planner.forward_control(
+                int(block_id),
+                task_embedding=task_embedding,
+                history_summary=history_summary,
+            )
+            control_outputs_by_block[int(block_id)] = control_outputs
+            if self._planner_use_learned_shared_gate():
+                layer_cfg["shared_gate"] = control_outputs.shared_gate
+            hybrid_plans[int(block_id)] = layer_cfg
+        context["planner_control_last_outputs"] = control_outputs_by_block
+        return hybrid_plans
+
+    def _plans_for_training_forward(self, context: Dict[str, Any]) -> Dict[int, Dict[str, object]]:
+        if self._hybrid_planner_enabled():
+            return self._decorate_plans_for_debug(
+                context,
+                self._hybrid_plans_for_training_forward(context),
+            )
+        return self._decorate_plans_for_debug(context, context["applied_plans"])
 
     def _log_adapter_delta_debug(self, context: Dict[str, Any]) -> None:
         if not self._epoch_debug_enabled(
@@ -1736,8 +2030,13 @@ class NHLoRATrainer:
             "class_ids_seen": unique_labels,
         }
 
-    def _compute_raw_planner(self, task_state: TaskState) -> Dict[int, PlannerSignals]:
-        history_summary = self.history_bank.aggregate()
+    def _compute_raw_planner(
+        self,
+        task_state: TaskState,
+        history_summary: torch.Tensor | None = None,
+    ) -> Dict[int, PlannerSignals]:
+        if history_summary is None:
+            history_summary = self.history_bank.aggregate()
         raw_planner = {}
         for block_id in self.model.selected_blocks:
             raw_planner[block_id] = self.planner(
@@ -1792,6 +2091,7 @@ class NHLoRATrainer:
         task_index = task_definition.task_id
         task_number = task_index + 1
         task_state, warmup_info = self._run_warmup_sensing(task_definition)
+        planner_history_summary = self.history_bank.aggregate()
         self.last_train_state["task_states"].append(
             {
                 "task_id": task_number,
@@ -1808,7 +2108,7 @@ class NHLoRATrainer:
             self.last_train_state["bootstrap_used"] = True
         else:
             teacher_model, teacher_profile = self._build_teacher_payload()
-            raw_planner = self._compute_raw_planner(task_state)
+            raw_planner = self._compute_raw_planner(task_state, history_summary=planner_history_summary)
             materialized_plans = self._materialize_structure(task_state, raw_planner, task_id=task_number)
             self.last_train_state["planner_used_on_task2"] = task_number == 2
             self.last_train_state["materialize_used_on_task2"] = task_number == 2
@@ -1861,11 +2161,19 @@ class NHLoRATrainer:
             "warmup_info": warmup_info,
             "old_num_classes": old_num_classes,
             "old_classifier_weight_snapshot": old_classifier_weight_snapshot,
+            "planner_control_context": {
+                "task_embedding": task_state.embedding.detach(),
+                "history_summary": None if planner_history_summary is None else planner_history_summary.detach(),
+            },
         }
         if self._planner_audit_enabled():
             context["planner_optimizer_summary"] = self._planner_optimizer_membership(optimizer)
+        if self._hybrid_planner_enabled():
+            context["planner_policy_optimizer_summary"] = self._planner_policy_optimizer_membership(optimizer)
+            context["planner_control_optimizer_summary"] = self._planner_control_optimizer_membership(optimizer)
         self._log_stage5_plan_debug(context)
         self._log_planner_audit_prepare(context)
+        self._log_hybrid_planner_prepare(context)
         return context
 
     def _accumulate_usage(self, accumulator: Dict[int, Dict[int, float]], route_info: Dict[int, Dict[str, object]]) -> None:
@@ -2066,6 +2374,15 @@ class NHLoRATrainer:
                 "grad_nonzero_batches": 0,
                 "optimizer_steps": 0,
             }
+            context["planner_control_epoch_accumulator"] = {
+                "batches": 0,
+                "grad_l2_sum": 0.0,
+                "grad_l2_max": 0.0,
+                "grad_present_batches": 0,
+                "grad_nonzero_batches": 0,
+                "optimizer_steps": 0,
+                "shared_gate": {},
+            }
             train_loader = self._build_train_loader(train_dataset)
             self.model.train()
             self.planner.train()
@@ -2088,14 +2405,16 @@ class NHLoRATrainer:
                 losses["total"].backward()
                 self._mask_old_classifier_gradients(context)
                 self._accumulate_planner_audit_pre_step(context)
+                self._accumulate_planner_control_pre_step(context)
                 self._accumulate_grad_norm_debug(context)
                 if grad_clip_norm > 0:
                     nn.utils.clip_grad_norm_(
-                        list(self.model.parameters()) + list(self.planner.parameters()) + list(self.task_state_encoder.parameters()),
+                        list(self.model.parameters()) + self._planner_trainable_parameters() + list(self.task_state_encoder.parameters()),
                         grad_clip_norm,
                     )
                 optimizer.step()
                 self._record_planner_optimizer_step(context)
+                self._record_planner_control_optimizer_step(context)
                 self._accumulate_usage(usage_accumulator, outputs["route_info"])
                 self._update_routing_debug(context, outputs["route_info"])
                 if outputs["route_info"]:
@@ -2175,6 +2494,7 @@ class NHLoRATrainer:
                 self._log_adapter_delta_debug(context)
                 self._log_routing_debug(context)
                 self._log_planner_epoch_audit(context)
+                self._log_planner_control_epoch(context)
 
         training_time = self._perf_counter() - training_time_start
         self._log_classifier_drift_debug(context, final=True)
@@ -2214,6 +2534,7 @@ class NHLoRATrainer:
         )
         self._log_stage5_train_eval_comparison(context)
         self._log_planner_parameter_drift(context)
+        self._log_planner_control_parameter_drift(context)
         self._append_history(context, usage_stats)
         self.last_train_state["history_sizes"].append(len(self.history_bank.entries))
 

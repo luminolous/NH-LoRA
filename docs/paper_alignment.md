@@ -84,6 +84,14 @@ The design paper is the primary source of truth. When paper detail was ambiguous
   initialization and post-Task-1, and task-state/planner-input summaries.
   These logs are observational and do not change planner thresholds, CHU,
   routing, or inference semantics.
+- Hybrid planner note: `training.planner_mode=hybrid` enables the Stage 8
+  Checkpoint A split between pre-task structural policy and task-loss-trained
+  forward control. In this mode, the policy branch is explicitly not trained by
+  task loss, while the control branch recomputes learned shared-gate values in a
+  graph-preserving way during training forward passes. Discrete structural
+  actions, CHU, routing semantics, and inference-profile hard action semantics
+  remain unchanged in this pass, and soft-rank training is intentionally
+  deferred.
 
 ### CHU
 
