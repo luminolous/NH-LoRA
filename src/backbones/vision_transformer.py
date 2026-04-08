@@ -160,7 +160,7 @@ class FrozenVisionTransformerBackbone(nn.Module):
         attention = torch.softmax((query @ key.transpose(-2, -1)) * block.attn.scale, dim=-1)
         attended = attention @ value
         attended = attended.transpose(1, 2).reshape(batch_size, seq_len, -1)
-        attended = nh_layer.apply_to_projection("out_proj", attended, route_state, planner_cfg)
+        attended = nh_layer.apply_to_projection("out_proj", attended, route_state, planner_cfg, base_output=attended)
         attn_output = F.linear(attended, block.attn.proj.weight, block.attn.proj.bias)
         tokens = tokens + attn_output
         mlp_input = block.norm2(tokens)

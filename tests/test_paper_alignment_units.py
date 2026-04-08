@@ -9,6 +9,7 @@ from unittest.mock import patch
 import numpy as np
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from src.datasets.base import ContinualBenchmark, SampleRecord, TaskDefinition
 from src.datasets.transforms import build_cifar_test_transform
@@ -209,6 +210,28 @@ class _ListLogger:
 
 
 class PaperAlignmentUnitTests(unittest.TestCase):
+    def _build_stage4_model(self, insertion_points):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / ("stage4_" + "_".join(insertion_points))
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        config["model"]["insertion_points"] = list(insertion_points)
+        return NHLoRAModel(config)
+
+    def _stage4_planner_cfg(self, slot_id: int, accumulator=None):
+        planner_cfg = {
+            "active_slot_candidates": [slot_id],
+            "selected_slot": slot_id,
+            "rank_cfg": {slot_id: 1},
+            "shared_gate": 1.0,
+            "deterministic": True,
+            "shared_only": False,
+        }
+        if accumulator is not None:
+            planner_cfg["_debug_delta_stats"] = accumulator
+            planner_cfg["_debug_block_id"] = 1
+        return planner_cfg
+
     def test_dynamic_slot_params_follow_layer_device(self):
         target_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         layer = NHLoRALayer(
@@ -882,6 +905,97 @@ class PaperAlignmentUnitTests(unittest.TestCase):
         self.assertIn("[Routing][Task 2][Epoch 1][Layer 1]", joined_messages)
         self.assertIn("avg_candidate_count=2.00", joined_messages)
         self.assertIn("avg_topk=2.00", joined_messages)
+
+    def test_stage4_zero_lora_block_parity_preserves_out_proj_semantics(self):
+        torch.manual_seed(1404)
+        for insertion_points in (["q_proj", "v_proj"], ["q_proj", "v_proj", "out_proj"]):
+            with self.subTest(insertion_points=insertion_points):
+                model = self._build_stage4_model(insertion_points)
+                model.eval()
+                block = model.backbone.core_model.blocks[1]
+                layer = model.layers["1"]
+                slot_id = layer.add_slot(initial_rank=1, task_id=1)
+                tokens = torch.randn(2, 5, model.backbone.embed_dim)
+
+                plain = model.backbone._forward_block_plain(block, tokens)
+                adapted, _ = model.backbone._forward_block_with_adapter(
+                    block,
+                    tokens,
+                    layer,
+                    self._stage4_planner_cfg(slot_id),
+                    task_state=None,
+                )
+
+                self.assertTrue(torch.allclose(adapted, plain, atol=1e-6))
+
+    def test_stage4_active_adapter_changes_output_and_delta_logger(self):
+        torch.manual_seed(1405)
+        model = self._build_stage4_model(["q_proj", "v_proj"])
+        model.eval()
+        block = model.backbone.core_model.blocks[1]
+        layer = model.layers["1"]
+        slot_id = layer.add_slot(initial_rank=1, task_id=1)
+        with torch.no_grad():
+            for point_name in ("q_proj", "v_proj"):
+                bank = layer.point_banks[point_name]
+                bank.shared_b.fill_(0.05)
+                bank.slot_b[slot_id].fill_(0.05)
+        tokens = torch.randn(2, 5, model.backbone.embed_dim)
+        accumulator = {}
+
+        plain = model.backbone._forward_block_plain(block, tokens)
+        adapted, _ = model.backbone._forward_block_with_adapter(
+            block,
+            tokens,
+            layer,
+            self._stage4_planner_cfg(slot_id, accumulator=accumulator),
+            task_state=None,
+        )
+
+        self.assertGreater(float((adapted - plain).abs().max().item()), 1e-6)
+        self.assertIn(1, accumulator)
+        shared_max = max(
+            point_stats["shared"]["max_abs"]
+            for point_stats in accumulator[1].values()
+            if "shared" in point_stats
+        )
+        slot_max = max(
+            point_stats["slot"]["max_abs"]
+            for point_stats in accumulator[1].values()
+            if "slot" in point_stats
+        )
+        self.assertGreater(shared_max, 0.0)
+        self.assertGreater(slot_max, 0.0)
+
+    def test_stage4_ce_grad_flows_to_active_slot_and_shared_b(self):
+        torch.manual_seed(1406)
+        model = self._build_stage4_model(["q_proj", "v_proj"])
+        model.train()
+        model.classifier.expand(2)
+        layer = model.layers["1"]
+        slot_id = layer.add_slot(initial_rank=1, task_id=1)
+        images = torch.randn(4, 3, 32, 32)
+        labels = torch.tensor([0, 1, 0, 1])
+
+        outputs = model.forward_with_state(
+            images,
+            task_state=None,
+            planner_out={1: self._stage4_planner_cfg(slot_id)},
+        )
+        loss = F.cross_entropy(outputs["logits"], labels)
+        loss.backward()
+
+        slot_grad_norm = 0.0
+        shared_grad_norm = 0.0
+        for point_name in ("q_proj", "v_proj"):
+            bank = layer.point_banks[point_name]
+            self.assertIsNotNone(bank.slot_b[slot_id].grad)
+            self.assertIsNotNone(bank.shared_b.grad)
+            slot_grad_norm += float(bank.slot_b[slot_id].grad.norm().item())
+            shared_grad_norm += float(bank.shared_b.grad.norm().item())
+        self.assertTrue(outputs["features"].requires_grad)
+        self.assertGreater(slot_grad_norm, 0.0)
+        self.assertGreater(shared_grad_norm, 0.0)
 
     def test_adapter_delta_debug_records_shared_and_slot_stats(self):
         layer = NHLoRALayer(
