@@ -77,6 +77,13 @@ The design paper is the primary source of truth. When paper detail was ambiguous
   retained inference-profile slot ids, and same-input train-vs-eval route comparisons.
   These logs are observational and do not change planner, CHU, objective, or inference
   policy.
+- Planner audit note: `training.planner_audit_logging` enables Stage 7
+  diagnostics that report per-layer `novelty` / `conflict` margins against
+  `tau_novelty` / `tau_conflict`, planner action trajectories, optimizer
+  membership, pre-step planner grad stats, planner parameter drift from
+  initialization and post-Task-1, and task-state/planner-input summaries.
+  These logs are observational and do not change planner thresholds, CHU,
+  routing, or inference semantics.
 
 ### CHU
 

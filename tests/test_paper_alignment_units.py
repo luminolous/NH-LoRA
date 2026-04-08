@@ -171,6 +171,7 @@ def _build_test_config(output_root: str):
             "retention_feature_diff_max_epochs": 3,
             "routing_debug_logging": False,
             "routing_debug_max_epochs": 3,
+            "planner_audit_logging": False,
             "adapter_delta_debug_logging": False,
             "adapter_delta_debug_max_epochs": 3,
             "final_feature_diff_debug_logging": False,
@@ -1513,6 +1514,7 @@ class PaperAlignmentUnitTests(unittest.TestCase):
         self.assertIn("retention_feature_representation=cls", joined_messages)
         self.assertIn("retention_feature_diff_logging=", joined_messages)
         self.assertIn("routing_debug_logging=", joined_messages)
+        self.assertIn("planner_audit_logging=", joined_messages)
         self.assertIn("adapter_delta_debug_logging=", joined_messages)
         self.assertIn("final_feature_diff_debug_logging=", joined_messages)
         self.assertIn("classifier_drift_debug_logging=", joined_messages)
@@ -1537,6 +1539,186 @@ class PaperAlignmentUnitTests(unittest.TestCase):
         joined_messages = "\n".join(logger.messages)
         self.assertIn("retention_feature_representation=full_tokens", joined_messages)
         self.assertIn("can use substantially more memory", joined_messages)
+
+    def test_planner_decision_label_matches_threshold_quadrants(self):
+        self.assertEqual(
+            NHLoRATrainer._planner_decision_label(
+                novelty=0.2,
+                conflict=0.2,
+                tau_novelty=0.5,
+                tau_conflict=0.5,
+            ),
+            "reuse_shared",
+        )
+        self.assertEqual(
+            NHLoRATrainer._planner_decision_label(
+                novelty=0.7,
+                conflict=0.2,
+                tau_novelty=0.5,
+                tau_conflict=0.5,
+            ),
+            "expand_rank_existing_slot",
+        )
+        self.assertEqual(
+            NHLoRATrainer._planner_decision_label(
+                novelty=0.7,
+                conflict=0.8,
+                tau_novelty=0.5,
+                tau_conflict=0.5,
+            ),
+            "open_new_slot",
+        )
+        self.assertEqual(
+            NHLoRATrainer._planner_decision_label(
+                novelty=0.2,
+                conflict=0.8,
+                tau_novelty=0.5,
+                tau_conflict=0.5,
+            ),
+            "freeze_old_strong_retention",
+        )
+
+    def test_planner_parameter_distance_summary_tracks_zero_and_nonzero(self):
+        planner = HorizonPlanner(
+            selected_blocks=[0],
+            task_embedding_dim=4,
+            history_dim=6,
+            hidden_dim=8,
+            layer_embedding_dim=3,
+            rank_min=1,
+            rank_max=4,
+            tau_novelty=0.5,
+            tau_conflict=0.5,
+        )
+        init_snapshot = NHLoRATrainer._snapshot_named_parameters(planner)
+        zero_distance = NHLoRATrainer._parameter_distance_summary(
+            NHLoRATrainer._snapshot_named_parameters(planner),
+            init_snapshot,
+        )
+
+        self.assertIsNotNone(zero_distance)
+        self.assertAlmostEqual(float(zero_distance["l2"]), 0.0, places=8)
+        self.assertAlmostEqual(float(zero_distance["max_abs"]), 0.0, places=8)
+
+        with torch.no_grad():
+            next(planner.parameters()).add_(0.125)
+
+        moved_distance = NHLoRATrainer._parameter_distance_summary(
+            NHLoRATrainer._snapshot_named_parameters(planner),
+            init_snapshot,
+        )
+
+        self.assertGreater(float(moved_distance["l2"]), 0.0)
+        self.assertGreater(float(moved_distance["max_abs"]), 0.0)
+
+    def test_planner_audit_prepare_reports_optimizer_membership_without_mutating_inputs(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "planner_audit_prepare_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        config["training"]["planner_audit_logging"] = True
+        benchmark = _build_tiny_benchmark(num_tasks=2)
+        logger = _ListLogger()
+        trainer = NHLoRATrainer(config, logger, benchmark=benchmark)
+        task_state, warmup_info = trainer._run_warmup_sensing(benchmark.tasks[1])
+        raw_planner = trainer._compute_raw_planner(task_state)
+        optimizer = trainer._build_optimizer()
+        before_embedding = task_state.embedding.detach().clone()
+        before_signals = {
+            block_id: (
+                float(signals.novelty.item()),
+                float(signals.conflict.item()),
+                float(signals.shared_gate.item()),
+            )
+            for block_id, signals in raw_planner.items()
+        }
+        context = {
+            "task_number": 2,
+            "task_state": task_state,
+            "raw_planner": raw_planner,
+            "optimizer": optimizer,
+            "warmup_info": warmup_info,
+        }
+
+        trainer._log_planner_audit_prepare(context)
+
+        self.assertTrue(torch.allclose(task_state.embedding, before_embedding))
+        after_signals = {
+            block_id: (
+                float(signals.novelty.item()),
+                float(signals.conflict.item()),
+                float(signals.shared_gate.item()),
+            )
+            for block_id, signals in raw_planner.items()
+        }
+        self.assertEqual(before_signals, after_signals)
+        self.assertTrue(context["planner_optimizer_summary"]["in_optimizer"])
+        joined_messages = "\n".join(logger.messages)
+        self.assertIn("[PlannerInputAudit][Task 2]", joined_messages)
+        self.assertIn("[PlannerTrainPath][Task 2] in_optimizer=True", joined_messages)
+        self.assertIn("[PlannerAudit][Task 2][Layer 1]", joined_messages)
+        self.assertIn("[PlannerTrajectory][Layer 1]", joined_messages)
+
+    def test_planner_audit_prepare_is_silent_when_disabled(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "planner_audit_disabled_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        config["training"]["planner_audit_logging"] = False
+        benchmark = _build_tiny_benchmark(num_tasks=2)
+        logger = _ListLogger()
+        trainer = NHLoRATrainer(config, logger, benchmark=benchmark)
+        task_state, warmup_info = trainer._run_warmup_sensing(benchmark.tasks[1])
+        context = {
+            "task_number": 2,
+            "task_state": task_state,
+            "raw_planner": trainer._compute_raw_planner(task_state),
+            "optimizer": trainer._build_optimizer(),
+            "warmup_info": warmup_info,
+        }
+
+        trainer._log_planner_audit_prepare(context)
+
+        self.assertEqual(logger.messages, [])
+
+    def test_planner_epoch_audit_reports_pre_step_grad_and_optimizer_steps(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "planner_epoch_audit_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        config["training"]["planner_audit_logging"] = True
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        logger = _ListLogger()
+        trainer = NHLoRATrainer(config, logger, benchmark=benchmark)
+        optimizer = trainer._build_optimizer()
+        for parameter in trainer.planner.parameters():
+            parameter.grad = torch.zeros_like(parameter)
+        first_parameter = next(trainer.planner.parameters())
+        first_parameter.grad.fill_(0.25)
+        context = {
+            "task_number": 2,
+            "current_epoch": 1,
+            "optimizer": optimizer,
+            "planner_optimizer_summary": trainer._planner_optimizer_membership(optimizer),
+            "planner_audit_epoch_accumulator": {
+                "batches": 0,
+                "grad_l2_sum": 0.0,
+                "grad_l2_max": 0.0,
+                "grad_present_batches": 0,
+                "grad_nonzero_batches": 0,
+                "optimizer_steps": 0,
+            },
+        }
+
+        trainer._accumulate_planner_audit_pre_step(context)
+        trainer._record_planner_optimizer_step(context)
+        trainer._log_planner_epoch_audit(context)
+
+        joined_messages = "\n".join(logger.messages)
+        self.assertIn("[PlannerTrainPath][Task 2][Epoch 1]", joined_messages)
+        self.assertIn("grad_present_batches=1/1", joined_messages)
+        self.assertIn("grad_nonzero_batches=1/1", joined_messages)
+        self.assertIn("optimizer_steps=1", joined_messages)
 
     def test_forgetting_and_parameter_growth_delta_helpers(self):
         repo_root = Path(__file__).resolve().parents[1]

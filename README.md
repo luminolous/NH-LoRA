@@ -64,6 +64,11 @@ They log planner/materialized/applied routing state, slot ids, retained inferenc
 profile slots, and same-input train-vs-eval route comparisons without changing
 planner, CHU, loss, or inference policy.
 
+Optional Stage 7 planner diagnostics are enabled by `training.planner_audit_logging`.
+They log planner threshold margins, action trajectories, optimizer membership,
+pre-step planner grad statistics, parameter drift from initialization and post-Task-1,
+and task-state/planner-input summaries without changing planner behavior.
+
 ## Bootstrap Task 1
 
 Task 1 is intentionally special:

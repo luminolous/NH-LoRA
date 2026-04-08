@@ -102,6 +102,7 @@ training:
   retention_feature_diff_max_epochs: 3
   routing_debug_logging: false
   routing_debug_max_epochs: 3
+  planner_audit_logging: false
   adapter_delta_debug_logging: false
   adapter_delta_debug_max_epochs: 3
   final_feature_diff_debug_logging: false

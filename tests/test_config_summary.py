@@ -17,6 +17,7 @@ class ConfigAndSummarySmokeTest(unittest.TestCase):
         self.assertEqual(config["training"]["classifier_lr_scale"], 1.0)
         self.assertEqual(config["training"]["freeze_new_classifier_epochs"], 0)
         self.assertEqual(config["training"]["freeze_all_classifier_epochs"], 0)
+        self.assertFalse(config["training"]["planner_audit_logging"])
 
         workspace_tmp = repo_root / "outputs" / "test_tmp" / "config_summary_runtime"
         workspace_tmp.mkdir(parents=True, exist_ok=True)

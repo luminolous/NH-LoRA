@@ -112,6 +112,11 @@ class NHLoRATrainer:
             "current_task_id": 0,
             "global_step": 0,
         }
+        self._planner_init_snapshot = self._snapshot_named_parameters(self.planner)
+        self._planner_post_task1_snapshot = None
+        self._planner_action_history: Dict[int, List[Dict[str, Any]]] = {
+            int(block_id): [] for block_id in self.model.selected_blocks
+        }
 
     def _resolve_device(self, requested_device: str) -> torch.device:
         if requested_device == "cuda" and not torch.cuda.is_available():
@@ -310,13 +315,14 @@ class NHLoRATrainer:
             chu_cfg.get("stability_threshold", "n/a"),
         )
         self.logger.info(
-            "  logging estimate_eta=%s cuda_sync_timing=%s debug_eval_around_consolidation=%s retention_debug_logging=%s retention_feature_diff_logging=%s routing_debug_logging=%s adapter_delta_debug_logging=%s final_feature_diff_debug_logging=%s classifier_drift_debug_logging=%s grad_norm_debug_logging=%s logit_margin_debug_logging=%s freeze_old_classifier_weights=%s classifier_lr_scale=%s freeze_new_classifier_epochs=%s freeze_all_classifier_epochs=%s",
+            "  logging estimate_eta=%s cuda_sync_timing=%s debug_eval_around_consolidation=%s retention_debug_logging=%s retention_feature_diff_logging=%s routing_debug_logging=%s planner_audit_logging=%s adapter_delta_debug_logging=%s final_feature_diff_debug_logging=%s classifier_drift_debug_logging=%s grad_norm_debug_logging=%s logit_margin_debug_logging=%s freeze_old_classifier_weights=%s classifier_lr_scale=%s freeze_new_classifier_epochs=%s freeze_all_classifier_epochs=%s",
             training_cfg.get("estimate_eta", True),
             training_cfg.get("cuda_sync_timing", False),
             training_cfg.get("debug_eval_around_consolidation", False),
             training_cfg.get("retention_debug_logging", True),
             training_cfg.get("retention_feature_diff_logging", False),
             training_cfg.get("routing_debug_logging", False),
+            training_cfg.get("planner_audit_logging", False),
             training_cfg.get("adapter_delta_debug_logging", False),
             training_cfg.get("final_feature_diff_debug_logging", False),
             training_cfg.get("classifier_drift_debug_logging", False),
@@ -469,6 +475,103 @@ class NHLoRATrainer:
 
     def _routing_audit_enabled(self) -> bool:
         return bool(self.config["training"].get("routing_debug_logging", False))
+
+    def _planner_audit_enabled(self) -> bool:
+        return bool(self.config["training"].get("planner_audit_logging", False))
+
+    @staticmethod
+    def _snapshot_named_parameters(module: nn.Module) -> Dict[str, torch.Tensor]:
+        return {
+            name: parameter.detach().cpu().clone()
+            for name, parameter in module.named_parameters()
+        }
+
+    @staticmethod
+    def _parameter_distance_summary(
+        current_snapshot: Dict[str, torch.Tensor],
+        reference_snapshot: Dict[str, torch.Tensor] | None,
+    ) -> Dict[str, float | int] | None:
+        if reference_snapshot is None:
+            return None
+        squared_sum = 0.0
+        max_abs = 0.0
+        tracked_tensors = 0
+        tracked_parameters = 0
+        for name, reference in reference_snapshot.items():
+            current = current_snapshot.get(name)
+            if current is None:
+                continue
+            diff = current.to(reference.device) - reference
+            tracked_tensors += 1
+            tracked_parameters += int(diff.numel())
+            squared_sum += float(diff.pow(2).sum().item())
+            if diff.numel():
+                max_abs = max(max_abs, float(diff.abs().max().item()))
+        return {
+            "l2": squared_sum ** 0.5,
+            "max_abs": max_abs,
+            "tracked_tensors": tracked_tensors,
+            "tracked_parameters": tracked_parameters,
+        }
+
+    @staticmethod
+    def _history_attention_stats(attention: torch.Tensor | None) -> Dict[str, float | int | bool]:
+        if attention is None or attention.numel() == 0:
+            return {
+                "used": False,
+                "count": 0,
+                "entropy": 0.0,
+                "max_weight": 0.0,
+            }
+        normalized = attention.detach().float()
+        entropy = float(
+            -(normalized * normalized.clamp_min(1e-8).log()).sum(dim=-1).mean().item()
+        )
+        return {
+            "used": True,
+            "count": int(normalized.shape[-1]),
+            "entropy": entropy,
+            "max_weight": float(normalized.max().item()),
+        }
+
+    @staticmethod
+    def _planner_decision_label(
+        *,
+        novelty: float,
+        conflict: float,
+        tau_novelty: float,
+        tau_conflict: float,
+    ) -> str:
+        if novelty < tau_novelty and conflict < tau_conflict:
+            return "reuse_shared"
+        if novelty >= tau_novelty and conflict < tau_conflict:
+            return "expand_rank_existing_slot"
+        if novelty >= tau_novelty and conflict >= tau_conflict:
+            return "open_new_slot"
+        return "freeze_old_strong_retention"
+
+    def _planner_optimizer_membership(self, optimizer) -> Dict[str, object]:
+        planner_param_ids = {id(parameter) for parameter in self.planner.parameters()}
+        total_parameters = sum(1 for _ in self.planner.parameters())
+        requires_grad_parameters = sum(1 for parameter in self.planner.parameters() if parameter.requires_grad)
+        matched_group_indices = []
+        matched_group_lrs = []
+        matched_parameter_count = 0
+        for group_index, group in enumerate(optimizer.param_groups):
+            matched_params = [parameter for parameter in group["params"] if id(parameter) in planner_param_ids]
+            if not matched_params:
+                continue
+            matched_group_indices.append(int(group_index))
+            matched_group_lrs.append(float(group.get("lr", self._base_learning_rate())))
+            matched_parameter_count += len(matched_params)
+        return {
+            "in_optimizer": bool(matched_group_indices),
+            "group_indices": matched_group_indices,
+            "group_lrs": matched_group_lrs,
+            "total_parameters": int(total_parameters),
+            "requires_grad_parameters": int(requires_grad_parameters),
+            "matched_parameters": int(matched_parameter_count),
+        }
 
     @staticmethod
     def _int_list(values) -> List[int]:
@@ -668,6 +771,275 @@ class NHLoRATrainer:
                     block_id=int(block_id),
                     config_like=applied,
                 )
+
+    def _planner_margin_record(
+        self,
+        *,
+        block_id: int,
+        task_number: int,
+        signals: PlannerSignals,
+    ) -> Dict[str, object]:
+        planner_cfg = self.config["planner"]
+        tau_novelty = float(planner_cfg["tau_novelty"])
+        tau_conflict = float(planner_cfg["tau_conflict"])
+        novelty = float(signals.novelty.item())
+        conflict = float(signals.conflict.item())
+        novelty_margin = novelty - tau_novelty
+        conflict_margin = conflict - tau_conflict
+        attention_stats = self._history_attention_stats(signals.history_attention)
+        return {
+            "task_number": int(task_number),
+            "block_id": int(block_id),
+            "action": self._planner_decision_label(
+                novelty=novelty,
+                conflict=conflict,
+                tau_novelty=tau_novelty,
+                tau_conflict=tau_conflict,
+            ),
+            "novelty": novelty,
+            "conflict": conflict,
+            "tau_novelty": tau_novelty,
+            "tau_conflict": tau_conflict,
+            "novelty_margin": novelty_margin,
+            "conflict_margin": conflict_margin,
+            "shared_gate": float(signals.shared_gate.item()),
+            "consolidate": float(signals.consolidate.item()),
+            "rank_budget": int(signals.rank_budget),
+            "planner_input_norm": float(signals.planner_input.detach().norm().item())
+            if signals.planner_input is not None
+            else 0.0,
+            "planner_representation_norm": float(signals.planner_representation.detach().norm().item())
+            if signals.planner_representation is not None
+            else 0.0,
+            "history_attention_used": bool(attention_stats["used"]),
+            "history_attention_count": int(attention_stats["count"]),
+            "history_attention_entropy": float(attention_stats["entropy"]),
+            "history_attention_max_weight": float(attention_stats["max_weight"]),
+        }
+
+    def _log_planner_layer_focus(self, context: Dict[str, Any]) -> None:
+        if not self._planner_audit_enabled():
+            return
+        records = context.get("planner_audit_records", {})
+        if len(records) <= 1:
+            return
+        focus_layer = 6 if 6 in records else None
+        if focus_layer is None:
+            open_layers = [block_id for block_id, record in records.items() if record["action"] == "open_new_slot"]
+            focus_layer = open_layers[0] if open_layers else None
+        if focus_layer is None or focus_layer not in records:
+            return
+        others = [record for block_id, record in records.items() if int(block_id) != int(focus_layer)]
+        if not others:
+            return
+        action_counts: Dict[str, int] = {}
+        for record in others:
+            action = str(record["action"])
+            action_counts[action] = action_counts.get(action, 0) + 1
+        other_novelty_mean = sum(float(record["novelty_margin"]) for record in others) / len(others)
+        other_conflict_mean = sum(float(record["conflict_margin"]) for record in others) / len(others)
+        focus_record = records[int(focus_layer)]
+        self.logger.info(
+            "[PlannerLayerCompare][Task %d] focus_layer=%d action=%s novelty_margin=%.4f conflict_margin=%.4f other_action_counts=%s other_mean_novelty_margin=%.4f other_mean_conflict_margin=%.4f",
+            context["task_number"],
+            int(focus_layer),
+            focus_record["action"],
+            float(focus_record["novelty_margin"]),
+            float(focus_record["conflict_margin"]),
+            action_counts,
+            other_novelty_mean,
+            other_conflict_mean,
+        )
+
+    def _log_planner_audit_prepare(self, context: Dict[str, Any]) -> None:
+        if not self._planner_audit_enabled():
+            return
+        task_state = context["task_state"]
+        optimizer_summary = context.setdefault(
+            "planner_optimizer_summary",
+            self._planner_optimizer_membership(context["optimizer"]),
+        )
+        self.logger.info(
+            "[PlannerInputAudit][Task %d] embedding_norm=%.4e similarity_mean=%.4e entropy_mean=%.4e gradient_sketch_norm=%.4e has_history=%s history_entries=%d",
+            context["task_number"],
+            float(task_state.embedding.norm().item()),
+            float(task_state.similarity.mean().item()),
+            float(task_state.entropy.mean().item()),
+            float(task_state.gradient_sketch.norm().item()),
+            bool(context["warmup_info"].get("has_history", False)),
+            len(self.history_bank.entries),
+        )
+        self.logger.info(
+            "[PlannerTrainPath][Task %d] in_optimizer=%s group_indices=%s group_lrs=%s requires_grad=%d/%d matched_parameters=%d",
+            context["task_number"],
+            bool(optimizer_summary["in_optimizer"]),
+            optimizer_summary["group_indices"],
+            optimizer_summary["group_lrs"],
+            int(optimizer_summary["requires_grad_parameters"]),
+            int(optimizer_summary["total_parameters"]),
+            int(optimizer_summary["matched_parameters"]),
+        )
+        raw_planner = context.get("raw_planner", {})
+        if not raw_planner:
+            self.logger.info(
+                "[PlannerAudit][Task %d] no raw planner signals available (bootstrap task or planner bypass).",
+                context["task_number"],
+            )
+            return
+        records = {}
+        for block_id in self.model.selected_blocks:
+            signals = raw_planner.get(block_id)
+            if signals is None:
+                continue
+            record = self._planner_margin_record(
+                block_id=int(block_id),
+                task_number=int(context["task_number"]),
+                signals=signals,
+            )
+            records[int(block_id)] = record
+            self._planner_action_history.setdefault(int(block_id), []).append(
+                {
+                    "task_number": int(context["task_number"]),
+                    "action": str(record["action"]),
+                    "novelty_margin": float(record["novelty_margin"]),
+                    "conflict_margin": float(record["conflict_margin"]),
+                }
+            )
+            self.logger.info(
+                "[PlannerAudit][Task %d][Layer %d] action=%s novelty=%.4f tau_novelty=%.4f novelty_margin=%.4f conflict=%.4f tau_conflict=%.4f conflict_margin=%.4f shared_gate=%.4f consolidate=%.4f rank_budget=%d planner_input_norm=%.4e planner_representation_norm=%.4e history_used=%s history_count=%d history_entropy=%.4f history_max_weight=%.4f",
+                context["task_number"],
+                int(block_id),
+                record["action"],
+                float(record["novelty"]),
+                float(record["tau_novelty"]),
+                float(record["novelty_margin"]),
+                float(record["conflict"]),
+                float(record["tau_conflict"]),
+                float(record["conflict_margin"]),
+                float(record["shared_gate"]),
+                float(record["consolidate"]),
+                int(record["rank_budget"]),
+                float(record["planner_input_norm"]),
+                float(record["planner_representation_norm"]),
+                bool(record["history_attention_used"]),
+                int(record["history_attention_count"]),
+                float(record["history_attention_entropy"]),
+                float(record["history_attention_max_weight"]),
+            )
+        context["planner_audit_records"] = records
+        for block_id in sorted(records):
+            history = self._planner_action_history.get(int(block_id), [])
+            self.logger.info(
+                "[PlannerTrajectory][Layer %d] tasks=%s actions=%s novelty_margins=%s conflict_margins=%s",
+                int(block_id),
+                [int(entry["task_number"]) for entry in history],
+                [str(entry["action"]) for entry in history],
+                [round(float(entry["novelty_margin"]), 4) for entry in history],
+                [round(float(entry["conflict_margin"]), 4) for entry in history],
+            )
+        self._log_planner_layer_focus(context)
+
+    def _compute_planner_grad_stats(self) -> Dict[str, float | int]:
+        squared_sum = 0.0
+        max_abs = 0.0
+        present_params = 0
+        nonzero_params = 0
+        for parameter in self.planner.parameters():
+            if parameter.grad is None:
+                continue
+            grad = parameter.grad.detach()
+            present_params += 1
+            squared_sum += float(grad.pow(2).sum().item())
+            if grad.numel():
+                grad_max = float(grad.abs().max().item())
+                max_abs = max(max_abs, grad_max)
+                if grad_max > 0.0:
+                    nonzero_params += 1
+        return {
+            "l2": squared_sum ** 0.5,
+            "max_abs": max_abs,
+            "present_params": present_params,
+            "nonzero_params": nonzero_params,
+        }
+
+    def _accumulate_planner_audit_pre_step(self, context: Dict[str, Any]) -> None:
+        if not self._planner_audit_enabled():
+            return
+        accumulator = context.setdefault(
+            "planner_audit_epoch_accumulator",
+            {
+                "batches": 0,
+                "grad_l2_sum": 0.0,
+                "grad_l2_max": 0.0,
+                "grad_present_batches": 0,
+                "grad_nonzero_batches": 0,
+                "optimizer_steps": 0,
+            },
+        )
+        stats = self._compute_planner_grad_stats()
+        accumulator["batches"] += 1
+        accumulator["grad_l2_sum"] += float(stats["l2"])
+        accumulator["grad_l2_max"] = max(float(accumulator["grad_l2_max"]), float(stats["max_abs"]))
+        accumulator["grad_present_batches"] += int(int(stats["present_params"]) > 0)
+        accumulator["grad_nonzero_batches"] += int(int(stats["nonzero_params"]) > 0)
+
+    def _record_planner_optimizer_step(self, context: Dict[str, Any]) -> None:
+        if not self._planner_audit_enabled():
+            return
+        accumulator = context.setdefault(
+            "planner_audit_epoch_accumulator",
+            {
+                "batches": 0,
+                "grad_l2_sum": 0.0,
+                "grad_l2_max": 0.0,
+                "grad_present_batches": 0,
+                "grad_nonzero_batches": 0,
+                "optimizer_steps": 0,
+            },
+        )
+        accumulator["optimizer_steps"] += 1
+
+    def _log_planner_epoch_audit(self, context: Dict[str, Any]) -> None:
+        if not self._planner_audit_enabled():
+            return
+        accumulator = context.get("planner_audit_epoch_accumulator", {})
+        batches = max(int(accumulator.get("batches", 0)), 1)
+        optimizer_summary = context.get("planner_optimizer_summary") or self._planner_optimizer_membership(context["optimizer"])
+        self.logger.info(
+            "[PlannerTrainPath][Task %d][Epoch %d] in_optimizer=%s group_indices=%s group_lrs=%s requires_grad=%d/%d grad_present_batches=%d/%d grad_nonzero_batches=%d/%d optimizer_steps=%d pre_step_grad_l2_mean=%.4e pre_step_grad_l2_max=%.4e",
+            context["task_number"],
+            int(context["current_epoch"]),
+            bool(optimizer_summary["in_optimizer"]),
+            optimizer_summary["group_indices"],
+            optimizer_summary["group_lrs"],
+            int(optimizer_summary["requires_grad_parameters"]),
+            int(optimizer_summary["total_parameters"]),
+            int(accumulator.get("grad_present_batches", 0)),
+            batches,
+            int(accumulator.get("grad_nonzero_batches", 0)),
+            batches,
+            int(accumulator.get("optimizer_steps", 0)),
+            float(accumulator.get("grad_l2_sum", 0.0)) / batches,
+            float(accumulator.get("grad_l2_max", 0.0)),
+        )
+
+    def _log_planner_parameter_drift(self, context: Dict[str, Any]) -> None:
+        if not self._planner_audit_enabled():
+            return
+        current_snapshot = self._snapshot_named_parameters(self.planner)
+        from_init = self._parameter_distance_summary(current_snapshot, self._planner_init_snapshot)
+        from_post_task1 = self._parameter_distance_summary(current_snapshot, self._planner_post_task1_snapshot)
+        self.logger.info(
+            "[PlannerParamDrift][Task %d] from_init_l2=%.4e from_init_max_abs=%.4e from_post_task1_l2=%s from_post_task1_max_abs=%s",
+            context["task_number"],
+            0.0 if from_init is None else float(from_init["l2"]),
+            0.0 if from_init is None else float(from_init["max_abs"]),
+            "n/a" if from_post_task1 is None else f"{float(from_post_task1['l2']):.4e}",
+            "n/a" if from_post_task1 is None else f"{float(from_post_task1['max_abs']):.4e}",
+        )
+        if int(context["task_number"]) == 1 and self._planner_post_task1_snapshot is None:
+            self._planner_post_task1_snapshot = current_snapshot
+            self.logger.info("[PlannerParamDrift][Task 1] stored_post_task1_reference=True")
 
     def _log_stage5_lifecycle_for_profile(self, context: Dict[str, Any], label: str, profile: Dict[int, Dict[str, object]]) -> None:
         if not self._routing_audit_enabled():
@@ -1490,7 +1862,10 @@ class NHLoRATrainer:
             "old_num_classes": old_num_classes,
             "old_classifier_weight_snapshot": old_classifier_weight_snapshot,
         }
+        if self._planner_audit_enabled():
+            context["planner_optimizer_summary"] = self._planner_optimizer_membership(optimizer)
         self._log_stage5_plan_debug(context)
+        self._log_planner_audit_prepare(context)
         return context
 
     def _accumulate_usage(self, accumulator: Dict[int, Dict[int, float]], route_info: Dict[int, Dict[str, object]]) -> None:
@@ -1683,6 +2058,14 @@ class NHLoRATrainer:
                 group: {"sum": 0.0, "max": 0.0, "batches": 0}
                 for group in ("shared", "slot", "router", "planner", "classifier")
             }
+            context["planner_audit_epoch_accumulator"] = {
+                "batches": 0,
+                "grad_l2_sum": 0.0,
+                "grad_l2_max": 0.0,
+                "grad_present_batches": 0,
+                "grad_nonzero_batches": 0,
+                "optimizer_steps": 0,
+            }
             train_loader = self._build_train_loader(train_dataset)
             self.model.train()
             self.planner.train()
@@ -1704,6 +2087,7 @@ class NHLoRATrainer:
                 losses = self._compute_loss(context, outputs, labels)
                 losses["total"].backward()
                 self._mask_old_classifier_gradients(context)
+                self._accumulate_planner_audit_pre_step(context)
                 self._accumulate_grad_norm_debug(context)
                 if grad_clip_norm > 0:
                     nn.utils.clip_grad_norm_(
@@ -1711,6 +2095,7 @@ class NHLoRATrainer:
                         grad_clip_norm,
                     )
                 optimizer.step()
+                self._record_planner_optimizer_step(context)
                 self._accumulate_usage(usage_accumulator, outputs["route_info"])
                 self._update_routing_debug(context, outputs["route_info"])
                 if outputs["route_info"]:
@@ -1789,6 +2174,7 @@ class NHLoRATrainer:
                 self._log_grad_norm_debug(context)
                 self._log_adapter_delta_debug(context)
                 self._log_routing_debug(context)
+                self._log_planner_epoch_audit(context)
 
         training_time = self._perf_counter() - training_time_start
         self._log_classifier_drift_debug(context, final=True)
@@ -1827,6 +2213,7 @@ class NHLoRATrainer:
             profile=self.inference_profile,
         )
         self._log_stage5_train_eval_comparison(context)
+        self._log_planner_parameter_drift(context)
         self._append_history(context, usage_stats)
         self.last_train_state["history_sizes"].append(len(self.history_bank.entries))
 
