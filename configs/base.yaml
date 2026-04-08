@@ -102,6 +102,16 @@ training:
   retention_feature_diff_max_epochs: 3
   routing_debug_logging: false
   routing_debug_max_epochs: 3
+  adapter_delta_debug_logging: false
+  adapter_delta_debug_max_epochs: 3
+  final_feature_diff_debug_logging: false
+  final_feature_diff_debug_max_epochs: 3
+  classifier_drift_debug_logging: false
+  classifier_drift_debug_max_epochs: 3
+  grad_norm_debug_logging: false
+  grad_norm_debug_max_epochs: 3
+  logit_margin_debug_logging: false
+  logit_margin_debug_max_epochs: 3
   freeze_old_classifier_weights: true
 
 loss:

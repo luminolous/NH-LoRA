@@ -409,18 +409,50 @@ class NHLoRALayer(nn.Module):
     def _point_output_dim(self, point_name: str) -> int:
         return self.embed_dim * 4 if point_name == "mlp_fc1" else self.embed_dim
 
+    def _record_delta_debug(
+        self,
+        kind: str,
+        point_name: str,
+        delta: torch.Tensor,
+        planner_cfg: Dict[str, object],
+    ) -> None:
+        accumulator = planner_cfg.get("_debug_delta_stats")
+        if not isinstance(accumulator, dict):
+            return
+        block_id = int(planner_cfg.get("_debug_block_id", -1))
+        block_entry = accumulator.setdefault(block_id, {})
+        point_entry = block_entry.setdefault(point_name, {})
+        stats = point_entry.setdefault(
+            kind,
+            {
+                "calls": 0,
+                "norm_sum": 0.0,
+                "mean_abs_sum": 0.0,
+                "max_abs": 0.0,
+            },
+        )
+        detached = delta.detach()
+        stats["calls"] += 1
+        stats["norm_sum"] += float(detached.norm().item())
+        stats["mean_abs_sum"] += float(detached.abs().mean().item()) if detached.numel() else 0.0
+        stats["max_abs"] = max(float(stats["max_abs"]), float(detached.abs().max().item()) if detached.numel() else 0.0)
+
     def _shared_delta(self, point_name: str, hidden_states: torch.Tensor, planner_cfg: Dict[str, object]) -> torch.Tensor:
         if point_name not in self.selected_points:
             return hidden_states.new_zeros(*hidden_states.shape[:-1], self._point_output_dim(point_name))
         bank = self.point_banks[sanitize_key(point_name)]
-        return bank.shared_delta(hidden_states, shared_gate=float(planner_cfg.get("shared_gate", 1.0)))
+        delta = bank.shared_delta(hidden_states, shared_gate=float(planner_cfg.get("shared_gate", 1.0)))
+        self._record_delta_debug("shared", point_name, delta, planner_cfg)
+        return delta
 
     def _slot_delta(self, point_name: str, hidden_states: torch.Tensor, route_state: Dict[str, object], planner_cfg: Dict[str, object]) -> torch.Tensor:
         if point_name not in self.selected_points:
             return hidden_states.new_zeros(*hidden_states.shape[:-1], self._point_output_dim(point_name))
         candidate_slots = route_state.get("candidate_slots", [])
         if not candidate_slots:
-            return hidden_states.new_zeros(*hidden_states.shape[:-1], self._point_output_dim(point_name))
+            delta = hidden_states.new_zeros(*hidden_states.shape[:-1], self._point_output_dim(point_name))
+            self._record_delta_debug("slot", point_name, delta, planner_cfg)
+            return delta
         bank = self.point_banks[sanitize_key(point_name)]
         rank_cfg = planner_cfg.get("rank_cfg", {})
         weights = route_state.get("routing_weights")
@@ -429,7 +461,9 @@ class NHLoRALayer(nn.Module):
         if weights is None or topk_indices is None:
             slot_id = candidate_slots[0]
             rank = int(rank_cfg.get(slot_id, self.slot_metadata[slot_id].rank))
-            return bank.slot_delta(hidden_states, slot_id, rank)
+            delta = bank.slot_delta(hidden_states, slot_id, rank)
+            self._record_delta_debug("slot", point_name, delta, planner_cfg)
+            return delta
         for batch_index in range(hidden_states.size(0)):
             batch_hidden = hidden_states[batch_index : batch_index + 1]
             for col, candidate_index in enumerate(topk_indices[batch_index].tolist()):
@@ -438,6 +472,7 @@ class NHLoRALayer(nn.Module):
                 slot_delta = bank.slot_delta(batch_hidden, slot_id, rank)
                 delta[batch_index : batch_index + 1] += slot_delta * weights[batch_index, col]
                 self.slot_metadata[slot_id].last_usage = float(weights[batch_index, col].detach().item())
+        self._record_delta_debug("slot", point_name, delta, planner_cfg)
         return delta
 
     def apply_to_qkv(self, hidden_states: torch.Tensor, base_qkv: torch.Tensor, route_state: Dict[str, object], planner_cfg: Dict[str, object]) -> torch.Tensor:

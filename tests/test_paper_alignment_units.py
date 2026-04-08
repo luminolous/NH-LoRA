@@ -166,6 +166,16 @@ def _build_test_config(output_root: str):
             "retention_feature_diff_max_epochs": 3,
             "routing_debug_logging": False,
             "routing_debug_max_epochs": 3,
+            "adapter_delta_debug_logging": False,
+            "adapter_delta_debug_max_epochs": 3,
+            "final_feature_diff_debug_logging": False,
+            "final_feature_diff_debug_max_epochs": 3,
+            "classifier_drift_debug_logging": False,
+            "classifier_drift_debug_max_epochs": 3,
+            "grad_norm_debug_logging": False,
+            "grad_norm_debug_max_epochs": 3,
+            "logit_margin_debug_logging": False,
+            "logit_margin_debug_max_epochs": 3,
         },
         "loss": {
             "lambda_kd": 0.5,
@@ -873,6 +883,138 @@ class PaperAlignmentUnitTests(unittest.TestCase):
         self.assertIn("avg_candidate_count=2.00", joined_messages)
         self.assertIn("avg_topk=2.00", joined_messages)
 
+    def test_adapter_delta_debug_records_shared_and_slot_stats(self):
+        layer = NHLoRALayer(
+            embed_dim=8,
+            selected_points=["q_proj"],
+            shared_rank=2,
+            slot_r_max=4,
+            slot_init_rank=1,
+            bootstrap_slot_rank=1,
+            max_slots=2,
+            router_topk=1,
+            router_temperature=1.0,
+            task_embedding_dim=8,
+        )
+        slot_id = layer.add_slot(initial_rank=1, task_id=1)
+        hidden_states = torch.randn(2, 5, 8)
+        accumulator = {}
+        planner_cfg = {
+            "shared_gate": 1.0,
+            "rank_cfg": {slot_id: 1},
+            "_debug_delta_stats": accumulator,
+            "_debug_block_id": 7,
+        }
+
+        shared_delta = layer._shared_delta("q_proj", hidden_states, planner_cfg)
+        slot_delta = layer._slot_delta(
+            "q_proj",
+            hidden_states,
+            route_state={"candidate_slots": [slot_id]},
+            planner_cfg=planner_cfg,
+        )
+
+        self.assertEqual(shared_delta.shape, hidden_states.shape)
+        self.assertEqual(slot_delta.shape, hidden_states.shape)
+        self.assertIn(7, accumulator)
+        self.assertIn("q_proj", accumulator[7])
+        self.assertEqual(accumulator[7]["q_proj"]["shared"]["calls"], 1)
+        self.assertEqual(accumulator[7]["q_proj"]["slot"]["calls"], 1)
+        self.assertIn("norm_sum", accumulator[7]["q_proj"]["shared"])
+        self.assertIn("mean_abs_sum", accumulator[7]["q_proj"]["slot"])
+
+    def test_stage1_debug_helpers_are_config_gated_and_log_expected_records(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "stage1_debug_helpers_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        for flag in (
+            "adapter_delta_debug_logging",
+            "final_feature_diff_debug_logging",
+            "classifier_drift_debug_logging",
+            "grad_norm_debug_logging",
+            "logit_margin_debug_logging",
+        ):
+            config["training"][flag] = True
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        logger = _ListLogger()
+        trainer = NHLoRATrainer(config, logger, benchmark=benchmark)
+        trainer.model.classifier.expand(4)
+
+        context = {
+            "task_number": 2,
+            "current_epoch": 1,
+            "old_num_classes": 2,
+            "applied_plans": {1: {"shared_gate": 1.0}},
+            "grad_norm_debug_accumulator": {
+                group: {"sum": 0.0, "max": 0.0, "batches": 0}
+                for group in ("shared", "slot", "router", "planner", "classifier")
+            },
+        }
+        disabled_config = _build_test_config(str(workspace_tmp))
+        disabled_trainer = NHLoRATrainer(disabled_config, _ListLogger(), benchmark=benchmark)
+        disabled_context = dict(context)
+        disabled_context["applied_plans"] = {1: {"shared_gate": 1.0}}
+        self.assertIs(disabled_trainer._plans_for_training_forward(disabled_context), disabled_context["applied_plans"])
+
+        debug_plans = trainer._plans_for_training_forward(context)
+        self.assertIn("_debug_delta_stats", debug_plans[1])
+        self.assertNotIn("_debug_delta_stats", context["applied_plans"][1])
+
+        feature_dim = trainer.model.backbone.embed_dim
+        outputs = {
+            "features": torch.randn(3, feature_dim),
+            "logits": torch.tensor(
+                [
+                    [0.2, 0.1, 1.1, 1.3],
+                    [0.1, 0.4, 1.2, 1.1],
+                    [0.0, 0.3, 0.9, 1.0],
+                ]
+            ),
+        }
+        teacher_outputs = {"features": outputs["features"] + 0.01}
+        context["old_classifier_weight_snapshot"] = trainer.model.classifier.weight[:2].detach().clone()
+        with torch.no_grad():
+            trainer.model.classifier.weight[:2].add_(0.01)
+
+        trainer._log_final_feature_diff_debug(context, outputs, teacher_outputs)
+        trainer._log_logit_margin_debug(context, outputs)
+        trainer._log_classifier_drift_debug(context)
+
+        layer = trainer.model.layers["1"]
+        slot_id = layer.add_slot(initial_rank=1, task_id=1)
+        bank = layer.point_banks["q_proj"]
+        bank.shared_a.grad = torch.ones_like(bank.shared_a) * 0.01
+        bank.slot_a[slot_id].grad = torch.ones_like(bank.slot_a[slot_id]) * 0.02
+        layer.query_proj.weight.grad = torch.ones_like(layer.query_proj.weight) * 0.03
+        trainer.model.classifier.weight.grad = torch.ones_like(trainer.model.classifier.weight) * 0.04
+        planner_param = next(trainer.planner.parameters())
+        planner_param.grad = torch.ones_like(planner_param) * 0.05
+        trainer._accumulate_grad_norm_debug(context)
+        trainer._log_grad_norm_debug(context)
+
+        context["adapter_delta_debug_accumulator"] = {
+            1: {
+                "q_proj": {
+                    "shared": {"calls": 1, "norm_sum": 1.0, "mean_abs_sum": 0.5, "max_abs": 0.7},
+                    "slot": {"calls": 1, "norm_sum": 0.0, "mean_abs_sum": 0.0, "max_abs": 0.0},
+                }
+            }
+        }
+        trainer._log_adapter_delta_debug(context)
+
+        joined_messages = "\n".join(logger.messages)
+        self.assertIn("[FinalFeatureDiff][Task 2][Epoch 1]", joined_messages)
+        self.assertIn("[LogitMargin][Task 2][Epoch 1]", joined_messages)
+        self.assertIn("[ClassifierDrift][Task 2][Epoch 1]", joined_messages)
+        self.assertIn("[GradNorm][Task 2][Epoch 1][shared]", joined_messages)
+        self.assertIn("[GradNorm][Task 2][Epoch 1][slot]", joined_messages)
+        self.assertIn("[GradNorm][Task 2][Epoch 1][router]", joined_messages)
+        self.assertIn("[GradNorm][Task 2][Epoch 1][planner]", joined_messages)
+        self.assertIn("[GradNorm][Task 2][Epoch 1][classifier]", joined_messages)
+        self.assertIn("[AdapterDelta][Task 2][Epoch 1][Layer 1][q_proj][shared]", joined_messages)
+        self.assertIn("[AdapterDelta][Task 2][Epoch 1][Layer 1][q_proj][slot]", joined_messages)
+
     def test_seed_config_logging_tolerates_missing_optional_fields(self):
         repo_root = Path(__file__).resolve().parents[1]
         workspace_tmp = repo_root / "outputs" / "test_tmp" / "seed_config_log_unit"
@@ -893,6 +1035,11 @@ class PaperAlignmentUnitTests(unittest.TestCase):
         self.assertIn("retention_feature_representation=cls", joined_messages)
         self.assertIn("retention_feature_diff_logging=", joined_messages)
         self.assertIn("routing_debug_logging=", joined_messages)
+        self.assertIn("adapter_delta_debug_logging=", joined_messages)
+        self.assertIn("final_feature_diff_debug_logging=", joined_messages)
+        self.assertIn("classifier_drift_debug_logging=", joined_messages)
+        self.assertIn("grad_norm_debug_logging=", joined_messages)
+        self.assertIn("logit_margin_debug_logging=", joined_messages)
 
     def test_seed_config_warns_for_full_token_retention_features(self):
         repo_root = Path(__file__).resolve().parents[1]

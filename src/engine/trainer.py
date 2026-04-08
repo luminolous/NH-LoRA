@@ -296,13 +296,18 @@ class NHLoRATrainer:
             chu_cfg.get("stability_threshold", "n/a"),
         )
         self.logger.info(
-            "  logging estimate_eta=%s cuda_sync_timing=%s debug_eval_around_consolidation=%s retention_debug_logging=%s retention_feature_diff_logging=%s routing_debug_logging=%s freeze_old_classifier_weights=%s",
+            "  logging estimate_eta=%s cuda_sync_timing=%s debug_eval_around_consolidation=%s retention_debug_logging=%s retention_feature_diff_logging=%s routing_debug_logging=%s adapter_delta_debug_logging=%s final_feature_diff_debug_logging=%s classifier_drift_debug_logging=%s grad_norm_debug_logging=%s logit_margin_debug_logging=%s freeze_old_classifier_weights=%s",
             training_cfg.get("estimate_eta", True),
             training_cfg.get("cuda_sync_timing", False),
             training_cfg.get("debug_eval_around_consolidation", False),
             training_cfg.get("retention_debug_logging", True),
             training_cfg.get("retention_feature_diff_logging", False),
             training_cfg.get("routing_debug_logging", False),
+            training_cfg.get("adapter_delta_debug_logging", False),
+            training_cfg.get("final_feature_diff_debug_logging", False),
+            training_cfg.get("classifier_drift_debug_logging", False),
+            training_cfg.get("grad_norm_debug_logging", False),
+            training_cfg.get("logit_margin_debug_logging", False),
             training_cfg.get("freeze_old_classifier_weights", True),
         )
         if str(loss_cfg.get("retention_feature_representation", "cls")).lower() == "full_tokens":
@@ -432,6 +437,251 @@ class NHLoRATrainer:
         epoch = int(context.get("current_epoch", 0))
         max_epochs = int(self.config["training"].get(max_epoch_key, 3))
         return epoch > 0 and epoch <= max(max_epochs, 0)
+
+    def _plans_for_training_forward(self, context: Dict[str, Any]) -> Dict[int, Dict[str, object]]:
+        if not self._epoch_debug_enabled(
+            context,
+            flag_key="adapter_delta_debug_logging",
+            max_epoch_key="adapter_delta_debug_max_epochs",
+        ):
+            return context["applied_plans"]
+        accumulator = context.setdefault("adapter_delta_debug_accumulator", {})
+        debug_plans = {}
+        for block_id, planner_cfg in context["applied_plans"].items():
+            layer_cfg = dict(planner_cfg)
+            layer_cfg["_debug_delta_stats"] = accumulator
+            layer_cfg["_debug_block_id"] = int(block_id)
+            debug_plans[int(block_id)] = layer_cfg
+        return debug_plans
+
+    def _log_adapter_delta_debug(self, context: Dict[str, Any]) -> None:
+        if not self._epoch_debug_enabled(
+            context,
+            flag_key="adapter_delta_debug_logging",
+            max_epoch_key="adapter_delta_debug_max_epochs",
+        ):
+            return
+        epoch = int(context["current_epoch"])
+        if context.get("last_adapter_delta_debug_epoch") == epoch:
+            return
+        context["last_adapter_delta_debug_epoch"] = epoch
+        accumulator = context.get("adapter_delta_debug_accumulator", {})
+        context["last_adapter_delta_debug"] = accumulator
+        if not accumulator:
+            self.logger.warning(
+                "[AdapterDelta][Task %d][Epoch %d] no adapter delta records were collected.",
+                context["task_number"],
+                epoch,
+            )
+            return
+        for block_id in sorted(accumulator):
+            for point_name in sorted(accumulator[block_id]):
+                point_stats = accumulator[block_id][point_name]
+                for kind in ("shared", "slot"):
+                    stats = point_stats.get(kind)
+                    if not stats:
+                        continue
+                    calls = max(int(stats.get("calls", 0)), 1)
+                    self.logger.info(
+                        "[AdapterDelta][Task %d][Epoch %d][Layer %d][%s][%s] calls=%d norm_mean=%.4e mean_abs=%.4e max_abs=%.4e",
+                        context["task_number"],
+                        epoch,
+                        int(block_id),
+                        point_name,
+                        kind,
+                        int(stats.get("calls", 0)),
+                        float(stats.get("norm_sum", 0.0)) / calls,
+                        float(stats.get("mean_abs_sum", 0.0)) / calls,
+                        float(stats.get("max_abs", 0.0)),
+                    )
+
+    def _compute_grad_group_norms(self) -> Dict[str, float]:
+        squared_sums = {
+            "shared": 0.0,
+            "slot": 0.0,
+            "router": 0.0,
+            "planner": 0.0,
+            "classifier": 0.0,
+        }
+        for name, parameter in self.model.named_parameters():
+            if parameter.grad is None:
+                continue
+            if ".shared_a" in name or ".shared_b" in name:
+                group = "shared"
+            elif ".slot_a" in name or ".slot_b" in name:
+                group = "slot"
+            elif ".query_proj" in name or ".slot_keys" in name:
+                group = "router"
+            elif name.startswith("classifier."):
+                group = "classifier"
+            else:
+                continue
+            squared_sums[group] += float(parameter.grad.detach().pow(2).sum().item())
+        for parameter in self.planner.parameters():
+            if parameter.grad is not None:
+                squared_sums["planner"] += float(parameter.grad.detach().pow(2).sum().item())
+        return {group: value ** 0.5 for group, value in squared_sums.items()}
+
+    def _accumulate_grad_norm_debug(self, context: Dict[str, Any]) -> None:
+        if not self._epoch_debug_enabled(
+            context,
+            flag_key="grad_norm_debug_logging",
+            max_epoch_key="grad_norm_debug_max_epochs",
+        ):
+            return
+        accumulator = context.setdefault(
+            "grad_norm_debug_accumulator",
+            {group: {"sum": 0.0, "max": 0.0, "batches": 0} for group in ("shared", "slot", "router", "planner", "classifier")},
+        )
+        for group, norm_value in self._compute_grad_group_norms().items():
+            stats = accumulator[group]
+            stats["sum"] += float(norm_value)
+            stats["max"] = max(float(stats["max"]), float(norm_value))
+            stats["batches"] += 1
+
+    def _log_grad_norm_debug(self, context: Dict[str, Any]) -> None:
+        if not self._epoch_debug_enabled(
+            context,
+            flag_key="grad_norm_debug_logging",
+            max_epoch_key="grad_norm_debug_max_epochs",
+        ):
+            return
+        epoch = int(context["current_epoch"])
+        if context.get("last_grad_norm_debug_epoch") == epoch:
+            return
+        context["last_grad_norm_debug_epoch"] = epoch
+        accumulator = context.get("grad_norm_debug_accumulator", {})
+        context["last_grad_norm_debug"] = accumulator
+        for group in ("shared", "slot", "router", "planner", "classifier"):
+            stats = accumulator.get(group, {"sum": 0.0, "max": 0.0, "batches": 0})
+            batches = max(int(stats.get("batches", 0)), 1)
+            self.logger.info(
+                "[GradNorm][Task %d][Epoch %d][%s] mean=%.4e max=%.4e batches=%d",
+                context["task_number"],
+                epoch,
+                group,
+                float(stats.get("sum", 0.0)) / batches,
+                float(stats.get("max", 0.0)),
+                int(stats.get("batches", 0)),
+            )
+
+    def _classifier_drift_stats(self, context: Dict[str, Any]) -> Dict[str, float] | None:
+        snapshot = context.get("old_classifier_weight_snapshot")
+        old_num_classes = int(context.get("old_num_classes", 0))
+        if old_num_classes <= 0 or not isinstance(snapshot, torch.Tensor):
+            return None
+        current = self.model.classifier.weight[:old_num_classes].detach()
+        snapshot = snapshot.to(device=current.device, dtype=current.dtype)
+        diff = current - snapshot
+        return {
+            "mean_abs": float(diff.abs().mean().item()),
+            "max_abs": float(diff.abs().max().item()),
+            "norm": float(diff.norm().item()),
+            "current_norm_mean": float(current.norm(dim=-1).mean().item()),
+            "snapshot_norm_mean": float(snapshot.norm(dim=-1).mean().item()),
+        }
+
+    def _log_classifier_drift_debug(self, context: Dict[str, Any], final: bool = False) -> None:
+        if not bool(self.config["training"].get("classifier_drift_debug_logging", False)):
+            return
+        epoch = int(context.get("current_epoch", 0))
+        max_epochs = int(self.config["training"].get("classifier_drift_debug_max_epochs", 3))
+        if not final and (int(context.get("task_number", 1)) <= 1 or epoch <= 0 or epoch > max(max_epochs, 0)):
+            return
+        label = "Final" if final else f"Epoch {epoch}"
+        if not final and context.get("last_classifier_drift_debug_epoch") == epoch:
+            return
+        if not final:
+            context["last_classifier_drift_debug_epoch"] = epoch
+        stats = self._classifier_drift_stats(context)
+        if stats is None:
+            return
+        context["last_classifier_drift_debug"] = stats
+        self.logger.info(
+            "[ClassifierDrift][Task %d][%s] old_classes=%d mean_abs=%.4e max_abs=%.4e norm=%.4e old_weight_norm_mean=%.4e snapshot_norm_mean=%.4e",
+            context["task_number"],
+            label,
+            int(context.get("old_num_classes", 0)),
+            stats["mean_abs"],
+            stats["max_abs"],
+            stats["norm"],
+            stats["current_norm_mean"],
+            stats["snapshot_norm_mean"],
+        )
+
+    def _log_final_feature_diff_debug(
+        self,
+        context: Dict[str, Any],
+        outputs: Dict[str, Any],
+        teacher_outputs: Dict[str, Any],
+    ) -> None:
+        if not self._epoch_debug_enabled(
+            context,
+            flag_key="final_feature_diff_debug_logging",
+            max_epoch_key="final_feature_diff_debug_max_epochs",
+        ):
+            return
+        epoch = int(context["current_epoch"])
+        if context.get("last_final_feature_diff_debug_epoch") == epoch:
+            return
+        context["last_final_feature_diff_debug_epoch"] = epoch
+        student_features = F.normalize(outputs["features"].detach(), dim=-1)
+        teacher_features = F.normalize(teacher_outputs["features"].detach(), dim=-1)
+        diff = (student_features - teacher_features).abs()
+        cosine = (student_features * teacher_features).sum(dim=-1)
+        stats = {
+            "mean_abs": float(diff.mean().item()),
+            "max_abs": float(diff.max().item()),
+            "mean_cosine": float(cosine.mean().item()),
+            "min_cosine": float(cosine.min().item()),
+        }
+        context["last_final_feature_diff_debug"] = stats
+        self.logger.info(
+            "[FinalFeatureDiff][Task %d][Epoch %d] mean_abs=%.4e max_abs=%.4e mean_cosine=%.4e min_cosine=%.4e",
+            context["task_number"],
+            epoch,
+            stats["mean_abs"],
+            stats["max_abs"],
+            stats["mean_cosine"],
+            stats["min_cosine"],
+        )
+
+    def _log_logit_margin_debug(self, context: Dict[str, Any], outputs: Dict[str, Any]) -> None:
+        if not self._epoch_debug_enabled(
+            context,
+            flag_key="logit_margin_debug_logging",
+            max_epoch_key="logit_margin_debug_max_epochs",
+        ):
+            return
+        epoch = int(context["current_epoch"])
+        if context.get("last_logit_margin_debug_epoch") == epoch:
+            return
+        old_num_classes = int(context.get("old_num_classes", 0))
+        logits = outputs["logits"].detach()
+        if old_num_classes <= 0 or logits.size(-1) <= old_num_classes:
+            return
+        context["last_logit_margin_debug_epoch"] = epoch
+        old_max = logits[:, :old_num_classes].max(dim=-1).values
+        new_max = logits[:, old_num_classes:].max(dim=-1).values
+        margin = new_max - old_max
+        stats = {
+            "old_max_mean": float(old_max.mean().item()),
+            "new_max_mean": float(new_max.mean().item()),
+            "new_minus_old_mean": float(margin.mean().item()),
+            "new_wins_ratio": float((margin > 0).float().mean().item()),
+        }
+        context["last_logit_margin_debug"] = stats
+        self.logger.info(
+            "[LogitMargin][Task %d][Epoch %d] old_classes=%d new_classes=%d old_max_mean=%.4e new_max_mean=%.4e new_minus_old_mean=%.4e new_wins_ratio=%.4f",
+            context["task_number"],
+            epoch,
+            old_num_classes,
+            logits.size(-1) - old_num_classes,
+            stats["old_max_mean"],
+            stats["new_max_mean"],
+            stats["new_minus_old_mean"],
+            stats["new_wins_ratio"],
+        )
 
     def _retention_feature_layer_match(
         self,
@@ -821,6 +1071,11 @@ class NHLoRATrainer:
         }
         self.model.capture_pre_task_snapshots()
         old_num_classes = self.model.classifier.num_classes
+        old_classifier_weight_snapshot = (
+            self.model.classifier.weight[:old_num_classes].detach().clone()
+            if old_num_classes > 0
+            else None
+        )
         self._expand_classifier_for_task(task_definition, task_state)
         optimizer = self._build_optimizer()
         scheduler = self._build_scheduler(optimizer)
@@ -839,6 +1094,7 @@ class NHLoRATrainer:
             "scheduler": scheduler,
             "warmup_info": warmup_info,
             "old_num_classes": old_num_classes,
+            "old_classifier_weight_snapshot": old_classifier_weight_snapshot,
         }
 
     def _accumulate_usage(self, accumulator: Dict[int, Dict[int, float]], route_info: Dict[int, Dict[str, object]]) -> None:
@@ -960,6 +1216,8 @@ class NHLoRATrainer:
                     task_state=None,
                     planner_out=teacher_profile,
                 )
+            self._log_final_feature_diff_debug(context, outputs, teacher_outputs)
+            self._log_logit_margin_debug(context, outputs)
             teacher_num_classes = teacher_model.classifier.num_classes
             if teacher_num_classes > 0:
                 kd_term = kd_loss(
@@ -1024,6 +1282,11 @@ class NHLoRATrainer:
             epoch_start = self._perf_counter()
             context["current_epoch"] = epoch
             context["routing_debug_accumulator"] = {}
+            context["adapter_delta_debug_accumulator"] = {}
+            context["grad_norm_debug_accumulator"] = {
+                group: {"sum": 0.0, "max": 0.0, "batches": 0}
+                for group in ("shared", "slot", "router", "planner", "classifier")
+            }
             train_loader = self._build_train_loader(train_dataset)
             self.model.train()
             self.planner.train()
@@ -1034,11 +1297,13 @@ class NHLoRATrainer:
             for batch in train_loader:
                 images, labels = self._prepare_images_labels(batch)
                 optimizer.zero_grad(set_to_none=True)
-                outputs = self.model.forward_with_state(images, context["task_state"], context["applied_plans"])
+                planner_out = self._plans_for_training_forward(context)
+                outputs = self.model.forward_with_state(images, context["task_state"], planner_out)
                 outputs["images"] = images
                 losses = self._compute_loss(context, outputs, labels)
                 losses["total"].backward()
                 self._mask_old_classifier_gradients(context)
+                self._accumulate_grad_norm_debug(context)
                 if grad_clip_norm > 0:
                     nn.utils.clip_grad_norm_(
                         list(self.model.parameters()) + list(self.planner.parameters()) + list(self.task_state_encoder.parameters()),
@@ -1119,9 +1384,13 @@ class NHLoRATrainer:
                         debug["kd_raw"],
                         debug["feat_raw"],
                     )
+                self._log_classifier_drift_debug(context)
+                self._log_grad_norm_debug(context)
+                self._log_adapter_delta_debug(context)
                 self._log_routing_debug(context)
 
         training_time = self._perf_counter() - training_time_start
+        self._log_classifier_drift_debug(context, final=True)
         usage_stats = self._finalize_usage(usage_accumulator, batch_count)
         for block_id, stats in usage_stats.items():
             self.model.layers[str(block_id)].update_usage_statistics(stats)
