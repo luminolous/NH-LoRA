@@ -125,14 +125,21 @@ class NHLoRATrainer:
     def _shared_lr_scale(self) -> float:
         return float(self.config["nh_lora"].get("shared_lr_scale", 1.0))
 
+    def _classifier_lr_scale(self) -> float:
+        return float(self.config["training"].get("classifier_lr_scale", 1.0))
+
     def _build_optimizer(self):
         shared_params = []
+        classifier_params = []
         other_params = []
+        classifier_lr_scale = self._classifier_lr_scale()
         for name, parameter in self.model.named_parameters():
             if not parameter.requires_grad:
                 continue
             if ".shared_a" in name or ".shared_b" in name:
                 shared_params.append(parameter)
+            elif name.startswith("classifier.") and classifier_lr_scale != 1.0:
+                classifier_params.append(parameter)
             else:
                 other_params.append(parameter)
         other_params.extend([parameter for parameter in self.planner.parameters() if parameter.requires_grad])
@@ -145,6 +152,13 @@ class NHLoRATrainer:
                 {
                     "params": shared_params,
                     "lr": self._base_learning_rate() * self._shared_lr_scale(),
+                }
+            )
+        if classifier_params:
+            parameter_groups.append(
+                {
+                    "params": classifier_params,
+                    "lr": self._base_learning_rate() * classifier_lr_scale,
                 }
             )
         return AdamW(parameter_groups, lr=self._base_learning_rate(), weight_decay=float(self.config["training"]["weight_decay"]))
@@ -296,7 +310,7 @@ class NHLoRATrainer:
             chu_cfg.get("stability_threshold", "n/a"),
         )
         self.logger.info(
-            "  logging estimate_eta=%s cuda_sync_timing=%s debug_eval_around_consolidation=%s retention_debug_logging=%s retention_feature_diff_logging=%s routing_debug_logging=%s adapter_delta_debug_logging=%s final_feature_diff_debug_logging=%s classifier_drift_debug_logging=%s grad_norm_debug_logging=%s logit_margin_debug_logging=%s freeze_old_classifier_weights=%s",
+            "  logging estimate_eta=%s cuda_sync_timing=%s debug_eval_around_consolidation=%s retention_debug_logging=%s retention_feature_diff_logging=%s routing_debug_logging=%s adapter_delta_debug_logging=%s final_feature_diff_debug_logging=%s classifier_drift_debug_logging=%s grad_norm_debug_logging=%s logit_margin_debug_logging=%s freeze_old_classifier_weights=%s classifier_lr_scale=%s freeze_new_classifier_epochs=%s freeze_all_classifier_epochs=%s",
             training_cfg.get("estimate_eta", True),
             training_cfg.get("cuda_sync_timing", False),
             training_cfg.get("debug_eval_around_consolidation", False),
@@ -309,6 +323,9 @@ class NHLoRATrainer:
             training_cfg.get("grad_norm_debug_logging", False),
             training_cfg.get("logit_margin_debug_logging", False),
             training_cfg.get("freeze_old_classifier_weights", True),
+            training_cfg.get("classifier_lr_scale", 1.0),
+            training_cfg.get("freeze_new_classifier_epochs", 0),
+            training_cfg.get("freeze_all_classifier_epochs", 0),
         )
         if str(loss_cfg.get("retention_feature_representation", "cls")).lower() == "full_tokens":
             self.logger.warning(
@@ -407,18 +424,30 @@ class NHLoRATrainer:
         return float(sum(forgetting_values) / len(forgetting_values))
 
     def _mask_old_classifier_gradients(self, context: Dict[str, Any]) -> None:
-        if not bool(self.config["training"].get("freeze_old_classifier_weights", True)):
-            return
+        training_cfg = self.config["training"]
+        current_epoch = int(context.get("current_epoch", 0))
+        freeze_all_epochs = int(training_cfg.get("freeze_all_classifier_epochs", 0))
+        freeze_new_epochs = int(training_cfg.get("freeze_new_classifier_epochs", 0))
         old_num_classes = int(context.get("old_num_classes", 0))
-        if old_num_classes <= 0:
-            return
         classifier = self.model.classifier
         if classifier.weight.grad is not None:
-            # Prevent old classifier prototypes from drifting under new-task CE updates.
-            classifier.weight.grad[:old_num_classes].zero_()
+            if current_epoch > 0 and current_epoch <= max(freeze_all_epochs, 0):
+                classifier.weight.grad.zero_()
+            else:
+                if bool(training_cfg.get("freeze_old_classifier_weights", True)) and old_num_classes > 0:
+                    # Prevent old classifier prototypes from drifting under new-task CE updates.
+                    classifier.weight.grad[:old_num_classes].zero_()
+                if current_epoch > 0 and current_epoch <= max(freeze_new_epochs, 0):
+                    classifier.weight.grad[old_num_classes:].zero_()
         bias = getattr(classifier, "bias", None)
         if bias is not None and getattr(bias, "grad", None) is not None:
-            bias.grad[:old_num_classes].zero_()
+            if current_epoch > 0 and current_epoch <= max(freeze_all_epochs, 0):
+                bias.grad.zero_()
+            else:
+                if bool(training_cfg.get("freeze_old_classifier_weights", True)) and old_num_classes > 0:
+                    bias.grad[:old_num_classes].zero_()
+                if current_epoch > 0 and current_epoch <= max(freeze_new_epochs, 0):
+                    bias.grad[old_num_classes:].zero_()
 
     def _active_retention_layers(self, context: Dict[str, Any]) -> List[int]:
         configured_layers = self.config["loss"].get("retention_layers")

@@ -162,6 +162,9 @@ def _build_test_config(output_root: str):
             "use_scheduler": True,
             "scheduler": "cosine",
             "freeze_old_classifier_weights": True,
+            "classifier_lr_scale": 1.0,
+            "freeze_new_classifier_epochs": 0,
+            "freeze_all_classifier_epochs": 0,
             "retention_debug_logging": True,
             "retention_feature_diff_logging": False,
             "retention_feature_diff_max_epochs": 3,
@@ -812,6 +815,104 @@ class PaperAlignmentUnitTests(unittest.TestCase):
 
         self.assertTrue(torch.allclose(trainer.model.classifier.weight.grad, torch.ones_like(trainer.model.classifier.weight.grad)))
 
+    def test_classifier_lr_scale_default_keeps_classifier_in_base_group(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "classifier_lr_default_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        logger = configure_logger(level=logging.WARNING)
+        trainer = NHLoRATrainer(config, logger, benchmark=benchmark)
+        trainer.model.classifier.expand(2)
+
+        optimizer = trainer._build_optimizer()
+        classifier_param_ids = {id(parameter) for parameter in trainer.model.classifier.parameters()}
+        classifier_groups = [
+            group
+            for group in optimizer.param_groups
+            if any(id(parameter) in classifier_param_ids for parameter in group["params"])
+        ]
+
+        self.assertEqual(len(classifier_groups), 1)
+        self.assertAlmostEqual(float(classifier_groups[0]["lr"]), float(config["training"]["lr"]), places=12)
+        self.assertGreater(len(classifier_groups[0]["params"]), len(classifier_param_ids))
+
+    def test_classifier_lr_scale_nondefault_uses_separate_param_group(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "classifier_lr_scaled_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        config["training"]["classifier_lr_scale"] = 0.25
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        logger = configure_logger(level=logging.WARNING)
+        trainer = NHLoRATrainer(config, logger, benchmark=benchmark)
+        trainer.model.classifier.expand(2)
+
+        optimizer = trainer._build_optimizer()
+        classifier_param_ids = {id(parameter) for parameter in trainer.model.classifier.parameters()}
+        classifier_groups = [
+            group
+            for group in optimizer.param_groups
+            if any(id(parameter) in classifier_param_ids for parameter in group["params"])
+        ]
+
+        self.assertEqual(len(classifier_groups), 1)
+        self.assertAlmostEqual(float(classifier_groups[0]["lr"]), float(config["training"]["lr"]) * 0.25, places=12)
+        self.assertTrue(all(id(parameter) in classifier_param_ids for parameter in classifier_groups[0]["params"]))
+
+    def test_freeze_all_classifier_epochs_masks_all_rows(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "classifier_freeze_all_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        config["training"]["freeze_old_classifier_weights"] = False
+        config["training"]["freeze_all_classifier_epochs"] = 2
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        logger = configure_logger(level=logging.WARNING)
+        trainer = NHLoRATrainer(config, logger, benchmark=benchmark)
+        trainer.model.classifier.expand(4)
+        trainer.model.classifier.weight.grad = torch.ones_like(trainer.model.classifier.weight)
+
+        trainer._mask_old_classifier_gradients({"old_num_classes": 2, "current_epoch": 1})
+
+        self.assertTrue(torch.allclose(trainer.model.classifier.weight.grad, torch.zeros_like(trainer.model.classifier.weight.grad)))
+
+    def test_freeze_new_classifier_epochs_masks_only_new_rows(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "classifier_freeze_new_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        config["training"]["freeze_old_classifier_weights"] = False
+        config["training"]["freeze_new_classifier_epochs"] = 2
+        config["training"]["classifier_lr_scale"] = 0.5
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        logger = configure_logger(level=logging.WARNING)
+        trainer = NHLoRATrainer(config, logger, benchmark=benchmark)
+        trainer.model.classifier.expand(4)
+        trainer.model.classifier.weight.grad = torch.ones_like(trainer.model.classifier.weight)
+
+        trainer._mask_old_classifier_gradients({"old_num_classes": 2, "current_epoch": 1})
+
+        self.assertTrue(torch.allclose(trainer.model.classifier.weight.grad[:2], torch.ones_like(trainer.model.classifier.weight.grad[:2])))
+        self.assertTrue(torch.allclose(trainer.model.classifier.weight.grad[2:], torch.zeros_like(trainer.model.classifier.weight.grad[2:])))
+
+    def test_freeze_new_classifier_epochs_expires_after_configured_epochs(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "classifier_freeze_new_expired_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        config["training"]["freeze_old_classifier_weights"] = False
+        config["training"]["freeze_new_classifier_epochs"] = 1
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        logger = configure_logger(level=logging.WARNING)
+        trainer = NHLoRATrainer(config, logger, benchmark=benchmark)
+        trainer.model.classifier.expand(4)
+        trainer.model.classifier.weight.grad = torch.ones_like(trainer.model.classifier.weight)
+
+        trainer._mask_old_classifier_gradients({"old_num_classes": 2, "current_epoch": 2})
+
+        self.assertTrue(torch.allclose(trainer.model.classifier.weight.grad, torch.ones_like(trainer.model.classifier.weight.grad)))
+
     def test_teacher_profile_is_built_from_teacher_model(self):
         repo_root = Path(__file__).resolve().parents[1]
         workspace_tmp = repo_root / "outputs" / "test_tmp" / "teacher_profile_unit"
@@ -1154,6 +1255,9 @@ class PaperAlignmentUnitTests(unittest.TestCase):
         self.assertIn("classifier_drift_debug_logging=", joined_messages)
         self.assertIn("grad_norm_debug_logging=", joined_messages)
         self.assertIn("logit_margin_debug_logging=", joined_messages)
+        self.assertIn("classifier_lr_scale=", joined_messages)
+        self.assertIn("freeze_new_classifier_epochs=", joined_messages)
+        self.assertIn("freeze_all_classifier_epochs=", joined_messages)
 
     def test_seed_config_warns_for_full_token_retention_features(self):
         repo_root = Path(__file__).resolve().parents[1]

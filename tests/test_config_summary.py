@@ -14,6 +14,9 @@ class ConfigAndSummarySmokeTest(unittest.TestCase):
         config = load_config(repo_root / "configs" / "cifar100.yaml")
         self.assertEqual(config["benchmark"]["name"], "cifar100")
         self.assertEqual(config["model"]["backbone_name"], "vit_base_patch16_224_in21k")
+        self.assertEqual(config["training"]["classifier_lr_scale"], 1.0)
+        self.assertEqual(config["training"]["freeze_new_classifier_epochs"], 0)
+        self.assertEqual(config["training"]["freeze_all_classifier_epochs"], 0)
 
         workspace_tmp = repo_root / "outputs" / "test_tmp" / "config_summary_runtime"
         workspace_tmp.mkdir(parents=True, exist_ok=True)

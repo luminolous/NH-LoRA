@@ -112,6 +112,9 @@ training:
   grad_norm_debug_max_epochs: 3
   logit_margin_debug_logging: false
   logit_margin_debug_max_epochs: 3
+  classifier_lr_scale: 1.0
+  freeze_new_classifier_epochs: 0
+  freeze_all_classifier_epochs: 0
   freeze_old_classifier_weights: true
 
 loss:

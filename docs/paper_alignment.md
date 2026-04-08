@@ -68,6 +68,10 @@ The design paper is the primary source of truth. When paper detail was ambiguous
   - [src/models/classifier.py](/C:/Users/Syauqi%20Nabil/research/self/NH-LoRA/src/models/classifier.py)
   - [src/engine/trainer.py](/C:/Users/Syauqi%20Nabil/research/self/NH-LoRA/src/engine/trainer.py)
   - `NHLoRATrainer._expand_classifier_for_task`
+- Diagnostic note: `training.classifier_lr_scale`, `training.freeze_new_classifier_epochs`,
+  and `training.freeze_all_classifier_epochs` are default-off Stage 2 ablation knobs for
+  testing head dominance. They do not add rehearsal memory or alter the paper objective
+  when left at defaults.
 
 ### CHU
 

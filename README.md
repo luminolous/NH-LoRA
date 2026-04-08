@@ -18,6 +18,7 @@ This repository is organized to serve as the implementation-facing reference for
 - Bootstrap mode for task 1
 - Summary-only history bank
 - Rehearsal-free class-incremental training loop
+- Default-off classifier ablation knobs for diagnosing head dominance
 - Multi-seed metrics and summaries
 - One lightweight final model artifact per seed-run
 
@@ -52,6 +53,11 @@ outputs/
 7. CHU consolidates slot/shared memory after the task.
 8. The task summary is appended to the history bank.
 9. Post-consolidation inference profile is rebuilt for evaluation and future tasks.
+
+Optional Stage 2 diagnostic knobs live under `training`: `classifier_lr_scale`,
+`freeze_new_classifier_epochs`, and `freeze_all_classifier_epochs`. They default to
+baseline behavior and are intended for head-dominance ablation, not as a change to
+the NH-LoRA paper objective.
 
 ## Bootstrap Task 1
 
