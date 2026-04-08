@@ -639,8 +639,19 @@ class PaperAlignmentUnitTests(unittest.TestCase):
 
         layer.last_structural_action = "reuse_shared"
         profile = model.build_inference_profile()
-        self.assertEqual(profile[1]["active_slot_candidates"], [first_slot, second_slot])
-        self.assertFalse(profile[1]["shared_only"])
+        self.assertEqual(profile[1]["active_slot_candidates"], [])
+        self.assertIsNone(profile[1]["selected_slot"])
+        self.assertTrue(profile[1]["deterministic"])
+        self.assertTrue(profile[1]["shared_only"])
+        self.assertEqual(profile[1]["rank_cfg"], {first_slot: 1, second_slot: 1})
+
+        layer.last_structural_action = "freeze_old_strong_retention"
+        profile = model.build_inference_profile()
+        self.assertEqual(profile[1]["active_slot_candidates"], [])
+        self.assertIsNone(profile[1]["selected_slot"])
+        self.assertTrue(profile[1]["deterministic"])
+        self.assertTrue(profile[1]["shared_only"])
+        self.assertTrue(profile[1]["strong_retention"])
 
     def test_retention_feature_representation_modes(self):
         repo_root = Path(__file__).resolve().parents[1]
@@ -925,7 +936,7 @@ class PaperAlignmentUnitTests(unittest.TestCase):
         layer = trainer.model.layers["1"]
         first_slot = layer.add_slot(initial_rank=1, task_id=1)
         second_slot = layer.add_slot(initial_rank=1, task_id=2)
-        layer.last_structural_action = "reuse_shared"
+        layer.last_structural_action = "expand_rank_existing_slot"
         trainer.inference_profile = {1: {"active_slot_candidates": []}}
 
         _, teacher_profile = trainer._build_teacher_payload()
@@ -1043,7 +1054,7 @@ class PaperAlignmentUnitTests(unittest.TestCase):
         self.assertEqual(config_like, before_config)
         self.assertEqual(layer.export_structure_state(), before_state)
 
-    def test_stage5_profile_summary_uses_retained_live_slots_for_shared_only(self):
+    def test_stage5_profile_summary_preserves_retained_slots_when_shared_only(self):
         repo_root = Path(__file__).resolve().parents[1]
         workspace_tmp = repo_root / "outputs" / "test_tmp" / "stage5_profile_summary_unit"
         workspace_tmp.mkdir(parents=True, exist_ok=True)
@@ -1056,6 +1067,7 @@ class PaperAlignmentUnitTests(unittest.TestCase):
         second_slot = layer.add_slot(initial_rank=1, task_id=2)
         layer.slot_metadata[first_slot].retained_for_inference = False
         layer.slot_metadata[second_slot].retained_for_inference = True
+        layer.last_structural_action = "expand_rank_existing_slot"
 
         profile = trainer.model.build_inference_profile()
         summary = trainer._slot_lifecycle_summary(1, config_like=profile[1])
@@ -1064,6 +1076,14 @@ class PaperAlignmentUnitTests(unittest.TestCase):
         self.assertEqual(summary["retained_slot_ids"], [second_slot])
         self.assertEqual(summary["candidate_slot_ids"], [second_slot])
         self.assertFalse(profile[1]["shared_only"])
+
+        layer.last_structural_action = "reuse_shared"
+        shared_only_profile = trainer.model.build_inference_profile()
+        shared_only_summary = trainer._slot_lifecycle_summary(1, config_like=shared_only_profile[1])
+
+        self.assertEqual(shared_only_summary["retained_slot_ids"], [second_slot])
+        self.assertEqual(shared_only_summary["candidate_slot_ids"], [])
+        self.assertTrue(shared_only_profile[1]["shared_only"])
 
         layer.slot_metadata[second_slot].retained_for_inference = False
         empty_profile = trainer.model.build_inference_profile()
@@ -1190,6 +1210,65 @@ class PaperAlignmentUnitTests(unittest.TestCase):
         joined_messages = "\n".join(logger.messages)
         self.assertIn("[RouteModeCompare][Task 2] input_source=unit-same-input", joined_messages)
         self.assertIn("[RouteModeCompare][Task 2][Layer 1]", joined_messages)
+
+    def test_stage5_shared_only_inference_profile_matches_applied_plan(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "stage5_shared_only_profile_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        config["training"]["routing_debug_logging"] = True
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        logger = _ListLogger()
+        trainer = NHLoRATrainer(config, logger, benchmark=benchmark)
+        trainer.model.classifier.expand(2)
+        layer = trainer.model.layers["1"]
+        slot_id = layer.add_slot(initial_rank=1, task_id=1)
+        layer.slot_metadata[slot_id].retained_for_inference = True
+        layer.last_structural_action = "reuse_shared"
+        materialized_plan = MaterializedLayerPlan(
+            requested_action="reuse_shared",
+            action="reuse_shared",
+            selected_slot=None,
+            target_rank=None,
+            rank_delta=0,
+            create_new_slot=False,
+            new_slot_rank=None,
+            candidate_slots=[],
+            shared_only=True,
+        )
+        applied_plan = {
+            "action": "reuse_shared",
+            "requested_action": "reuse_shared",
+            "active_slot_candidates": [],
+            "selected_slot": None,
+            "rank_cfg": {slot_id: 1},
+            "shared_only": True,
+            "deterministic": True,
+            "created_new_slot": False,
+            "fallback_action": None,
+        }
+        trainer.inference_profile = trainer.model.build_inference_profile()
+        trainer.model.train()
+        torch.manual_seed(1517)
+        probe_images = torch.randn(2, 3, 32, 32)
+        context = {
+            "task_number": 3,
+            "task_state": None,
+            "applied_plans": {1: applied_plan},
+            "materialized_plans": {1: materialized_plan},
+            "routing_debug_probe_images": probe_images,
+            "routing_debug_probe_source": "unit-shared-only",
+        }
+
+        trainer._log_stage5_train_eval_comparison(context)
+
+        joined_messages = "\n".join(logger.messages)
+        self.assertIn("[RouteModeCompare][Task 3] input_source=unit-shared-only", joined_messages)
+        self.assertIn("shared_only_train=True", joined_messages)
+        self.assertIn("shared_only_profile=True", joined_messages)
+        self.assertIn("mismatch_applied_empty_profile_nonempty=False", joined_messages)
+        self.assertIn("mismatch_train_eval_applied=False", joined_messages)
+        self.assertIn("mismatch_eval_profile=False", joined_messages)
 
     def test_stage4_zero_lora_block_parity_preserves_out_proj_semantics(self):
         torch.manual_seed(1404)
