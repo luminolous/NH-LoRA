@@ -87,8 +87,7 @@ Stage 10 keeps hybrid mode opt-in and stabilizes the learned shared gate with an
 anchored residual parameterization. In `training.planner_mode=hybrid`, the
 training-time control gate now starts from the policy-side `shared_gate` in the
 applied plan, converts that anchor into logit space, adds a bounded residual
-`planner_control_delta_logit_scale * tanh(delta_raw)`, and maps back through
-sigmoid. The control head is zero-initialized so hybrid training begins at the
+term, and maps back through sigmoid. The control head is zero-initialized so hybrid training begins at the
 policy anchor instead of relearning an unconstrained absolute `beta`. The default
 `training.planner_control_delta_logit_scale=2.0` is an initial validation
 hypothesis for short-window reruns, not a claimed final tuned value. Stage 10
@@ -97,12 +96,21 @@ or enable soft-rank.
 
 Stage 11 extends the same `training.planner_audit_logging` path with a
 post-bootstrap residual-control audit. These logs keep behavior unchanged while
-reporting `delta_raw` percentile and threshold summaries, tanh-derivative
+reporting `delta_raw` percentile and threshold summaries, bounded-transform derivative
 collapse, control-head weight/bias norm and drift, bias-vs-activation
 contributions to `delta_raw`, gradient flow through `delta_raw -> delta_logit ->
 effective_logit`, cap-usage summaries around `planner_control_delta_logit_scale`,
 and a per-layer residual interpretation summary that compares anchor gate,
 effective gate, residual cap state, slot availability, and shared-vs-slot ratio.
+
+Stage 12 keeps the Stage 10 anchored residual semantics but narrows the residual
+path further in hybrid mode. The control representation is RMS-normalized just
+before the residual gate head, and the bounded residual transform is now
+`planner_control_delta_logit_scale * softsign(delta_raw)` instead of `tanh`.
+This keeps the residual bounded in logit space while preserving more gradient
+signal when `delta_raw` grows. Stage 12 does not tune thresholds, add
+regularizers, redesign CHU/router/classifier behavior, change Stage 5
+inference-profile semantics, or enable soft-rank.
 
 ## Bootstrap Task 1
 

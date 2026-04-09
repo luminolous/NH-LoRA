@@ -790,7 +790,7 @@ class NHLoRATrainer:
                 "anchor_logit_values": [],
                 "delta_raw_values": [],
                 "delta_logit_values": [],
-                "delta_tanh_derivative_values": [],
+                "delta_bound_derivative_values": [],
                 "beta_gap_abs": [],
                 "logit_gap_abs": [],
                 "delta_from_representation_values": [],
@@ -820,6 +820,8 @@ class NHLoRATrainer:
                 "input_vars": [],
                 "representation_norms": [],
                 "representation_vars": [],
+                "normalized_representation_norms": [],
+                "normalized_representation_vars": [],
             },
         )
 
@@ -835,6 +837,14 @@ class NHLoRATrainer:
             gate = gate.expand_as(reference)
         return gate
 
+    @staticmethod
+    def _bounded_residual_transform(delta_raw: torch.Tensor) -> torch.Tensor:
+        return F.softsign(delta_raw)
+
+    @staticmethod
+    def _bounded_residual_derivative(delta_raw: torch.Tensor) -> torch.Tensor:
+        return 1.0 / (1.0 + delta_raw.abs()).pow(2)
+
     def _compose_hybrid_control_outputs(
         self,
         raw_outputs: PlannerControlOutputs,
@@ -844,7 +854,7 @@ class NHLoRATrainer:
         anchor_beta_tensor = self._gate_tensor_like(anchor_beta, raw_outputs.delta_raw)
         clamped_anchor_beta = anchor_beta_tensor.clamp(min=1e-4, max=1.0 - 1e-4)
         anchor_logit = torch.logit(clamped_anchor_beta)
-        delta_logit = self._planner_control_delta_logit_scale() * torch.tanh(raw_outputs.delta_raw)
+        delta_logit = self._planner_control_delta_logit_scale() * self._bounded_residual_transform(raw_outputs.delta_raw)
         effective_logit = anchor_logit + delta_logit
         effective_beta = torch.sigmoid(effective_logit)
         return PlannerControlOutputs(
@@ -862,6 +872,7 @@ class NHLoRATrainer:
             history_context=raw_outputs.history_context,
             planner_input=raw_outputs.planner_input,
             planner_representation=raw_outputs.planner_representation,
+            normalized_planner_representation=raw_outputs.normalized_planner_representation,
         )
 
     def _planner_control_head_summary(self, block_id: int) -> Dict[str, float]:
@@ -1505,8 +1516,8 @@ class NHLoRATrainer:
                     float((outputs.shared_gate_logit.detach() - outputs.anchor_logit.detach()).abs().mean().item())
                 )
             layer_stats["delta_raw_values"].append(float(outputs.delta_raw.detach().mean().item()))
-            layer_stats["delta_tanh_derivative_values"].append(
-                float((1.0 - torch.tanh(outputs.delta_raw.detach()).pow(2)).mean().item())
+            layer_stats["delta_bound_derivative_values"].append(
+                float(self._bounded_residual_derivative(outputs.delta_raw.detach()).mean().item())
             )
             if outputs.delta_logit is not None:
                 layer_stats["delta_logit_values"].append(float(outputs.delta_logit.detach().mean().item()))
@@ -1546,6 +1557,18 @@ class NHLoRATrainer:
                     float(planner_representation.var(unbiased=False).item()) if planner_representation.numel() > 1 else 0.0
                 )
                 representation_vectors[int(block_id)] = planner_representation
+            if outputs.normalized_planner_representation is not None:
+                normalized_planner_representation = (
+                    outputs.normalized_planner_representation.detach().float().reshape(-1).cpu()
+                )
+                layer_stats["normalized_representation_norms"].append(
+                    float(normalized_planner_representation.norm().item())
+                )
+                layer_stats["normalized_representation_vars"].append(
+                    float(normalized_planner_representation.var(unbiased=False).item())
+                    if normalized_planner_representation.numel() > 1
+                    else 0.0
+                )
         if self._planner_control_saturation_audit_enabled():
             input_pairwise = self._pairwise_cosine_summary(input_vectors)
             representation_pairwise = self._pairwise_cosine_summary(representation_vectors)
@@ -1705,7 +1728,7 @@ class NHLoRATrainer:
             anchor_logit_summary = self._scalar_series_summary(layer_stats.get("anchor_logit_values", []))
             delta_raw_summary = self._scalar_series_summary(layer_stats.get("delta_raw_values", []))
             delta_logit_summary = self._scalar_series_summary(layer_stats.get("delta_logit_values", []))
-            delta_tanh_derivative_summary = self._scalar_series_summary(layer_stats.get("delta_tanh_derivative_values", []))
+            delta_bound_derivative_summary = self._scalar_series_summary(layer_stats.get("delta_bound_derivative_values", []))
             beta_gap_summary = self._scalar_series_summary(layer_stats.get("beta_gap_abs", []))
             logit_gap_summary = self._scalar_series_summary(layer_stats.get("logit_gap_abs", []))
             beta_grad_summary = self._scalar_series_summary(layer_stats.get("beta_grad_abs", []))
@@ -1780,7 +1803,7 @@ class NHLoRATrainer:
                 float(logit_gap_summary["mean"]),
             )
             self.logger.info(
-                "[PlannerResidualRaw][Task %d][Epoch %d][Layer %d] delta_raw_mean=%.4e delta_raw_min=%.4e delta_raw_max=%.4e delta_raw_p50=%.4e delta_raw_p90=%.4e delta_raw_p99=%.4e frac_abs_gt_2=%.4f frac_abs_gt_4=%.4f frac_abs_gt_6=%.4f tanh_derivative_mean=%.4e tanh_derivative_min=%.4e tanh_derivative_max=%.4e epoch_delta_raw_drift=%.4e task_delta_raw_drift=%.4e task_start_delta_raw=%.4e task_start_delta_logit=%.4e",
+                "[PlannerResidualRaw][Task %d][Epoch %d][Layer %d] delta_raw_mean=%.4e delta_raw_min=%.4e delta_raw_max=%.4e delta_raw_p50=%.4e delta_raw_p90=%.4e delta_raw_p99=%.4e frac_abs_gt_2=%.4f frac_abs_gt_4=%.4f frac_abs_gt_6=%.4f bound_derivative_mean=%.4e bound_derivative_min=%.4e bound_derivative_max=%.4e epoch_delta_raw_drift=%.4e task_delta_raw_drift=%.4e task_start_delta_raw=%.4e task_start_delta_logit=%.4e",
                 context["task_number"],
                 int(context["current_epoch"]),
                 int(block_id),
@@ -1793,9 +1816,9 @@ class NHLoRATrainer:
                 self._fraction_abs_above(layer_stats.get("delta_raw_values", []), 2.0),
                 self._fraction_abs_above(layer_stats.get("delta_raw_values", []), 4.0),
                 self._fraction_abs_above(layer_stats.get("delta_raw_values", []), 6.0),
-                float(delta_tanh_derivative_summary["mean"]),
-                float(delta_tanh_derivative_summary["min"]),
-                float(delta_tanh_derivative_summary["max"]),
+                float(delta_bound_derivative_summary["mean"]),
+                float(delta_bound_derivative_summary["min"]),
+                float(delta_bound_derivative_summary["max"]),
                 float(delta_raw_summary["last"]) - float(delta_raw_summary["first"]),
                 float(delta_raw_summary["mean"]) - task_start_delta_raw,
                 task_start_delta_raw,
@@ -1882,6 +1905,12 @@ class NHLoRATrainer:
             input_var_summary = self._scalar_series_summary(layer_stats.get("input_vars", []))
             representation_norm_summary = self._scalar_series_summary(layer_stats.get("representation_norms", []))
             representation_var_summary = self._scalar_series_summary(layer_stats.get("representation_vars", []))
+            normalized_representation_norm_summary = self._scalar_series_summary(
+                layer_stats.get("normalized_representation_norms", [])
+            )
+            normalized_representation_var_summary = self._scalar_series_summary(
+                layer_stats.get("normalized_representation_vars", [])
+            )
             policy_layer_input = None if not task_start_stats else task_start_stats.get("planner_input")
             latest_input_similarity_to_task_start = 0.0
             if policy_layer_input is not None and layer_stats.get("input_norms"):
@@ -1898,7 +1927,7 @@ class NHLoRATrainer:
                             torch.dot(current_input / current_norm, reference_input / reference_norm).item()
                         )
             self.logger.info(
-                "[PlannerControlInputs][Task %d][Epoch %d][Layer %d] input_norm_mean=%.4e input_var_mean=%.4e representation_norm_mean=%.4e representation_var_mean=%.4e input_similarity_to_task_start=%.4f",
+                "[PlannerControlInputs][Task %d][Epoch %d][Layer %d] input_norm_mean=%.4e input_var_mean=%.4e representation_norm_mean=%.4e representation_var_mean=%.4e normalized_representation_norm_mean=%.4e normalized_representation_var_mean=%.4e input_similarity_to_task_start=%.4f",
                 context["task_number"],
                 int(context["current_epoch"]),
                 int(block_id),
@@ -1906,6 +1935,8 @@ class NHLoRATrainer:
                 float(input_var_summary["mean"]),
                 float(representation_norm_summary["mean"]),
                 float(representation_var_summary["mean"]),
+                float(normalized_representation_norm_summary["mean"]),
+                float(normalized_representation_var_summary["mean"]),
                 latest_input_similarity_to_task_start,
             )
             self.logger.info(

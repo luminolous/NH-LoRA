@@ -107,7 +107,7 @@ The design paper is the primary source of truth. When paper detail was ambiguous
   the applied structural plan:
   - `anchor_beta = applied_plan["shared_gate"]`
   - `anchor_logit = logit(clamp(anchor_beta, 1e-4, 1 - 1e-4))`
-  - `delta_logit = planner_control_delta_logit_scale * tanh(delta_raw)`
+  - `delta_logit = planner_control_delta_logit_scale * bounded_transform(delta_raw)`
   - `effective_logit = anchor_logit + delta_logit`
   - `effective_beta = sigmoid(effective_logit)`
   The control output head is zero-initialized so hybrid training begins at the
@@ -117,7 +117,7 @@ The design paper is the primary source of truth. When paper detail was ambiguous
   hypothesis and is not yet claimed as a final tuned value.
 - Residual-control audit note: Stage 11 keeps the same `training.planner_audit_logging`
   flag and adds diagnostics for post-bootstrap residual saturation in hybrid mode.
-  These logs report `delta_raw` percentiles and threshold fractions, tanh-derivative
+  These logs report `delta_raw` percentiles and threshold fractions, bounded-transform derivative
   collapse, control-head weight/bias norm and drift from init, bias-vs-activation
   contributions to `delta_raw`, gradient-chain traces across `delta_raw`,
   `delta_logit`, and effective logit, cap-usage summaries relative to
@@ -125,6 +125,17 @@ The design paper is the primary source of truth. When paper detail was ambiguous
   summaries. These additions are observational only and do not retune thresholds,
   change bootstrap structural planning, redesign CHU/router/classifier behavior,
   or enable soft-rank.
+- Residual representation-scale stabilization note: Stage 12 keeps the same
+  hybrid anchor semantics but changes the residual path in two narrow ways:
+  - the control representation is RMS-normalized immediately before the residual
+    gate head,
+  - the bounded residual transform is `softsign` instead of `tanh`:
+    - `delta_logit = planner_control_delta_logit_scale * softsign(delta_raw)`
+  This targets the Stage 11 finding that `delta_raw` was dominated by the
+  representation term and then lost gradient at the bounded transform. Stage 12
+  remains hybrid-only, keeps `planner_control_delta_logit_scale=2.0` unchanged
+  for isolation, and does not retune thresholds, redesign CHU/router/classifier
+  behavior, alter Stage 5 inference-profile semantics, or enable soft-rank.
 
 ### CHU
 

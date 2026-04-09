@@ -38,6 +38,7 @@ class PlannerControlOutputs:
     history_context: torch.Tensor | None = None
     planner_input: torch.Tensor | None = None
     planner_representation: torch.Tensor | None = None
+    normalized_planner_representation: torch.Tensor | None = None
 
 
 @dataclass
@@ -380,6 +381,11 @@ class PlannerControlBranch(_PlannerBranchBase):
                 if output_head.bias is not None:
                     output_head.bias.zero_()
 
+    @staticmethod
+    def _normalize_control_representation(planner_representation: torch.Tensor) -> torch.Tensor:
+        rms = torch.sqrt(planner_representation.pow(2).mean(dim=-1, keepdim=True))
+        return planner_representation / torch.clamp(rms, min=1e-6)
+
     def forward_control(
         self,
         block_id: int,
@@ -391,8 +397,10 @@ class PlannerControlBranch(_PlannerBranchBase):
             task_embedding,
             history_summary,
         )
+        del outputs
         output_head = self.output_heads[str(block_id)]
-        delta_from_representation = F.linear(planner_representation, output_head.weight, bias=None)
+        normalized_planner_representation = self._normalize_control_representation(planner_representation)
+        delta_from_representation = F.linear(normalized_planner_representation, output_head.weight, bias=None)
         if output_head.bias is None:
             delta_bias = torch.zeros_like(delta_from_representation)
             bias_norm = 0.0
@@ -412,6 +420,7 @@ class PlannerControlBranch(_PlannerBranchBase):
             history_context=history_context,
             planner_input=planner_input,
             planner_representation=planner_representation,
+            normalized_planner_representation=normalized_planner_representation,
         )
 
 

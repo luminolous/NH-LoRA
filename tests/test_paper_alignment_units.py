@@ -382,6 +382,69 @@ class PaperAlignmentUnitTests(unittest.TestCase):
             float(positive.delta_logit.abs().max().item()),
             float(config["training"]["planner_control_delta_logit_scale"]) + 1e-6,
         )
+        expected_positive_delta = float(
+            config["training"]["planner_control_delta_logit_scale"]
+            * F.softsign(torch.tensor([[1.0]], dtype=torch.float32)).item()
+        )
+        self.assertAlmostEqual(float(positive.delta_logit.item()), expected_positive_delta, places=6)
+
+    def test_planner_control_representation_normalization_is_rms_stable(self):
+        planner = HorizonPlanner(
+            selected_blocks=[0],
+            task_embedding_dim=4,
+            history_dim=6,
+            hidden_dim=8,
+            layer_embedding_dim=3,
+            rank_min=1,
+            rank_max=4,
+            tau_novelty=0.5,
+            tau_conflict=0.5,
+        )
+        representation = torch.tensor([[1.0, -2.0, 3.0, -4.0, 5.0, -6.0, 7.0, -8.0]], dtype=torch.float32)
+        scaled_representation = representation * 11.0
+        normalized = planner.control_branch._normalize_control_representation(representation)
+        normalized_scaled = planner.control_branch._normalize_control_representation(scaled_representation)
+        rms = torch.sqrt(normalized.pow(2).mean(dim=-1))
+        self.assertTrue(torch.allclose(normalized, normalized_scaled, atol=1e-6))
+        self.assertTrue(torch.allclose(rms, torch.ones_like(rms), atol=1e-6))
+
+        output_head = planner.control_branch.output_heads["0"]
+        with torch.no_grad():
+            output_head.weight.fill_(1.0)
+            if output_head.bias is not None:
+                output_head.bias.zero_()
+        delta_from_representation = F.linear(normalized, output_head.weight, bias=None)
+        delta_from_scaled_representation = F.linear(normalized_scaled, output_head.weight, bias=None)
+        self.assertTrue(torch.allclose(delta_from_representation, delta_from_scaled_representation, atol=1e-6))
+
+    def test_softsign_bounded_residual_keeps_gradient_on_large_delta_raw(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "hybrid_softsign_gradient_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        config["training"]["planner_mode"] = "hybrid"
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        trainer = NHLoRATrainer(config, configure_logger(level=logging.WARNING), benchmark=benchmark)
+
+        delta_raw = torch.tensor([[10.0]], dtype=torch.float32, requires_grad=True)
+        outputs = trainer._compose_hybrid_control_outputs(
+            PlannerControlOutputs(
+                shared_gate=torch.sigmoid(delta_raw.detach()),
+                shared_gate_logit=delta_raw.detach(),
+                delta_raw=delta_raw,
+            ),
+            anchor_beta=0.5,
+        )
+        loss = outputs.shared_gate.sum()
+        loss.backward()
+
+        self.assertIsNotNone(delta_raw.grad)
+        self.assertGreater(abs(float(delta_raw.grad.item())), 0.0)
+        self.assertAlmostEqual(
+            float(outputs.delta_logit.item()),
+            float(config["training"]["planner_control_delta_logit_scale"] * F.softsign(torch.tensor([[10.0]])).item()),
+            places=6,
+        )
 
     def test_materialize_action_is_pure_and_reuse_shared_is_shared_only(self):
         layer = NHLoRALayer(
@@ -1974,10 +2037,10 @@ class PaperAlignmentUnitTests(unittest.TestCase):
         self.assertGreater(block_stats["slot_nontrivial_calls"], 0)
         self.assertGreater(block_stats["beta_gt_099_with_structural_slot_calls"], 0)
 
-    def test_hybrid_planner_control_epoch_logs_stage9_saturation_signals(self):
+    def test_hybrid_planner_control_epoch_logs_stage12_residual_stability_signals(self):
         seed_everything(17, deterministic=True)
         repo_root = Path(__file__).resolve().parents[1]
-        workspace_tmp = repo_root / "outputs" / "test_tmp" / "hybrid_control_stage9_logging_unit"
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "hybrid_control_stage12_logging_unit"
         workspace_tmp.mkdir(parents=True, exist_ok=True)
         config = _build_test_config(str(workspace_tmp))
         config["training"]["planner_mode"] = "hybrid"
@@ -2016,6 +2079,7 @@ class PaperAlignmentUnitTests(unittest.TestCase):
         self.assertIn("beta_anchor_gap_mean_abs=", joined_messages)
         self.assertIn("[PlannerResidualRaw][Task 2][Epoch 1][Layer 1]", joined_messages)
         self.assertIn("frac_abs_gt_6=", joined_messages)
+        self.assertIn("bound_derivative_mean=", joined_messages)
         self.assertIn("[PlannerControlLogits][Task 2][Epoch 1][Layer 1]", joined_messages)
         self.assertIn("frac_gt_logit099=", joined_messages)
         self.assertIn("[PlannerControlValues][Task 2][Epoch 1][Layer 1]", joined_messages)
@@ -2031,6 +2095,7 @@ class PaperAlignmentUnitTests(unittest.TestCase):
         self.assertIn("[PlannerResidualSummary][Task 2][Epoch 1][Layer 1]", joined_messages)
         self.assertIn("[PlannerContribution][Task 2][Epoch 1][Layer 1]", joined_messages)
         self.assertIn("[PlannerControlInputs][Task 2][Epoch 1][Layer 1]", joined_messages)
+        self.assertIn("normalized_representation_norm_mean=", joined_messages)
         self.assertIn("[PlannerControlInputCompare][Task 2][Epoch 1]", joined_messages)
 
     def test_hybrid_mode_rejects_soft_rank_training_for_stage8a(self):
