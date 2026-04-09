@@ -1486,7 +1486,7 @@ class PaperAlignmentUnitTests(unittest.TestCase):
             "applied_plans": {1: {"shared_gate": 1.0}},
             "grad_norm_debug_accumulator": {
                 group: {"sum": 0.0, "max": 0.0, "batches": 0}
-                for group in ("shared", "slot", "router", "planner", "classifier")
+                for group in ("shared", "slot", "router", "planner_policy", "planner_control", "planner", "classifier")
             },
         }
         disabled_config = _build_test_config(str(workspace_tmp))
@@ -1528,6 +1528,8 @@ class PaperAlignmentUnitTests(unittest.TestCase):
         trainer.model.classifier.weight.grad = torch.ones_like(trainer.model.classifier.weight) * 0.04
         planner_param = next(trainer.planner.parameters())
         planner_param.grad = torch.ones_like(planner_param) * 0.05
+        control_param = next(trainer.planner.control_parameters())
+        control_param.grad = torch.ones_like(control_param) * 0.06
         trainer._accumulate_grad_norm_debug(context)
         trainer._log_grad_norm_debug(context)
 
@@ -1548,6 +1550,8 @@ class PaperAlignmentUnitTests(unittest.TestCase):
         self.assertIn("[GradNorm][Task 2][Epoch 1][shared]", joined_messages)
         self.assertIn("[GradNorm][Task 2][Epoch 1][slot]", joined_messages)
         self.assertIn("[GradNorm][Task 2][Epoch 1][router]", joined_messages)
+        self.assertIn("[GradNorm][Task 2][Epoch 1][planner_policy]", joined_messages)
+        self.assertIn("[GradNorm][Task 2][Epoch 1][planner_control]", joined_messages)
         self.assertIn("[GradNorm][Task 2][Epoch 1][planner]", joined_messages)
         self.assertIn("[GradNorm][Task 2][Epoch 1][classifier]", joined_messages)
         self.assertIn("[AdapterDelta][Task 2][Epoch 1][Layer 1][q_proj][shared]", joined_messages)
@@ -1855,6 +1859,106 @@ class PaperAlignmentUnitTests(unittest.TestCase):
         drift = trainer._parameter_distance_summary(after_snapshot, before_snapshot)
         self.assertIsNotNone(drift)
         self.assertGreater(float(drift["l2"]), 0.0)
+
+    def test_planner_control_scalar_summary_reports_percentiles_and_threshold_fractions(self):
+        values = [0.1, 0.5, 1.0, 4.7, 7.2]
+        summary = NHLoRATrainer._scalar_series_summary(values)
+
+        self.assertEqual(int(summary["count"]), len(values))
+        self.assertAlmostEqual(float(summary["min"]), min(values), places=6)
+        self.assertAlmostEqual(float(summary["max"]), max(values), places=6)
+        self.assertGreaterEqual(float(summary["p99"]), float(summary["p90"]))
+        self.assertAlmostEqual(NHLoRATrainer._fraction_above(values, 2.0), 2 / 5, places=6)
+        self.assertAlmostEqual(NHLoRATrainer._fraction_above(values, 4.59511985013459), 2 / 5, places=6)
+        self.assertAlmostEqual(NHLoRATrainer._fraction_below(values, 0.2), 1 / 5, places=6)
+
+    def test_planner_control_contribution_debug_records_shared_and_slot_activity(self):
+        layer = NHLoRALayer(
+            embed_dim=8,
+            selected_points=["q_proj"],
+            shared_rank=2,
+            slot_r_max=4,
+            slot_init_rank=1,
+            bootstrap_slot_rank=1,
+            max_slots=2,
+            router_topk=1,
+            router_temperature=1.0,
+            task_embedding_dim=8,
+        )
+        slot_id = layer.add_slot(initial_rank=1, task_id=1)
+        with torch.no_grad():
+            layer.point_banks["q_proj"].shared_b.fill_(0.05)
+            layer.point_banks["q_proj"].slot_b[slot_id].fill_(0.03)
+        hidden_states = torch.randn(2, 4, 8)
+        contribution_accumulator = {}
+        planner_cfg = {
+            "shared_gate": torch.tensor([[0.995]], dtype=hidden_states.dtype),
+            "rank_cfg": {slot_id: 1},
+            "_debug_block_id": 3,
+            "_planner_control_contribution_accumulator": contribution_accumulator,
+        }
+
+        _ = layer._shared_delta("q_proj", hidden_states, planner_cfg)
+        _ = layer._slot_delta(
+            "q_proj",
+            hidden_states,
+            route_state={"candidate_slots": [slot_id]},
+            planner_cfg=planner_cfg,
+        )
+
+        block_stats = contribution_accumulator[3]
+        self.assertGreater(block_stats["shared_pre_beta_norm_count"], 0)
+        self.assertGreater(block_stats["shared_post_beta_norm_count"], 0)
+        self.assertGreater(block_stats["slot_norm_count"], 0)
+        self.assertGreater(block_stats["slot_structurally_available_calls"], 0)
+        self.assertGreater(block_stats["slot_nontrivial_calls"], 0)
+        self.assertGreater(block_stats["beta_gt_099_with_structural_slot_calls"], 0)
+
+    def test_hybrid_planner_control_epoch_logs_stage9_saturation_signals(self):
+        seed_everything(17, deterministic=True)
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "hybrid_control_stage9_logging_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        config["training"]["planner_mode"] = "hybrid"
+        config["training"]["planner_audit_logging"] = True
+        benchmark = _build_tiny_benchmark(num_tasks=2)
+        logger = _ListLogger()
+        trainer = NHLoRATrainer(config, logger, benchmark=benchmark)
+        context = trainer._prepare_task_context(benchmark.tasks[1])
+        context["current_epoch"] = 1
+        context["planner_control_epoch_accumulator"] = trainer._new_planner_control_epoch_accumulator()
+        context["planner_control_contribution_epoch_accumulator"] = {}
+        layer = trainer.model.layers["1"]
+        with torch.no_grad():
+            for point_name in ("q_proj", "v_proj"):
+                layer.point_banks[point_name].shared_b.fill_(0.05)
+        train_dataset, _ = benchmark.build_task_datasets(1)
+        loader = trainer._build_train_loader(train_dataset)
+        batch = next(iter(loader))
+        images, labels = trainer._prepare_images_labels(batch)
+        optimizer = context["optimizer"]
+
+        optimizer.zero_grad(set_to_none=True)
+        planner_out = trainer._plans_for_training_forward(context)
+        outputs = trainer.model.forward_with_state(images, context["task_state"], planner_out)
+        loss = F.cross_entropy(outputs["logits"], labels)
+        loss.backward()
+
+        trainer._accumulate_planner_control_pre_step(context)
+        trainer._record_planner_control_optimizer_step(context)
+        trainer._log_planner_control_epoch(context)
+
+        joined_messages = "\n".join(logger.messages)
+        self.assertIn("[PlannerControlLogits][Task 2][Epoch 1][Layer 1]", joined_messages)
+        self.assertIn("frac_gt_logit099=", joined_messages)
+        self.assertIn("[PlannerControlValues][Task 2][Epoch 1][Layer 1]", joined_messages)
+        self.assertIn("frac_gt_099=", joined_messages)
+        self.assertIn("[PlannerControlGradients][Task 2][Epoch 1][Layer 1]", joined_messages)
+        self.assertIn("logit_grad_effectively_zero_fraction=", joined_messages)
+        self.assertIn("[PlannerContribution][Task 2][Epoch 1][Layer 1]", joined_messages)
+        self.assertIn("[PlannerControlInputs][Task 2][Epoch 1][Layer 1]", joined_messages)
+        self.assertIn("[PlannerControlInputCompare][Task 2][Epoch 1]", joined_messages)
 
     def test_hybrid_mode_rejects_soft_rank_training_for_stage8a(self):
         repo_root = Path(__file__).resolve().parents[1]

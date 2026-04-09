@@ -92,6 +92,14 @@ The design paper is the primary source of truth. When paper detail was ambiguous
   actions, CHU, routing semantics, and inference-profile hard action semantics
   remain unchanged in this pass, and soft-rank training is intentionally
   deferred.
+- Planner-control saturation audit note: the same `training.planner_audit_logging`
+  flag now also exposes Stage 9 diagnostics for early-onset shared-gate
+  saturation in hybrid mode. These logs report pre-sigmoid beta-logit
+  distributions, post-sigmoid saturation fractions, branch-specific
+  `planner_policy` vs `planner_control` gradient traces, shared-vs-slot
+  contribution balance, and control-input similarity summaries. These diagnostics
+  are observational only and do not tune thresholds, clip beta, add
+  regularizers, or change CHU/routing/classifier semantics.
 
 ### CHU
 

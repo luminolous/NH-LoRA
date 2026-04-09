@@ -76,6 +76,13 @@ forward passes so task loss can update the control path honestly. Stage 8 Checkp
 does not change planner thresholds, CHU, or discrete structural actions, and it defers
 soft-rank training.
 
+Stage 9 extends `training.planner_audit_logging` with diagnostics for early-onset
+shared-gate saturation in hybrid mode. These logs add pre-sigmoid beta-logit
+summaries, post-sigmoid saturation fractions, branch-specific planner-policy vs
+planner-control gradient reporting, shared-vs-slot contribution summaries, and
+control-input similarity summaries. They are observational only and do not change
+planner, router, CHU, classifier, or loss behavior.
+
 ## Bootstrap Task 1
 
 Task 1 is intentionally special:

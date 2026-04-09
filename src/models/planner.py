@@ -25,6 +25,7 @@ class PlannerSignals:
 @dataclass
 class PlannerControlOutputs:
     shared_gate: torch.Tensor
+    shared_gate_logit: torch.Tensor
     history_attention: torch.Tensor | None = None
     history_context: torch.Tensor | None = None
     planner_input: torch.Tensor | None = None
@@ -374,8 +375,10 @@ class PlannerControlBranch(_PlannerBranchBase):
             task_embedding,
             history_summary,
         )
+        shared_gate_logit = outputs[:, 0:1]
         return PlannerControlOutputs(
-            shared_gate=torch.sigmoid(outputs[:, 0:1]),
+            shared_gate=torch.sigmoid(shared_gate_logit),
+            shared_gate_logit=shared_gate_logit,
             history_attention=history_attention,
             history_context=history_context,
             planner_input=planner_input,

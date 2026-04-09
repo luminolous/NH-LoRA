@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import time
 from copy import deepcopy
 from pathlib import Path
@@ -570,11 +571,80 @@ class NHLoRATrainer:
     def _planner_audit_enabled(self) -> bool:
         return bool(self.config["training"].get("planner_audit_logging", False))
 
+    def _planner_control_saturation_audit_enabled(self) -> bool:
+        return self._planner_audit_enabled() and self._hybrid_planner_enabled()
+
     @staticmethod
     def _snapshot_named_parameters(module: nn.Module) -> Dict[str, torch.Tensor]:
         return {
             name: parameter.detach().cpu().clone()
             for name, parameter in module.named_parameters()
+        }
+
+    @staticmethod
+    def _scalar_series_summary(values: List[float]) -> Dict[str, float]:
+        if not values:
+            return {
+                "mean": 0.0,
+                "min": 0.0,
+                "max": 0.0,
+                "p50": 0.0,
+                "p90": 0.0,
+                "p99": 0.0,
+                "first": 0.0,
+                "last": 0.0,
+                "count": 0.0,
+            }
+        samples = torch.tensor(values, dtype=torch.float32)
+        quantiles = torch.quantile(samples, torch.tensor([0.5, 0.9, 0.99], dtype=samples.dtype))
+        return {
+            "mean": float(samples.mean().item()),
+            "min": float(samples.min().item()),
+            "max": float(samples.max().item()),
+            "p50": float(quantiles[0].item()),
+            "p90": float(quantiles[1].item()),
+            "p99": float(quantiles[2].item()),
+            "first": float(samples[0].item()),
+            "last": float(samples[-1].item()),
+            "count": float(samples.numel()),
+        }
+
+    @staticmethod
+    def _fraction_above(values: List[float], threshold: float) -> float:
+        if not values:
+            return 0.0
+        return float(sum(1 for value in values if float(value) > threshold) / len(values))
+
+    @staticmethod
+    def _fraction_below(values: List[float], threshold: float) -> float:
+        if not values:
+            return 0.0
+        return float(sum(1 for value in values if float(value) < threshold) / len(values))
+
+    @staticmethod
+    def _pairwise_cosine_summary(vectors: Dict[int, torch.Tensor]) -> Dict[str, float]:
+        if len(vectors) <= 1:
+            return {"count": 0.0, "mean": 0.0, "min": 0.0, "max": 0.0}
+        normalized_vectors = []
+        for _, vector in sorted(vectors.items()):
+            flat = vector.detach().float().reshape(-1)
+            denom = float(flat.norm().item())
+            if denom <= 1e-12:
+                normalized_vectors.append(flat.new_zeros(flat.shape))
+            else:
+                normalized_vectors.append(flat / flat.norm())
+        pairwise = []
+        for left_index in range(len(normalized_vectors)):
+            for right_index in range(left_index + 1, len(normalized_vectors)):
+                pairwise.append(float((normalized_vectors[left_index] * normalized_vectors[right_index]).sum().item()))
+        if not pairwise:
+            return {"count": 0.0, "mean": 0.0, "min": 0.0, "max": 0.0}
+        pairwise_tensor = torch.tensor(pairwise, dtype=torch.float32)
+        return {
+            "count": float(pairwise_tensor.numel()),
+            "mean": float(pairwise_tensor.mean().item()),
+            "min": float(pairwise_tensor.min().item()),
+            "max": float(pairwise_tensor.max().item()),
         }
 
     @staticmethod
@@ -624,6 +694,94 @@ class NHLoRATrainer:
             "entropy": entropy,
             "max_weight": float(normalized.max().item()),
         }
+
+    @staticmethod
+    def _planner_vector_collection_summary(vectors: Dict[int, torch.Tensor]) -> Dict[str, float]:
+        if not vectors:
+            return {
+                "count": 0.0,
+                "norm_mean": 0.0,
+                "var_mean": 0.0,
+                "pairwise_cosine_mean": 0.0,
+                "pairwise_cosine_min": 0.0,
+                "pairwise_cosine_max": 0.0,
+            }
+        norms = []
+        variances = []
+        flattened = {}
+        for block_id, vector in vectors.items():
+            flat = vector.detach().float().reshape(-1)
+            flattened[int(block_id)] = flat
+            norms.append(float(flat.norm().item()))
+            variances.append(float(flat.var(unbiased=False).item()) if flat.numel() > 1 else 0.0)
+        pairwise = NHLoRATrainer._pairwise_cosine_summary(flattened)
+        return {
+            "count": float(len(flattened)),
+            "norm_mean": sum(norms) / max(len(norms), 1),
+            "var_mean": sum(variances) / max(len(variances), 1),
+            "pairwise_cosine_mean": float(pairwise["mean"]),
+            "pairwise_cosine_min": float(pairwise["min"]),
+            "pairwise_cosine_max": float(pairwise["max"]),
+        }
+
+    @staticmethod
+    def _new_planner_control_epoch_accumulator() -> Dict[str, object]:
+        return {
+            "batches": 0,
+            "grad_l2_sum": 0.0,
+            "grad_l2_max": 0.0,
+            "grad_present_batches": 0,
+            "grad_nonzero_batches": 0,
+            "optimizer_steps": 0,
+            "layers": {},
+            "input_pairwise_cosine": [],
+            "representation_pairwise_cosine": [],
+        }
+
+    @staticmethod
+    def _planner_control_layer_accumulator(
+        accumulator: Dict[str, object],
+        block_id: int,
+    ) -> Dict[str, object]:
+        layers = accumulator.setdefault("layers", {})
+        return layers.setdefault(
+            int(block_id),
+            {
+                "beta_values": [],
+                "beta_logits": [],
+                "beta_grad_abs": [],
+                "logit_grad_abs": [],
+                "beta_grad_present_batches": 0,
+                "beta_grad_nonzero_batches": 0,
+                "logit_grad_present_batches": 0,
+                "logit_grad_nonzero_batches": 0,
+                "input_norms": [],
+                "input_vars": [],
+                "representation_norms": [],
+                "representation_vars": [],
+            },
+        )
+
+    def _capture_planner_control_task_start(self, task_embedding: torch.Tensor, history_summary: torch.Tensor | None) -> Dict[int, Dict[str, object]]:
+        if not self._hybrid_planner_enabled():
+            return {}
+        snapshot: Dict[int, Dict[str, object]] = {}
+        with torch.no_grad():
+            for block_id in self.model.selected_blocks:
+                outputs = self.planner.forward_control(
+                    int(block_id),
+                    task_embedding=task_embedding,
+                    history_summary=history_summary,
+                )
+                snapshot[int(block_id)] = {
+                    "beta": float(outputs.shared_gate.detach().mean().item()),
+                    "logit": float(outputs.shared_gate_logit.detach().mean().item()),
+                    "planner_input": outputs.planner_input.detach().float().cpu() if outputs.planner_input is not None else None,
+                    "planner_representation": outputs.planner_representation.detach().float().cpu()
+                    if outputs.planner_representation is not None
+                    else None,
+                }
+        return snapshot
 
     @staticmethod
     def _planner_decision_label(
@@ -1038,6 +1196,39 @@ class NHLoRATrainer:
                 [round(float(entry["novelty_margin"]), 4) for entry in history],
                 [round(float(entry["conflict_margin"]), 4) for entry in history],
             )
+        policy_inputs = {
+            int(block_id): signals.planner_input.detach().float().cpu()
+            for block_id, signals in raw_planner.items()
+            if signals.planner_input is not None
+        }
+        policy_representations = {
+            int(block_id): signals.planner_representation.detach().float().cpu()
+            for block_id, signals in raw_planner.items()
+            if signals.planner_representation is not None
+        }
+        policy_input_summary = self._planner_vector_collection_summary(policy_inputs)
+        policy_representation_summary = self._planner_vector_collection_summary(policy_representations)
+        context["planner_policy_input_summary"] = {
+            "inputs": policy_input_summary,
+            "representations": policy_representation_summary,
+        }
+        task_context_stats = context.get("planner_control_task_context_stats", {"norm": 0.0, "var": 0.0})
+        self.logger.info(
+            "[PlannerPolicyInputs][Task %d] task_context_norm=%.4e task_context_var=%.4e input_norm_mean=%.4e input_var_mean=%.4e input_pairwise_cosine_mean=%.4f input_pairwise_cosine_min=%.4f input_pairwise_cosine_max=%.4f representation_norm_mean=%.4e representation_var_mean=%.4e representation_pairwise_cosine_mean=%.4f representation_pairwise_cosine_min=%.4f representation_pairwise_cosine_max=%.4f",
+            context["task_number"],
+            float(task_context_stats.get("norm", 0.0)),
+            float(task_context_stats.get("var", 0.0)),
+            float(policy_input_summary["norm_mean"]),
+            float(policy_input_summary["var_mean"]),
+            float(policy_input_summary["pairwise_cosine_mean"]),
+            float(policy_input_summary["pairwise_cosine_min"]),
+            float(policy_input_summary["pairwise_cosine_max"]),
+            float(policy_representation_summary["norm_mean"]),
+            float(policy_representation_summary["var_mean"]),
+            float(policy_representation_summary["pairwise_cosine_mean"]),
+            float(policy_representation_summary["pairwise_cosine_min"]),
+            float(policy_representation_summary["pairwise_cosine_max"]),
+        )
         self._log_planner_layer_focus(context)
 
     def _log_hybrid_planner_prepare(self, context: Dict[str, Any]) -> None:
@@ -1151,20 +1342,47 @@ class NHLoRATrainer:
         )
         accumulator["optimizer_steps"] += 1
 
+    def _record_planner_control_forward_stats(
+        self,
+        context: Dict[str, Any],
+        control_outputs_by_block: Dict[int, PlannerControlOutputs],
+    ) -> None:
+        accumulator = context.setdefault(
+            "planner_control_epoch_accumulator",
+            self._new_planner_control_epoch_accumulator(),
+        )
+        input_vectors: Dict[int, torch.Tensor] = {}
+        representation_vectors: Dict[int, torch.Tensor] = {}
+        for block_id, outputs in control_outputs_by_block.items():
+            layer_stats = self._planner_control_layer_accumulator(accumulator, int(block_id))
+            layer_stats["beta_values"].append(float(outputs.shared_gate.detach().mean().item()))
+            layer_stats["beta_logits"].append(float(outputs.shared_gate_logit.detach().mean().item()))
+            if outputs.planner_input is not None:
+                planner_input = outputs.planner_input.detach().float().reshape(-1).cpu()
+                layer_stats["input_norms"].append(float(planner_input.norm().item()))
+                layer_stats["input_vars"].append(
+                    float(planner_input.var(unbiased=False).item()) if planner_input.numel() > 1 else 0.0
+                )
+                input_vectors[int(block_id)] = planner_input
+            if outputs.planner_representation is not None:
+                planner_representation = outputs.planner_representation.detach().float().reshape(-1).cpu()
+                layer_stats["representation_norms"].append(float(planner_representation.norm().item()))
+                layer_stats["representation_vars"].append(
+                    float(planner_representation.var(unbiased=False).item()) if planner_representation.numel() > 1 else 0.0
+                )
+                representation_vectors[int(block_id)] = planner_representation
+        if self._planner_control_saturation_audit_enabled():
+            input_pairwise = self._pairwise_cosine_summary(input_vectors)
+            representation_pairwise = self._pairwise_cosine_summary(representation_vectors)
+            accumulator.setdefault("input_pairwise_cosine", []).append(float(input_pairwise["mean"]))
+            accumulator.setdefault("representation_pairwise_cosine", []).append(float(representation_pairwise["mean"]))
+
     def _accumulate_planner_control_pre_step(self, context: Dict[str, Any]) -> None:
         if not self._hybrid_planner_enabled():
             return
         accumulator = context.setdefault(
             "planner_control_epoch_accumulator",
-            {
-                "batches": 0,
-                "grad_l2_sum": 0.0,
-                "grad_l2_max": 0.0,
-                "grad_present_batches": 0,
-                "grad_nonzero_batches": 0,
-                "optimizer_steps": 0,
-                "shared_gate": {},
-            },
+            self._new_planner_control_epoch_accumulator(),
         )
         stats = self._compute_module_grad_stats(self.planner.control_branch)
         accumulator["batches"] += 1
@@ -1172,32 +1390,29 @@ class NHLoRATrainer:
         accumulator["grad_l2_max"] = max(float(accumulator["grad_l2_max"]), float(stats["max_abs"]))
         accumulator["grad_present_batches"] += int(int(stats["present_params"]) > 0)
         accumulator["grad_nonzero_batches"] += int(int(stats["nonzero_params"]) > 0)
+        if not self._planner_control_saturation_audit_enabled():
+            return
         control_outputs = context.get("planner_control_last_outputs", {})
+        grad_zero_epsilon = 1e-12
         for block_id, outputs in control_outputs.items():
-            gate_value = float(outputs.shared_gate.detach().mean().item())
-            gate_stats = accumulator["shared_gate"].setdefault(
-                int(block_id),
-                {"sum": 0.0, "min": gate_value, "max": gate_value, "count": 0},
-            )
-            gate_stats["sum"] += gate_value
-            gate_stats["min"] = min(float(gate_stats["min"]), gate_value)
-            gate_stats["max"] = max(float(gate_stats["max"]), gate_value)
-            gate_stats["count"] += 1
+            layer_stats = self._planner_control_layer_accumulator(accumulator, int(block_id))
+            beta_grad = outputs.shared_gate.grad
+            beta_grad_abs = 0.0 if beta_grad is None else abs(float(beta_grad.detach().mean().item()))
+            layer_stats["beta_grad_abs"].append(beta_grad_abs)
+            layer_stats["beta_grad_present_batches"] += int(beta_grad is not None)
+            layer_stats["beta_grad_nonzero_batches"] += int(beta_grad_abs > grad_zero_epsilon)
+            logit_grad = outputs.shared_gate_logit.grad
+            logit_grad_abs = 0.0 if logit_grad is None else abs(float(logit_grad.detach().mean().item()))
+            layer_stats["logit_grad_abs"].append(logit_grad_abs)
+            layer_stats["logit_grad_present_batches"] += int(logit_grad is not None)
+            layer_stats["logit_grad_nonzero_batches"] += int(logit_grad_abs > grad_zero_epsilon)
 
     def _record_planner_control_optimizer_step(self, context: Dict[str, Any]) -> None:
         if not self._hybrid_planner_enabled():
             return
         accumulator = context.setdefault(
             "planner_control_epoch_accumulator",
-            {
-                "batches": 0,
-                "grad_l2_sum": 0.0,
-                "grad_l2_max": 0.0,
-                "grad_present_batches": 0,
-                "grad_nonzero_batches": 0,
-                "optimizer_steps": 0,
-                "shared_gate": {},
-            },
+            self._new_planner_control_epoch_accumulator(),
         )
         accumulator["optimizer_steps"] += 1
 
@@ -1250,17 +1465,166 @@ class NHLoRATrainer:
             float(accumulator.get("grad_l2_sum", 0.0)) / batches,
             float(accumulator.get("grad_l2_max", 0.0)),
         )
-        for block_id in sorted(accumulator.get("shared_gate", {})):
-            stats = accumulator["shared_gate"][block_id]
-            count = max(int(stats.get("count", 0)), 1)
+        if not self._planner_control_saturation_audit_enabled():
+            for block_id in sorted(accumulator.get("layers", {})):
+                layer_stats = accumulator["layers"][block_id]
+                beta_summary = self._scalar_series_summary(layer_stats.get("beta_values", []))
+                self.logger.info(
+                    "[PlannerControlValues][Task %d][Epoch %d][Layer %d] beta_mean=%.4f beta_min=%.4f beta_max=%.4f",
+                    context["task_number"],
+                    int(context["current_epoch"]),
+                    int(block_id),
+                    float(beta_summary["mean"]),
+                    float(beta_summary["min"]),
+                    float(beta_summary["max"]),
+                )
+            return
+        task_start = context.get("planner_control_task_start", {})
+        contribution_accumulator = context.get("planner_control_contribution_epoch_accumulator", {})
+        logit_threshold_099 = math.log(0.99 / 0.01)
+        logit_threshold_0999 = math.log(0.999 / 0.001)
+        task_context_stats = context.get("planner_control_task_context_stats", {"norm": 0.0, "var": 0.0})
+        policy_input_summary = context.get("planner_policy_input_summary", {})
+        control_input_pairwise = self._scalar_series_summary(accumulator.get("input_pairwise_cosine", []))
+        control_rep_pairwise = self._scalar_series_summary(accumulator.get("representation_pairwise_cosine", []))
+        self.logger.info(
+            "[PlannerControlInputCompare][Task %d][Epoch %d] task_context_norm=%.4e task_context_var=%.4e control_input_pairwise_cosine_mean=%.4f control_input_pairwise_cosine_min=%.4f control_input_pairwise_cosine_max=%.4f control_representation_pairwise_cosine_mean=%.4f control_representation_pairwise_cosine_min=%.4f control_representation_pairwise_cosine_max=%.4f policy_input_pairwise_cosine_mean=%s policy_representation_pairwise_cosine_mean=%s",
+            context["task_number"],
+            int(context["current_epoch"]),
+            float(task_context_stats.get("norm", 0.0)),
+            float(task_context_stats.get("var", 0.0)),
+            float(control_input_pairwise["mean"]),
+            float(control_input_pairwise["min"]),
+            float(control_input_pairwise["max"]),
+            float(control_rep_pairwise["mean"]),
+            float(control_rep_pairwise["min"]),
+            float(control_rep_pairwise["max"]),
+            "n/a"
+            if not policy_input_summary
+            else f"{float(policy_input_summary['inputs']['pairwise_cosine_mean']):.4f}",
+            "n/a"
+            if not policy_input_summary
+            else f"{float(policy_input_summary['representations']['pairwise_cosine_mean']):.4f}",
+        )
+        for block_id in sorted(accumulator.get("layers", {})):
+            layer_stats = accumulator["layers"][block_id]
+            beta_summary = self._scalar_series_summary(layer_stats.get("beta_values", []))
+            logit_summary = self._scalar_series_summary(layer_stats.get("beta_logits", []))
+            beta_grad_summary = self._scalar_series_summary(layer_stats.get("beta_grad_abs", []))
+            logit_grad_summary = self._scalar_series_summary(layer_stats.get("logit_grad_abs", []))
+            task_start_stats = task_start.get(int(block_id), {})
+            task_start_beta = float(task_start_stats.get("beta", 0.0))
+            task_start_logit = float(task_start_stats.get("logit", 0.0))
             self.logger.info(
-                "[PlannerControlValues][Task %d][Epoch %d][Layer %d] beta_mean=%.4f beta_min=%.4f beta_max=%.4f",
+                "[PlannerControlLogits][Task %d][Epoch %d][Layer %d] logit_mean=%.4e logit_min=%.4e logit_max=%.4e logit_p50=%.4e logit_p90=%.4e logit_p99=%.4e frac_gt_0=%.4f frac_gt_2=%.4f frac_gt_logit099=%.4f frac_gt_logit0999=%.4f epoch_logit_drift=%.4e task_logit_drift=%.4e task_start_logit=%.4e",
                 context["task_number"],
                 int(context["current_epoch"]),
                 int(block_id),
-                float(stats.get("sum", 0.0)) / count,
-                float(stats.get("min", 0.0)),
-                float(stats.get("max", 0.0)),
+                float(logit_summary["mean"]),
+                float(logit_summary["min"]),
+                float(logit_summary["max"]),
+                float(logit_summary["p50"]),
+                float(logit_summary["p90"]),
+                float(logit_summary["p99"]),
+                self._fraction_above(layer_stats.get("beta_logits", []), 0.0),
+                self._fraction_above(layer_stats.get("beta_logits", []), 2.0),
+                self._fraction_above(layer_stats.get("beta_logits", []), logit_threshold_099),
+                self._fraction_above(layer_stats.get("beta_logits", []), logit_threshold_0999),
+                float(logit_summary["last"]) - float(logit_summary["first"]),
+                float(logit_summary["mean"]) - task_start_logit,
+                task_start_logit,
+            )
+            self.logger.info(
+                "[PlannerControlValues][Task %d][Epoch %d][Layer %d] beta_mean=%.4f beta_min=%.4f beta_max=%.4f beta_p50=%.4f beta_p90=%.4f beta_p99=%.4f frac_gt_099=%.4f frac_gt_0999=%.4f frac_lt_001=%.4f epoch_beta_drift=%.4e task_beta_drift=%.4e task_start_beta=%.4f",
+                context["task_number"],
+                int(context["current_epoch"]),
+                int(block_id),
+                float(beta_summary["mean"]),
+                float(beta_summary["min"]),
+                float(beta_summary["max"]),
+                float(beta_summary["p50"]),
+                float(beta_summary["p90"]),
+                float(beta_summary["p99"]),
+                self._fraction_above(layer_stats.get("beta_values", []), 0.99),
+                self._fraction_above(layer_stats.get("beta_values", []), 0.999),
+                self._fraction_below(layer_stats.get("beta_values", []), 0.01),
+                float(beta_summary["last"]) - float(beta_summary["first"]),
+                float(beta_summary["mean"]) - task_start_beta,
+                task_start_beta,
+            )
+            self.logger.info(
+                "[PlannerControlGradients][Task %d][Epoch %d][Layer %d] beta_grad_mean=%.4e beta_grad_max=%.4e beta_grad_present_batches=%d/%d beta_grad_nonzero_batches=%d/%d beta_grad_effectively_zero_fraction=%.4f logit_grad_mean=%.4e logit_grad_max=%.4e logit_grad_present_batches=%d/%d logit_grad_nonzero_batches=%d/%d logit_grad_effectively_zero_fraction=%.4f",
+                context["task_number"],
+                int(context["current_epoch"]),
+                int(block_id),
+                float(beta_grad_summary["mean"]),
+                float(beta_grad_summary["max"]),
+                int(layer_stats.get("beta_grad_present_batches", 0)),
+                max(int(beta_summary["count"]), 1),
+                int(layer_stats.get("beta_grad_nonzero_batches", 0)),
+                max(int(beta_summary["count"]), 1),
+                self._fraction_below(layer_stats.get("beta_grad_abs", []), 1e-12),
+                float(logit_grad_summary["mean"]),
+                float(logit_grad_summary["max"]),
+                int(layer_stats.get("logit_grad_present_batches", 0)),
+                max(int(logit_summary["count"]), 1),
+                int(layer_stats.get("logit_grad_nonzero_batches", 0)),
+                max(int(logit_summary["count"]), 1),
+                self._fraction_below(layer_stats.get("logit_grad_abs", []), 1e-12),
+            )
+            input_norm_summary = self._scalar_series_summary(layer_stats.get("input_norms", []))
+            input_var_summary = self._scalar_series_summary(layer_stats.get("input_vars", []))
+            representation_norm_summary = self._scalar_series_summary(layer_stats.get("representation_norms", []))
+            representation_var_summary = self._scalar_series_summary(layer_stats.get("representation_vars", []))
+            policy_layer_input = None if not task_start_stats else task_start_stats.get("planner_input")
+            latest_input_similarity_to_task_start = 0.0
+            if policy_layer_input is not None and layer_stats.get("input_norms"):
+                current_input = None
+                control_outputs = context.get("planner_control_last_outputs", {})
+                if int(block_id) in control_outputs and control_outputs[int(block_id)].planner_input is not None:
+                    current_input = control_outputs[int(block_id)].planner_input.detach().float().reshape(-1).cpu()
+                if current_input is not None:
+                    current_norm = float(current_input.norm().item())
+                    reference_input = policy_layer_input.detach().float().reshape(-1)
+                    reference_norm = float(reference_input.norm().item())
+                    if current_norm > 1e-12 and reference_norm > 1e-12:
+                        latest_input_similarity_to_task_start = float(
+                            torch.dot(current_input / current_norm, reference_input / reference_norm).item()
+                        )
+            self.logger.info(
+                "[PlannerControlInputs][Task %d][Epoch %d][Layer %d] input_norm_mean=%.4e input_var_mean=%.4e representation_norm_mean=%.4e representation_var_mean=%.4e input_similarity_to_task_start=%.4f",
+                context["task_number"],
+                int(context["current_epoch"]),
+                int(block_id),
+                float(input_norm_summary["mean"]),
+                float(input_var_summary["mean"]),
+                float(representation_norm_summary["mean"]),
+                float(representation_var_summary["mean"]),
+                latest_input_similarity_to_task_start,
+            )
+            contribution_stats = contribution_accumulator.get(int(block_id), {})
+            shared_pre_count = max(int(contribution_stats.get("shared_pre_beta_norm_count", 0)), 1)
+            shared_post_count = max(int(contribution_stats.get("shared_post_beta_norm_count", 0)), 1)
+            slot_count = max(int(contribution_stats.get("slot_norm_count", 0)), 1)
+            structural_calls = max(int(contribution_stats.get("slot_structurally_available_calls", 0)), 1)
+            mean_shared_pre = float(contribution_stats.get("shared_pre_beta_norm_sum", 0.0)) / shared_pre_count
+            mean_shared_post = float(contribution_stats.get("shared_post_beta_norm_sum", 0.0)) / shared_post_count
+            mean_slot = float(contribution_stats.get("slot_norm_sum", 0.0)) / slot_count
+            shared_to_slot_ratio = mean_shared_post / max(mean_slot, 1e-12)
+            self.logger.info(
+                "[PlannerContribution][Task %d][Epoch %d][Layer %d] shared_pre_beta_norm_mean=%.4e shared_post_beta_norm_mean=%.4e slot_norm_mean=%.4e shared_to_slot_ratio=%.4e slot_structurally_available_fraction=%.4f slot_nontrivial_fraction=%.4f slot_zero_contribution_fraction=%.4f beta_gt_099_with_structural_slot_fraction=%.4f beta_gt_0999_with_structural_slot_fraction=%.4f",
+                context["task_number"],
+                int(context["current_epoch"]),
+                int(block_id),
+                mean_shared_pre,
+                mean_shared_post,
+                mean_slot,
+                shared_to_slot_ratio,
+                float(contribution_stats.get("slot_structurally_available_calls", 0)) / max(slot_count, 1),
+                float(contribution_stats.get("slot_nontrivial_calls", 0)) / structural_calls,
+                float(contribution_stats.get("slot_zero_contribution_calls", 0)) / structural_calls,
+                float(contribution_stats.get("beta_gt_099_with_structural_slot_calls", 0)) / structural_calls,
+                float(contribution_stats.get("beta_gt_0999_with_structural_slot_calls", 0)) / structural_calls,
             )
 
     def _log_planner_parameter_drift(self, context: Dict[str, Any]) -> None:
@@ -1467,18 +1831,24 @@ class NHLoRATrainer:
         context: Dict[str, Any],
         plans: Dict[int, Dict[str, object]],
     ) -> Dict[int, Dict[str, object]]:
-        if not self._epoch_debug_enabled(
+        adapter_delta_enabled = self._epoch_debug_enabled(
             context,
             flag_key="adapter_delta_debug_logging",
             max_epoch_key="adapter_delta_debug_max_epochs",
-        ):
+        )
+        planner_control_contribution_enabled = self._planner_control_saturation_audit_enabled()
+        if not adapter_delta_enabled and not planner_control_contribution_enabled:
             return plans
         accumulator = context.setdefault("adapter_delta_debug_accumulator", {})
+        control_contribution_accumulator = context.setdefault("planner_control_contribution_epoch_accumulator", {})
         debug_plans = {}
         for block_id, planner_cfg in plans.items():
             layer_cfg = dict(planner_cfg)
-            layer_cfg["_debug_delta_stats"] = accumulator
             layer_cfg["_debug_block_id"] = int(block_id)
+            if adapter_delta_enabled:
+                layer_cfg["_debug_delta_stats"] = accumulator
+            if planner_control_contribution_enabled:
+                layer_cfg["_planner_control_contribution_accumulator"] = control_contribution_accumulator
             debug_plans[int(block_id)] = layer_cfg
         return debug_plans
 
@@ -1499,11 +1869,17 @@ class NHLoRATrainer:
                 task_embedding=task_embedding,
                 history_summary=history_summary,
             )
+            if self._planner_control_saturation_audit_enabled():
+                if control_outputs.shared_gate.requires_grad:
+                    control_outputs.shared_gate.retain_grad()
+                if control_outputs.shared_gate_logit.requires_grad:
+                    control_outputs.shared_gate_logit.retain_grad()
             control_outputs_by_block[int(block_id)] = control_outputs
             if self._planner_use_learned_shared_gate():
                 layer_cfg["shared_gate"] = control_outputs.shared_gate
             hybrid_plans[int(block_id)] = layer_cfg
         context["planner_control_last_outputs"] = control_outputs_by_block
+        self._record_planner_control_forward_stats(context, control_outputs_by_block)
         return hybrid_plans
 
     def _plans_for_training_forward(self, context: Dict[str, Any]) -> Dict[int, Dict[str, object]]:
@@ -1560,6 +1936,8 @@ class NHLoRATrainer:
             "shared": 0.0,
             "slot": 0.0,
             "router": 0.0,
+            "planner_policy": 0.0,
+            "planner_control": 0.0,
             "planner": 0.0,
             "classifier": 0.0,
         }
@@ -1577,6 +1955,12 @@ class NHLoRATrainer:
             else:
                 continue
             squared_sums[group] += float(parameter.grad.detach().pow(2).sum().item())
+        for parameter in self.planner.policy_parameters():
+            if parameter.grad is not None:
+                squared_sums["planner_policy"] += float(parameter.grad.detach().pow(2).sum().item())
+        for parameter in self.planner.control_parameters():
+            if parameter.grad is not None:
+                squared_sums["planner_control"] += float(parameter.grad.detach().pow(2).sum().item())
         for parameter in self.planner.parameters():
             if parameter.grad is not None:
                 squared_sums["planner"] += float(parameter.grad.detach().pow(2).sum().item())
@@ -1591,7 +1975,10 @@ class NHLoRATrainer:
             return
         accumulator = context.setdefault(
             "grad_norm_debug_accumulator",
-            {group: {"sum": 0.0, "max": 0.0, "batches": 0} for group in ("shared", "slot", "router", "planner", "classifier")},
+            {
+                group: {"sum": 0.0, "max": 0.0, "batches": 0}
+                for group in ("shared", "slot", "router", "planner_policy", "planner_control", "planner", "classifier")
+            },
         )
         for group, norm_value in self._compute_grad_group_norms().items():
             stats = accumulator[group]
@@ -1612,7 +1999,7 @@ class NHLoRATrainer:
         context["last_grad_norm_debug_epoch"] = epoch
         accumulator = context.get("grad_norm_debug_accumulator", {})
         context["last_grad_norm_debug"] = accumulator
-        for group in ("shared", "slot", "router", "planner", "classifier"):
+        for group in ("shared", "slot", "router", "planner_policy", "planner_control", "planner", "classifier"):
             stats = accumulator.get(group, {"sum": 0.0, "max": 0.0, "batches": 0})
             batches = max(int(stats.get("batches", 0)), 1)
             self.logger.info(
@@ -2165,12 +2552,22 @@ class NHLoRATrainer:
                 "task_embedding": task_state.embedding.detach(),
                 "history_summary": None if planner_history_summary is None else planner_history_summary.detach(),
             },
+            "planner_control_task_context_stats": {
+                "norm": float(task_state.embedding.detach().norm().item()),
+                "var": float(task_state.embedding.detach().float().var(unbiased=False).item())
+                if task_state.embedding.numel() > 1
+                else 0.0,
+            },
         }
         if self._planner_audit_enabled():
             context["planner_optimizer_summary"] = self._planner_optimizer_membership(optimizer)
         if self._hybrid_planner_enabled():
             context["planner_policy_optimizer_summary"] = self._planner_policy_optimizer_membership(optimizer)
             context["planner_control_optimizer_summary"] = self._planner_control_optimizer_membership(optimizer)
+            context["planner_control_task_start"] = self._capture_planner_control_task_start(
+                task_state.embedding.detach(),
+                None if planner_history_summary is None else planner_history_summary.detach(),
+            )
         self._log_stage5_plan_debug(context)
         self._log_planner_audit_prepare(context)
         self._log_hybrid_planner_prepare(context)
@@ -2364,7 +2761,7 @@ class NHLoRATrainer:
             context["adapter_delta_debug_accumulator"] = {}
             context["grad_norm_debug_accumulator"] = {
                 group: {"sum": 0.0, "max": 0.0, "batches": 0}
-                for group in ("shared", "slot", "router", "planner", "classifier")
+                for group in ("shared", "slot", "router", "planner_policy", "planner_control", "planner", "classifier")
             }
             context["planner_audit_epoch_accumulator"] = {
                 "batches": 0,
@@ -2374,15 +2771,8 @@ class NHLoRATrainer:
                 "grad_nonzero_batches": 0,
                 "optimizer_steps": 0,
             }
-            context["planner_control_epoch_accumulator"] = {
-                "batches": 0,
-                "grad_l2_sum": 0.0,
-                "grad_l2_max": 0.0,
-                "grad_present_batches": 0,
-                "grad_nonzero_batches": 0,
-                "optimizer_steps": 0,
-                "shared_gate": {},
-            }
+            context["planner_control_epoch_accumulator"] = self._new_planner_control_epoch_accumulator()
+            context["planner_control_contribution_epoch_accumulator"] = {}
             train_loader = self._build_train_loader(train_dataset)
             self.model.train()
             self.planner.train()
