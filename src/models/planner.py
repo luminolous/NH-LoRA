@@ -26,6 +26,10 @@ class PlannerSignals:
 class PlannerControlOutputs:
     shared_gate: torch.Tensor
     shared_gate_logit: torch.Tensor
+    delta_raw: torch.Tensor
+    delta_logit: torch.Tensor | None = None
+    anchor_beta: torch.Tensor | None = None
+    anchor_logit: torch.Tensor | None = None
     history_attention: torch.Tensor | None = None
     history_context: torch.Tensor | None = None
     planner_input: torch.Tensor | None = None
@@ -363,6 +367,14 @@ class PlannerControlBranch(_PlannerBranchBase):
             layer_embedding_dim=layer_embedding_dim,
             output_dim=1,
         )
+        self._zero_init_output_heads()
+
+    def _zero_init_output_heads(self) -> None:
+        with torch.no_grad():
+            for output_head in self.output_heads.values():
+                output_head.weight.zero_()
+                if output_head.bias is not None:
+                    output_head.bias.zero_()
 
     def forward_control(
         self,
@@ -379,6 +391,7 @@ class PlannerControlBranch(_PlannerBranchBase):
         return PlannerControlOutputs(
             shared_gate=torch.sigmoid(shared_gate_logit),
             shared_gate_logit=shared_gate_logit,
+            delta_raw=shared_gate_logit,
             history_attention=history_attention,
             history_context=history_context,
             planner_input=planner_input,

@@ -162,6 +162,9 @@ class NHLoRATrainer:
     def _planner_use_learned_shared_gate(self) -> bool:
         return bool(self.config["training"].get("planner_use_learned_shared_gate", True))
 
+    def _planner_control_delta_logit_scale(self) -> float:
+        return float(self.config["training"].get("planner_control_delta_logit_scale", 2.0))
+
     def _planner_soft_rank_training_enabled(self) -> bool:
         return bool(self.config["training"].get("planner_soft_rank_training", False))
 
@@ -193,6 +196,8 @@ class NHLoRATrainer:
                 "Stage 8 Checkpoint A defers training.planner_soft_rank_training=true. "
                 "Leave it false for this pass."
             )
+        if self._planner_control_delta_logit_scale() <= 0.0:
+            raise ValueError("Hybrid planner requires training.planner_control_delta_logit_scale > 0.")
         if not self._planner_hard_rank_eval():
             raise ValueError(
                 "Stage 8 Checkpoint A requires training.planner_hard_rank_eval=true."
@@ -400,7 +405,7 @@ class NHLoRATrainer:
             chu_cfg.get("stability_threshold", "n/a"),
         )
         self.logger.info(
-            "  logging estimate_eta=%s cuda_sync_timing=%s debug_eval_around_consolidation=%s retention_debug_logging=%s retention_feature_diff_logging=%s routing_debug_logging=%s planner_audit_logging=%s adapter_delta_debug_logging=%s final_feature_diff_debug_logging=%s classifier_drift_debug_logging=%s grad_norm_debug_logging=%s logit_margin_debug_logging=%s freeze_old_classifier_weights=%s classifier_lr_scale=%s freeze_new_classifier_epochs=%s freeze_all_classifier_epochs=%s planner_mode=%s planner_control_recompute=%s planner_policy_trainable=%s planner_control_trainable=%s planner_use_learned_shared_gate=%s planner_soft_rank_training=%s planner_hard_rank_eval=%s",
+            "  logging estimate_eta=%s cuda_sync_timing=%s debug_eval_around_consolidation=%s retention_debug_logging=%s retention_feature_diff_logging=%s routing_debug_logging=%s planner_audit_logging=%s adapter_delta_debug_logging=%s final_feature_diff_debug_logging=%s classifier_drift_debug_logging=%s grad_norm_debug_logging=%s logit_margin_debug_logging=%s freeze_old_classifier_weights=%s classifier_lr_scale=%s freeze_new_classifier_epochs=%s freeze_all_classifier_epochs=%s planner_mode=%s planner_control_recompute=%s planner_policy_trainable=%s planner_control_trainable=%s planner_use_learned_shared_gate=%s planner_control_delta_logit_scale=%s planner_soft_rank_training=%s planner_hard_rank_eval=%s",
             training_cfg.get("estimate_eta", True),
             training_cfg.get("cuda_sync_timing", False),
             training_cfg.get("debug_eval_around_consolidation", False),
@@ -422,6 +427,7 @@ class NHLoRATrainer:
             training_cfg.get("planner_policy_trainable", False),
             training_cfg.get("planner_control_trainable", True),
             training_cfg.get("planner_use_learned_shared_gate", True),
+            training_cfg.get("planner_control_delta_logit_scale", 2.0),
             training_cfg.get("planner_soft_rank_training", False),
             training_cfg.get("planner_hard_rank_eval", True),
         )
@@ -749,6 +755,12 @@ class NHLoRATrainer:
             {
                 "beta_values": [],
                 "beta_logits": [],
+                "anchor_beta_values": [],
+                "anchor_logit_values": [],
+                "delta_raw_values": [],
+                "delta_logit_values": [],
+                "beta_gap_abs": [],
+                "logit_gap_abs": [],
                 "beta_grad_abs": [],
                 "logit_grad_abs": [],
                 "beta_grad_present_batches": 0,
@@ -762,20 +774,68 @@ class NHLoRATrainer:
             },
         )
 
-    def _capture_planner_control_task_start(self, task_embedding: torch.Tensor, history_summary: torch.Tensor | None) -> Dict[int, Dict[str, object]]:
+    @staticmethod
+    def _gate_tensor_like(anchor_beta: float | torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
+        if isinstance(anchor_beta, torch.Tensor):
+            gate = anchor_beta.to(device=reference.device, dtype=reference.dtype)
+        else:
+            gate = reference.new_full(reference.shape, float(anchor_beta))
+        while gate.dim() < reference.dim():
+            gate = gate.unsqueeze(-1)
+        if gate.shape != reference.shape:
+            gate = gate.expand_as(reference)
+        return gate
+
+    def _compose_hybrid_control_outputs(
+        self,
+        raw_outputs: PlannerControlOutputs,
+        *,
+        anchor_beta: float | torch.Tensor,
+    ) -> PlannerControlOutputs:
+        anchor_beta_tensor = self._gate_tensor_like(anchor_beta, raw_outputs.delta_raw)
+        clamped_anchor_beta = anchor_beta_tensor.clamp(min=1e-4, max=1.0 - 1e-4)
+        anchor_logit = torch.logit(clamped_anchor_beta)
+        delta_logit = self._planner_control_delta_logit_scale() * torch.tanh(raw_outputs.delta_raw)
+        effective_logit = anchor_logit + delta_logit
+        effective_beta = torch.sigmoid(effective_logit)
+        return PlannerControlOutputs(
+            shared_gate=effective_beta,
+            shared_gate_logit=effective_logit,
+            delta_raw=raw_outputs.delta_raw,
+            delta_logit=delta_logit,
+            anchor_beta=anchor_beta_tensor,
+            anchor_logit=anchor_logit,
+            history_attention=raw_outputs.history_attention,
+            history_context=raw_outputs.history_context,
+            planner_input=raw_outputs.planner_input,
+            planner_representation=raw_outputs.planner_representation,
+        )
+
+    def _capture_planner_control_task_start(
+        self,
+        task_embedding: torch.Tensor,
+        history_summary: torch.Tensor | None,
+        applied_plans: Dict[int, Dict[str, object]],
+    ) -> Dict[int, Dict[str, object]]:
         if not self._hybrid_planner_enabled():
             return {}
         snapshot: Dict[int, Dict[str, object]] = {}
         with torch.no_grad():
             for block_id in self.model.selected_blocks:
-                outputs = self.planner.forward_control(
+                raw_outputs = self.planner.forward_control(
                     int(block_id),
                     task_embedding=task_embedding,
                     history_summary=history_summary,
                 )
+                outputs = self._compose_hybrid_control_outputs(
+                    raw_outputs,
+                    anchor_beta=float(applied_plans[int(block_id)]["shared_gate"]),
+                )
                 snapshot[int(block_id)] = {
                     "beta": float(outputs.shared_gate.detach().mean().item()),
                     "logit": float(outputs.shared_gate_logit.detach().mean().item()),
+                    "anchor_beta": float(outputs.anchor_beta.detach().mean().item()),
+                    "anchor_logit": float(outputs.anchor_logit.detach().mean().item()),
                     "planner_input": outputs.planner_input.detach().float().cpu() if outputs.planner_input is not None else None,
                     "planner_representation": outputs.planner_representation.detach().float().cpu()
                     if outputs.planner_representation is not None
@@ -1244,13 +1304,14 @@ class NHLoRATrainer:
             self._planner_control_optimizer_membership(optimizer),
         )
         self.logger.info(
-            "[HybridPlannerConfig][Task %d] planner_mode=%s policy_trainable=%s control_trainable=%s control_recompute=%s learned_shared_gate=%s soft_rank_enabled=%s soft_rank_temperature=%s hard_rank_eval=%s",
+            "[HybridPlannerConfig][Task %d] planner_mode=%s policy_trainable=%s control_trainable=%s control_recompute=%s learned_shared_gate=%s delta_logit_scale=%.4f soft_rank_enabled=%s soft_rank_temperature=%s hard_rank_eval=%s",
             context["task_number"],
             self._planner_mode(),
             self._planner_policy_trainable(),
             self._planner_control_trainable(),
             self._planner_control_recompute_mode(),
             self._planner_use_learned_shared_gate(),
+            self._planner_control_delta_logit_scale(),
             self._planner_soft_rank_training_enabled(),
             float(self.config["training"].get("planner_soft_rank_temperature", 0.5)),
             self._planner_hard_rank_eval(),
@@ -1357,6 +1418,19 @@ class NHLoRATrainer:
             layer_stats = self._planner_control_layer_accumulator(accumulator, int(block_id))
             layer_stats["beta_values"].append(float(outputs.shared_gate.detach().mean().item()))
             layer_stats["beta_logits"].append(float(outputs.shared_gate_logit.detach().mean().item()))
+            if outputs.anchor_beta is not None:
+                layer_stats["anchor_beta_values"].append(float(outputs.anchor_beta.detach().mean().item()))
+                layer_stats["beta_gap_abs"].append(
+                    float((outputs.shared_gate.detach() - outputs.anchor_beta.detach()).abs().mean().item())
+                )
+            if outputs.anchor_logit is not None:
+                layer_stats["anchor_logit_values"].append(float(outputs.anchor_logit.detach().mean().item()))
+                layer_stats["logit_gap_abs"].append(
+                    float((outputs.shared_gate_logit.detach() - outputs.anchor_logit.detach()).abs().mean().item())
+                )
+            layer_stats["delta_raw_values"].append(float(outputs.delta_raw.detach().mean().item()))
+            if outputs.delta_logit is not None:
+                layer_stats["delta_logit_values"].append(float(outputs.delta_logit.detach().mean().item()))
             if outputs.planner_input is not None:
                 planner_input = outputs.planner_input.detach().float().reshape(-1).cpu()
                 layer_stats["input_norms"].append(float(planner_input.norm().item()))
@@ -1510,11 +1584,49 @@ class NHLoRATrainer:
             layer_stats = accumulator["layers"][block_id]
             beta_summary = self._scalar_series_summary(layer_stats.get("beta_values", []))
             logit_summary = self._scalar_series_summary(layer_stats.get("beta_logits", []))
+            anchor_beta_summary = self._scalar_series_summary(layer_stats.get("anchor_beta_values", []))
+            anchor_logit_summary = self._scalar_series_summary(layer_stats.get("anchor_logit_values", []))
+            delta_raw_summary = self._scalar_series_summary(layer_stats.get("delta_raw_values", []))
+            delta_logit_summary = self._scalar_series_summary(layer_stats.get("delta_logit_values", []))
+            beta_gap_summary = self._scalar_series_summary(layer_stats.get("beta_gap_abs", []))
+            logit_gap_summary = self._scalar_series_summary(layer_stats.get("logit_gap_abs", []))
             beta_grad_summary = self._scalar_series_summary(layer_stats.get("beta_grad_abs", []))
             logit_grad_summary = self._scalar_series_summary(layer_stats.get("logit_grad_abs", []))
             task_start_stats = task_start.get(int(block_id), {})
             task_start_beta = float(task_start_stats.get("beta", 0.0))
             task_start_logit = float(task_start_stats.get("logit", 0.0))
+            task_start_anchor_beta = float(task_start_stats.get("anchor_beta", 0.0))
+            task_start_anchor_logit = float(task_start_stats.get("anchor_logit", 0.0))
+            self.logger.info(
+                "[PlannerControlAnchor][Task %d][Epoch %d][Layer %d] anchor_beta_mean=%.4f anchor_beta_min=%.4f anchor_beta_max=%.4f frac_anchor_gt_099=%.4f frac_anchor_gt_0999=%.4f anchor_logit_mean=%.4e anchor_logit_p90=%.4e anchor_logit_p99=%.4e task_start_anchor_beta=%.4f task_start_anchor_logit=%.4e",
+                context["task_number"],
+                int(context["current_epoch"]),
+                int(block_id),
+                float(anchor_beta_summary["mean"]),
+                float(anchor_beta_summary["min"]),
+                float(anchor_beta_summary["max"]),
+                self._fraction_above(layer_stats.get("anchor_beta_values", []), 0.99),
+                self._fraction_above(layer_stats.get("anchor_beta_values", []), 0.999),
+                float(anchor_logit_summary["mean"]),
+                float(anchor_logit_summary["p90"]),
+                float(anchor_logit_summary["p99"]),
+                task_start_anchor_beta,
+                task_start_anchor_logit,
+            )
+            self.logger.info(
+                "[PlannerControlDelta][Task %d][Epoch %d][Layer %d] delta_raw_mean=%.4e delta_raw_min=%.4e delta_raw_max=%.4e delta_logit_mean=%.4e delta_logit_min=%.4e delta_logit_max=%.4e beta_anchor_gap_mean_abs=%.4e logit_anchor_gap_mean_abs=%.4e",
+                context["task_number"],
+                int(context["current_epoch"]),
+                int(block_id),
+                float(delta_raw_summary["mean"]),
+                float(delta_raw_summary["min"]),
+                float(delta_raw_summary["max"]),
+                float(delta_logit_summary["mean"]),
+                float(delta_logit_summary["min"]),
+                float(delta_logit_summary["max"]),
+                float(beta_gap_summary["mean"]),
+                float(logit_gap_summary["mean"]),
+            )
             self.logger.info(
                 "[PlannerControlLogits][Task %d][Epoch %d][Layer %d] logit_mean=%.4e logit_min=%.4e logit_max=%.4e logit_p50=%.4e logit_p90=%.4e logit_p99=%.4e frac_gt_0=%.4f frac_gt_2=%.4f frac_gt_logit099=%.4f frac_gt_logit0999=%.4f epoch_logit_drift=%.4e task_logit_drift=%.4e task_start_logit=%.4e",
                 context["task_number"],
@@ -1864,10 +1976,14 @@ class NHLoRATrainer:
         hybrid_plans: Dict[int, Dict[str, object]] = {}
         for block_id, planner_cfg in context["applied_plans"].items():
             layer_cfg = dict(planner_cfg)
-            control_outputs = self.planner.forward_control(
+            raw_outputs = self.planner.forward_control(
                 int(block_id),
                 task_embedding=task_embedding,
                 history_summary=history_summary,
+            )
+            control_outputs = self._compose_hybrid_control_outputs(
+                raw_outputs,
+                anchor_beta=float(planner_cfg["shared_gate"]),
             )
             if self._planner_control_saturation_audit_enabled():
                 if control_outputs.shared_gate.requires_grad:
@@ -2567,6 +2683,7 @@ class NHLoRATrainer:
             context["planner_control_task_start"] = self._capture_planner_control_task_start(
                 task_state.embedding.detach(),
                 None if planner_history_summary is None else planner_history_summary.detach(),
+                applied_plans,
             )
         self._log_stage5_plan_debug(context)
         self._log_planner_audit_prepare(context)

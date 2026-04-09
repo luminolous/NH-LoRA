@@ -14,6 +14,7 @@ training:
   epochs_per_task: 30
   lr: 5e-4
   planner_mode: hybrid
+  planner_control_delta_logit_scale: 2.0
 
 runtime:
   num_workers: 8

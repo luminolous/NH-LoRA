@@ -83,6 +83,18 @@ planner-control gradient reporting, shared-vs-slot contribution summaries, and
 control-input similarity summaries. They are observational only and do not change
 planner, router, CHU, classifier, or loss behavior.
 
+Stage 10 keeps hybrid mode opt-in and stabilizes the learned shared gate with an
+anchored residual parameterization. In `training.planner_mode=hybrid`, the
+training-time control gate now starts from the policy-side `shared_gate` in the
+applied plan, converts that anchor into logit space, adds a bounded residual
+`planner_control_delta_logit_scale * tanh(delta_raw)`, and maps back through
+sigmoid. The control head is zero-initialized so hybrid training begins at the
+policy anchor instead of relearning an unconstrained absolute `beta`. The default
+`training.planner_control_delta_logit_scale=2.0` is an initial validation
+hypothesis for short-window reruns, not a claimed final tuned value. Stage 10
+still does not tune thresholds, add regularizers, redesign CHU/router/classifier,
+or enable soft-rank.
+
 ## Bootstrap Task 1
 
 Task 1 is intentionally special:

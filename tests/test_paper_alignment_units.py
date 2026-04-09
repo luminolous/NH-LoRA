@@ -19,7 +19,7 @@ from src.models.chu import ConsolidationHomeostasisUnit
 from src.models.lora import NHLoRALayer
 from src.models.losses import feature_retention, growth_penalty, rank_penalty, routing_balance_loss, slot_orthogonality
 from src.models.nh_lora import NHLoRAModel
-from src.models.planner import HorizonPlanner, MaterializedLayerPlan, PlannerSignals, materialize_action
+from src.models.planner import HorizonPlanner, MaterializedLayerPlan, PlannerControlOutputs, PlannerSignals, materialize_action
 from src.utils.logging_utils import configure_logger
 from src.utils.seeding import seed_everything
 
@@ -177,6 +177,7 @@ def _build_test_config(output_root: str):
             "planner_policy_trainable": False,
             "planner_control_trainable": True,
             "planner_use_learned_shared_gate": True,
+            "planner_control_delta_logit_scale": 2.0,
             "planner_soft_rank_training": False,
             "planner_soft_rank_temperature": 0.5,
             "planner_hard_rank_eval": True,
@@ -329,6 +330,50 @@ class PaperAlignmentUnitTests(unittest.TestCase):
 
         self.assertEqual(tuple(policy_outputs.shared_gate.shape), (1, 1))
         self.assertEqual(tuple(control_outputs.shared_gate.shape), (1, 1))
+        self.assertEqual(tuple(control_outputs.delta_raw.shape), (1, 1))
+        self.assertTrue(torch.allclose(control_outputs.delta_raw, torch.zeros_like(control_outputs.delta_raw)))
+
+    def test_hybrid_anchored_gate_stays_on_anchor_at_zero_init_and_moves_monotonically(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "hybrid_anchor_gate_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        config["training"]["planner_mode"] = "hybrid"
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        trainer = NHLoRATrainer(config, configure_logger(level=logging.WARNING), benchmark=benchmark)
+
+        raw_outputs = PlannerControlOutputs(
+            shared_gate=torch.tensor([[0.5]], dtype=torch.float32),
+            shared_gate_logit=torch.zeros(1, 1),
+            delta_raw=torch.zeros(1, 1),
+        )
+        anchored = trainer._compose_hybrid_control_outputs(raw_outputs, anchor_beta=0.7)
+        self.assertAlmostEqual(float(anchored.shared_gate.item()), 0.7, places=6)
+        self.assertAlmostEqual(float(anchored.anchor_beta.item()), 0.7, places=6)
+        self.assertAlmostEqual(float(anchored.delta_logit.item()), 0.0, places=6)
+
+        positive = trainer._compose_hybrid_control_outputs(
+            PlannerControlOutputs(
+                shared_gate=torch.sigmoid(torch.tensor([[1.0]], dtype=torch.float32)),
+                shared_gate_logit=torch.tensor([[1.0]], dtype=torch.float32),
+                delta_raw=torch.tensor([[1.0]], dtype=torch.float32),
+            ),
+            anchor_beta=0.5,
+        )
+        negative = trainer._compose_hybrid_control_outputs(
+            PlannerControlOutputs(
+                shared_gate=torch.sigmoid(torch.tensor([[-1.0]], dtype=torch.float32)),
+                shared_gate_logit=torch.tensor([[-1.0]], dtype=torch.float32),
+                delta_raw=torch.tensor([[-1.0]], dtype=torch.float32),
+            ),
+            anchor_beta=0.5,
+        )
+        self.assertGreater(float(positive.shared_gate.item()), 0.5)
+        self.assertLess(float(negative.shared_gate.item()), 0.5)
+        self.assertLessEqual(
+            float(positive.delta_logit.abs().max().item()),
+            float(config["training"]["planner_control_delta_logit_scale"]) + 1e-6,
+        )
 
     def test_materialize_action_is_pure_and_reuse_shared_is_shared_only(self):
         layer = NHLoRALayer(
@@ -1950,6 +1995,10 @@ class PaperAlignmentUnitTests(unittest.TestCase):
         trainer._log_planner_control_epoch(context)
 
         joined_messages = "\n".join(logger.messages)
+        self.assertIn("[PlannerControlAnchor][Task 2][Epoch 1][Layer 1]", joined_messages)
+        self.assertIn("frac_anchor_gt_099=", joined_messages)
+        self.assertIn("[PlannerControlDelta][Task 2][Epoch 1][Layer 1]", joined_messages)
+        self.assertIn("beta_anchor_gap_mean_abs=", joined_messages)
         self.assertIn("[PlannerControlLogits][Task 2][Epoch 1][Layer 1]", joined_messages)
         self.assertIn("frac_gt_logit099=", joined_messages)
         self.assertIn("[PlannerControlValues][Task 2][Epoch 1][Layer 1]", joined_messages)

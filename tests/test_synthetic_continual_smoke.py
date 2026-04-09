@@ -170,6 +170,7 @@ def build_test_config(output_root: str):
             "planner_policy_trainable": False,
             "planner_control_trainable": True,
             "planner_use_learned_shared_gate": True,
+            "planner_control_delta_logit_scale": 2.0,
             "planner_soft_rank_training": False,
             "planner_soft_rank_temperature": 0.5,
             "planner_hard_rank_eval": True,

@@ -108,6 +108,7 @@ training:
   planner_policy_trainable: false
   planner_control_trainable: true
   planner_use_learned_shared_gate: true
+  planner_control_delta_logit_scale: 2.0
   planner_soft_rank_training: false
   planner_soft_rank_temperature: 0.5
   planner_hard_rank_eval: true

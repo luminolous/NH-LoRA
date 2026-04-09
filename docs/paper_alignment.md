@@ -100,6 +100,21 @@ The design paper is the primary source of truth. When paper detail was ambiguous
   contribution balance, and control-input similarity summaries. These diagnostics
   are observational only and do not tune thresholds, clip beta, add
   regularizers, or change CHU/routing/classifier semantics.
+- Hybrid shared-gate stabilization note: Stage 10 keeps `training.planner_mode=hybrid`
+  opt-in and changes only the learned control-gate parameterization. Instead of
+  learning an unconstrained absolute `beta`, the control branch now predicts a
+  bounded residual in logit space around the policy-side `shared_gate` stored in
+  the applied structural plan:
+  - `anchor_beta = applied_plan["shared_gate"]`
+  - `anchor_logit = logit(clamp(anchor_beta, 1e-4, 1 - 1e-4))`
+  - `delta_logit = planner_control_delta_logit_scale * tanh(delta_raw)`
+  - `effective_logit = anchor_logit + delta_logit`
+  - `effective_beta = sigmoid(effective_logit)`
+  The control output head is zero-initialized so hybrid training begins at the
+  policy anchor. This pass does not alter structural planning, CHU, routing,
+  classifier behavior, or Stage 5 inference-profile semantics. The default
+  `training.planner_control_delta_logit_scale=2.0` is only a first validation
+  hypothesis and is not yet claimed as a final tuned value.
 
 ### CHU
 

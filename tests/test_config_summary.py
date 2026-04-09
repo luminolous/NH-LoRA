@@ -23,6 +23,7 @@ class ConfigAndSummarySmokeTest(unittest.TestCase):
         self.assertFalse(config["training"]["planner_policy_trainable"])
         self.assertTrue(config["training"]["planner_control_trainable"])
         self.assertTrue(config["training"]["planner_use_learned_shared_gate"])
+        self.assertAlmostEqual(config["training"]["planner_control_delta_logit_scale"], 2.0, places=6)
         self.assertFalse(config["training"]["planner_soft_rank_training"])
         self.assertAlmostEqual(config["training"]["planner_soft_rank_temperature"], 0.5, places=6)
         self.assertTrue(config["training"]["planner_hard_rank_eval"])
