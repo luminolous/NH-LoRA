@@ -30,6 +30,10 @@ class PlannerControlOutputs:
     delta_logit: torch.Tensor | None = None
     anchor_beta: torch.Tensor | None = None
     anchor_logit: torch.Tensor | None = None
+    delta_from_representation: torch.Tensor | None = None
+    delta_bias: torch.Tensor | None = None
+    control_head_weight_norm: float | None = None
+    control_head_bias_norm: float | None = None
     history_attention: torch.Tensor | None = None
     history_context: torch.Tensor | None = None
     planner_input: torch.Tensor | None = None
@@ -387,11 +391,23 @@ class PlannerControlBranch(_PlannerBranchBase):
             task_embedding,
             history_summary,
         )
-        shared_gate_logit = outputs[:, 0:1]
+        output_head = self.output_heads[str(block_id)]
+        delta_from_representation = F.linear(planner_representation, output_head.weight, bias=None)
+        if output_head.bias is None:
+            delta_bias = torch.zeros_like(delta_from_representation)
+            bias_norm = 0.0
+        else:
+            delta_bias = output_head.bias.view(1, -1).expand_as(delta_from_representation)
+            bias_norm = float(output_head.bias.detach().norm().item())
+        shared_gate_logit = delta_from_representation + delta_bias
         return PlannerControlOutputs(
             shared_gate=torch.sigmoid(shared_gate_logit),
             shared_gate_logit=shared_gate_logit,
             delta_raw=shared_gate_logit,
+            delta_from_representation=delta_from_representation,
+            delta_bias=delta_bias,
+            control_head_weight_norm=float(output_head.weight.detach().norm().item()),
+            control_head_bias_norm=bias_norm,
             history_attention=history_attention,
             history_context=history_context,
             planner_input=planner_input,

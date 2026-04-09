@@ -115,6 +115,16 @@ The design paper is the primary source of truth. When paper detail was ambiguous
   classifier behavior, or Stage 5 inference-profile semantics. The default
   `training.planner_control_delta_logit_scale=2.0` is only a first validation
   hypothesis and is not yet claimed as a final tuned value.
+- Residual-control audit note: Stage 11 keeps the same `training.planner_audit_logging`
+  flag and adds diagnostics for post-bootstrap residual saturation in hybrid mode.
+  These logs report `delta_raw` percentiles and threshold fractions, tanh-derivative
+  collapse, control-head weight/bias norm and drift from init, bias-vs-activation
+  contributions to `delta_raw`, gradient-chain traces across `delta_raw`,
+  `delta_logit`, and effective logit, cap-usage summaries relative to
+  `planner_control_delta_logit_scale`, and per-layer residual interpretation
+  summaries. These additions are observational only and do not retune thresholds,
+  change bootstrap structural planning, redesign CHU/router/classifier behavior,
+  or enable soft-rank.
 
 ### CHU
 

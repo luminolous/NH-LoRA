@@ -95,6 +95,15 @@ hypothesis for short-window reruns, not a claimed final tuned value. Stage 10
 still does not tune thresholds, add regularizers, redesign CHU/router/classifier,
 or enable soft-rank.
 
+Stage 11 extends the same `training.planner_audit_logging` path with a
+post-bootstrap residual-control audit. These logs keep behavior unchanged while
+reporting `delta_raw` percentile and threshold summaries, tanh-derivative
+collapse, control-head weight/bias norm and drift, bias-vs-activation
+contributions to `delta_raw`, gradient flow through `delta_raw -> delta_logit ->
+effective_logit`, cap-usage summaries around `planner_control_delta_logit_scale`,
+and a per-layer residual interpretation summary that compares anchor gate,
+effective gate, residual cap state, slot availability, and shared-vs-slot ratio.
+
 ## Bootstrap Task 1
 
 Task 1 is intentionally special:

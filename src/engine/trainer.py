@@ -628,6 +628,37 @@ class NHLoRATrainer:
         return float(sum(1 for value in values if float(value) < threshold) / len(values))
 
     @staticmethod
+    def _fraction_abs_above(values: List[float], threshold: float) -> float:
+        if not values:
+            return 0.0
+        return float(sum(1 for value in values if abs(float(value)) > threshold) / len(values))
+
+    @staticmethod
+    def _fraction_within(values: List[float], target: float, atol: float) -> float:
+        if not values:
+            return 0.0
+        return float(sum(1 for value in values if abs(float(value) - target) <= atol) / len(values))
+
+    @staticmethod
+    def _mean_abs_gap_to_target(values: List[float], target: float) -> float:
+        if not values:
+            return 0.0
+        return float(sum(abs(float(value) - target) for value in values) / len(values))
+
+    @staticmethod
+    def _paired_series_correlation(left: List[float], right: List[float]) -> float:
+        if len(left) <= 1 or len(left) != len(right):
+            return 0.0
+        left_tensor = torch.tensor(left, dtype=torch.float32)
+        right_tensor = torch.tensor(right, dtype=torch.float32)
+        left_centered = left_tensor - left_tensor.mean()
+        right_centered = right_tensor - right_tensor.mean()
+        denominator = float(left_centered.norm().item() * right_centered.norm().item())
+        if denominator <= 1e-12:
+            return 0.0
+        return float(torch.dot(left_centered, right_centered).item() / denominator)
+
+    @staticmethod
     def _pairwise_cosine_summary(vectors: Dict[int, torch.Tensor]) -> Dict[str, float]:
         if len(vectors) <= 1:
             return {"count": 0.0, "mean": 0.0, "min": 0.0, "max": 0.0}
@@ -759,14 +790,32 @@ class NHLoRATrainer:
                 "anchor_logit_values": [],
                 "delta_raw_values": [],
                 "delta_logit_values": [],
+                "delta_tanh_derivative_values": [],
                 "beta_gap_abs": [],
                 "logit_gap_abs": [],
+                "delta_from_representation_values": [],
+                "delta_from_representation_abs_values": [],
+                "delta_bias_values": [],
+                "delta_bias_abs_values": [],
+                "delta_bias_share_values": [],
+                "head_weight_norms": [],
+                "head_bias_norms": [],
+                "head_weight_drift_from_init": [],
+                "head_bias_drift_from_init": [],
                 "beta_grad_abs": [],
                 "logit_grad_abs": [],
+                "delta_raw_grad_abs": [],
+                "delta_logit_grad_abs": [],
                 "beta_grad_present_batches": 0,
                 "beta_grad_nonzero_batches": 0,
                 "logit_grad_present_batches": 0,
                 "logit_grad_nonzero_batches": 0,
+                "delta_raw_grad_present_batches": 0,
+                "delta_raw_grad_nonzero_batches": 0,
+                "delta_logit_grad_present_batches": 0,
+                "delta_logit_grad_nonzero_batches": 0,
+                "bridge_grad_lost_batches": 0,
+                "loss_output_zero_batches": 0,
                 "input_norms": [],
                 "input_vars": [],
                 "representation_norms": [],
@@ -805,11 +854,34 @@ class NHLoRATrainer:
             delta_logit=delta_logit,
             anchor_beta=anchor_beta_tensor,
             anchor_logit=anchor_logit,
+            delta_from_representation=raw_outputs.delta_from_representation,
+            delta_bias=raw_outputs.delta_bias,
+            control_head_weight_norm=raw_outputs.control_head_weight_norm,
+            control_head_bias_norm=raw_outputs.control_head_bias_norm,
             history_attention=raw_outputs.history_attention,
             history_context=raw_outputs.history_context,
             planner_input=raw_outputs.planner_input,
             planner_representation=raw_outputs.planner_representation,
         )
+
+    def _planner_control_head_summary(self, block_id: int) -> Dict[str, float]:
+        output_head = self.planner.control_branch.output_heads[str(int(block_id))]
+        weight = output_head.weight.detach().cpu()
+        bias = None if output_head.bias is None else output_head.bias.detach().cpu()
+        init_weight = self._planner_control_init_snapshot.get(f"output_heads.{int(block_id)}.weight")
+        init_bias = self._planner_control_init_snapshot.get(f"output_heads.{int(block_id)}.bias")
+        weight_drift = 0.0
+        bias_drift = 0.0
+        if init_weight is not None:
+            weight_drift = float((weight - init_weight).norm().item())
+        if bias is not None and init_bias is not None:
+            bias_drift = float((bias - init_bias).norm().item())
+        return {
+            "weight_norm": float(weight.norm().item()),
+            "bias_norm": 0.0 if bias is None else float(bias.norm().item()),
+            "weight_l2_from_init": weight_drift,
+            "bias_l2_from_init": bias_drift,
+        }
 
     def _capture_planner_control_task_start(
         self,
@@ -836,6 +908,10 @@ class NHLoRATrainer:
                     "logit": float(outputs.shared_gate_logit.detach().mean().item()),
                     "anchor_beta": float(outputs.anchor_beta.detach().mean().item()),
                     "anchor_logit": float(outputs.anchor_logit.detach().mean().item()),
+                    "delta_raw": float(outputs.delta_raw.detach().mean().item()),
+                    "delta_logit": 0.0
+                    if outputs.delta_logit is None
+                    else float(outputs.delta_logit.detach().mean().item()),
                     "planner_input": outputs.planner_input.detach().float().cpu() if outputs.planner_input is not None else None,
                     "planner_representation": outputs.planner_representation.detach().float().cpu()
                     if outputs.planner_representation is not None
@@ -1429,8 +1505,33 @@ class NHLoRATrainer:
                     float((outputs.shared_gate_logit.detach() - outputs.anchor_logit.detach()).abs().mean().item())
                 )
             layer_stats["delta_raw_values"].append(float(outputs.delta_raw.detach().mean().item()))
+            layer_stats["delta_tanh_derivative_values"].append(
+                float((1.0 - torch.tanh(outputs.delta_raw.detach()).pow(2)).mean().item())
+            )
             if outputs.delta_logit is not None:
                 layer_stats["delta_logit_values"].append(float(outputs.delta_logit.detach().mean().item()))
+            if outputs.delta_from_representation is not None:
+                delta_from_representation = outputs.delta_from_representation.detach()
+                layer_stats["delta_from_representation_values"].append(float(delta_from_representation.mean().item()))
+                layer_stats["delta_from_representation_abs_values"].append(
+                    float(delta_from_representation.abs().mean().item())
+                )
+            if outputs.delta_bias is not None:
+                delta_bias = outputs.delta_bias.detach()
+                bias_abs_mean = float(delta_bias.abs().mean().item())
+                activation_abs_mean = 0.0
+                if outputs.delta_from_representation is not None:
+                    activation_abs_mean = float(outputs.delta_from_representation.detach().abs().mean().item())
+                layer_stats["delta_bias_values"].append(float(delta_bias.mean().item()))
+                layer_stats["delta_bias_abs_values"].append(bias_abs_mean)
+                layer_stats["delta_bias_share_values"].append(
+                    bias_abs_mean / max(bias_abs_mean + activation_abs_mean, 1e-12)
+                )
+            head_summary = self._planner_control_head_summary(int(block_id))
+            layer_stats["head_weight_norms"].append(float(head_summary["weight_norm"]))
+            layer_stats["head_bias_norms"].append(float(head_summary["bias_norm"]))
+            layer_stats["head_weight_drift_from_init"].append(float(head_summary["weight_l2_from_init"]))
+            layer_stats["head_bias_drift_from_init"].append(float(head_summary["bias_l2_from_init"]))
             if outputs.planner_input is not None:
                 planner_input = outputs.planner_input.detach().float().reshape(-1).cpu()
                 layer_stats["input_norms"].append(float(planner_input.norm().item()))
@@ -1480,6 +1581,22 @@ class NHLoRATrainer:
             layer_stats["logit_grad_abs"].append(logit_grad_abs)
             layer_stats["logit_grad_present_batches"] += int(logit_grad is not None)
             layer_stats["logit_grad_nonzero_batches"] += int(logit_grad_abs > grad_zero_epsilon)
+            delta_raw_grad = outputs.delta_raw.grad
+            delta_raw_grad_abs = 0.0 if delta_raw_grad is None else abs(float(delta_raw_grad.detach().mean().item()))
+            layer_stats["delta_raw_grad_abs"].append(delta_raw_grad_abs)
+            layer_stats["delta_raw_grad_present_batches"] += int(delta_raw_grad is not None)
+            layer_stats["delta_raw_grad_nonzero_batches"] += int(delta_raw_grad_abs > grad_zero_epsilon)
+            delta_logit_grad = None if outputs.delta_logit is None else outputs.delta_logit.grad
+            delta_logit_grad_abs = (
+                0.0 if delta_logit_grad is None else abs(float(delta_logit_grad.detach().mean().item()))
+            )
+            layer_stats["delta_logit_grad_abs"].append(delta_logit_grad_abs)
+            layer_stats["delta_logit_grad_present_batches"] += int(delta_logit_grad is not None)
+            layer_stats["delta_logit_grad_nonzero_batches"] += int(delta_logit_grad_abs > grad_zero_epsilon)
+            layer_stats["bridge_grad_lost_batches"] += int(
+                delta_logit_grad_abs > grad_zero_epsilon and delta_raw_grad_abs <= grad_zero_epsilon
+            )
+            layer_stats["loss_output_zero_batches"] += int(logit_grad_abs <= grad_zero_epsilon)
 
     def _record_planner_control_optimizer_step(self, context: Dict[str, Any]) -> None:
         if not self._hybrid_planner_enabled():
@@ -1588,15 +1705,50 @@ class NHLoRATrainer:
             anchor_logit_summary = self._scalar_series_summary(layer_stats.get("anchor_logit_values", []))
             delta_raw_summary = self._scalar_series_summary(layer_stats.get("delta_raw_values", []))
             delta_logit_summary = self._scalar_series_summary(layer_stats.get("delta_logit_values", []))
+            delta_tanh_derivative_summary = self._scalar_series_summary(layer_stats.get("delta_tanh_derivative_values", []))
             beta_gap_summary = self._scalar_series_summary(layer_stats.get("beta_gap_abs", []))
             logit_gap_summary = self._scalar_series_summary(layer_stats.get("logit_gap_abs", []))
             beta_grad_summary = self._scalar_series_summary(layer_stats.get("beta_grad_abs", []))
             logit_grad_summary = self._scalar_series_summary(layer_stats.get("logit_grad_abs", []))
+            delta_raw_grad_summary = self._scalar_series_summary(layer_stats.get("delta_raw_grad_abs", []))
+            delta_logit_grad_summary = self._scalar_series_summary(layer_stats.get("delta_logit_grad_abs", []))
+            head_weight_norm_summary = self._scalar_series_summary(layer_stats.get("head_weight_norms", []))
+            head_bias_norm_summary = self._scalar_series_summary(layer_stats.get("head_bias_norms", []))
+            head_weight_drift_summary = self._scalar_series_summary(layer_stats.get("head_weight_drift_from_init", []))
+            head_bias_drift_summary = self._scalar_series_summary(layer_stats.get("head_bias_drift_from_init", []))
+            delta_from_representation_summary = self._scalar_series_summary(
+                layer_stats.get("delta_from_representation_values", [])
+            )
+            delta_from_representation_abs_summary = self._scalar_series_summary(
+                layer_stats.get("delta_from_representation_abs_values", [])
+            )
+            delta_bias_summary = self._scalar_series_summary(layer_stats.get("delta_bias_values", []))
+            delta_bias_abs_summary = self._scalar_series_summary(layer_stats.get("delta_bias_abs_values", []))
+            delta_bias_share_summary = self._scalar_series_summary(layer_stats.get("delta_bias_share_values", []))
             task_start_stats = task_start.get(int(block_id), {})
             task_start_beta = float(task_start_stats.get("beta", 0.0))
             task_start_logit = float(task_start_stats.get("logit", 0.0))
             task_start_anchor_beta = float(task_start_stats.get("anchor_beta", 0.0))
             task_start_anchor_logit = float(task_start_stats.get("anchor_logit", 0.0))
+            task_start_delta_raw = float(task_start_stats.get("delta_raw", 0.0))
+            task_start_delta_logit = float(task_start_stats.get("delta_logit", 0.0))
+            delta_abs_values = [abs(float(value)) for value in layer_stats.get("delta_logit_values", [])]
+            delta_scale = self._planner_control_delta_logit_scale()
+            delta_cap_atol = 1e-3
+            frac_near_pos_cap = self._fraction_within(layer_stats.get("delta_logit_values", []), delta_scale, delta_cap_atol)
+            frac_near_neg_cap = self._fraction_within(layer_stats.get("delta_logit_values", []), -delta_scale, delta_cap_atol)
+            frac_near_any_cap = self._fraction_within(delta_abs_values, delta_scale, delta_cap_atol)
+            mean_abs_gap_to_cap = self._mean_abs_gap_to_target(delta_abs_values, delta_scale)
+            if frac_near_any_cap >= 0.95:
+                cap_state = "hard_pinned"
+            elif abs(float(delta_logit_summary["mean"])) >= 0.75 * delta_scale:
+                cap_state = "high_but_movable"
+            else:
+                cap_state = "bounded_active"
+            delta_representation_correlation = self._paired_series_correlation(
+                layer_stats.get("representation_norms", []),
+                [abs(float(value)) for value in layer_stats.get("delta_raw_values", [])],
+            )
             self.logger.info(
                 "[PlannerControlAnchor][Task %d][Epoch %d][Layer %d] anchor_beta_mean=%.4f anchor_beta_min=%.4f anchor_beta_max=%.4f frac_anchor_gt_099=%.4f frac_anchor_gt_0999=%.4f anchor_logit_mean=%.4e anchor_logit_p90=%.4e anchor_logit_p99=%.4e task_start_anchor_beta=%.4f task_start_anchor_logit=%.4e",
                 context["task_number"],
@@ -1626,6 +1778,28 @@ class NHLoRATrainer:
                 float(delta_logit_summary["max"]),
                 float(beta_gap_summary["mean"]),
                 float(logit_gap_summary["mean"]),
+            )
+            self.logger.info(
+                "[PlannerResidualRaw][Task %d][Epoch %d][Layer %d] delta_raw_mean=%.4e delta_raw_min=%.4e delta_raw_max=%.4e delta_raw_p50=%.4e delta_raw_p90=%.4e delta_raw_p99=%.4e frac_abs_gt_2=%.4f frac_abs_gt_4=%.4f frac_abs_gt_6=%.4f tanh_derivative_mean=%.4e tanh_derivative_min=%.4e tanh_derivative_max=%.4e epoch_delta_raw_drift=%.4e task_delta_raw_drift=%.4e task_start_delta_raw=%.4e task_start_delta_logit=%.4e",
+                context["task_number"],
+                int(context["current_epoch"]),
+                int(block_id),
+                float(delta_raw_summary["mean"]),
+                float(delta_raw_summary["min"]),
+                float(delta_raw_summary["max"]),
+                float(delta_raw_summary["p50"]),
+                float(delta_raw_summary["p90"]),
+                float(delta_raw_summary["p99"]),
+                self._fraction_abs_above(layer_stats.get("delta_raw_values", []), 2.0),
+                self._fraction_abs_above(layer_stats.get("delta_raw_values", []), 4.0),
+                self._fraction_abs_above(layer_stats.get("delta_raw_values", []), 6.0),
+                float(delta_tanh_derivative_summary["mean"]),
+                float(delta_tanh_derivative_summary["min"]),
+                float(delta_tanh_derivative_summary["max"]),
+                float(delta_raw_summary["last"]) - float(delta_raw_summary["first"]),
+                float(delta_raw_summary["mean"]) - task_start_delta_raw,
+                task_start_delta_raw,
+                task_start_delta_logit,
             )
             self.logger.info(
                 "[PlannerControlLogits][Task %d][Epoch %d][Layer %d] logit_mean=%.4e logit_min=%.4e logit_max=%.4e logit_p50=%.4e logit_p90=%.4e logit_p99=%.4e frac_gt_0=%.4f frac_gt_2=%.4f frac_gt_logit099=%.4f frac_gt_logit0999=%.4f epoch_logit_drift=%.4e task_logit_drift=%.4e task_start_logit=%.4e",
@@ -1684,6 +1858,26 @@ class NHLoRATrainer:
                 max(int(logit_summary["count"]), 1),
                 self._fraction_below(layer_stats.get("logit_grad_abs", []), 1e-12),
             )
+            self.logger.info(
+                "[PlannerResidualGradients][Task %d][Epoch %d][Layer %d] delta_raw_grad_mean=%.4e delta_raw_grad_max=%.4e delta_raw_grad_present_batches=%d/%d delta_raw_grad_nonzero_batches=%d/%d delta_logit_grad_mean=%.4e delta_logit_grad_max=%.4e delta_logit_grad_present_batches=%d/%d delta_logit_grad_nonzero_batches=%d/%d bridge_grad_lost_fraction=%.4f loss_output_zero_fraction=%.4f",
+                context["task_number"],
+                int(context["current_epoch"]),
+                int(block_id),
+                float(delta_raw_grad_summary["mean"]),
+                float(delta_raw_grad_summary["max"]),
+                int(layer_stats.get("delta_raw_grad_present_batches", 0)),
+                max(int(delta_raw_grad_summary["count"]), 1),
+                int(layer_stats.get("delta_raw_grad_nonzero_batches", 0)),
+                max(int(delta_raw_grad_summary["count"]), 1),
+                float(delta_logit_grad_summary["mean"]),
+                float(delta_logit_grad_summary["max"]),
+                int(layer_stats.get("delta_logit_grad_present_batches", 0)),
+                max(int(delta_logit_grad_summary["count"]), 1),
+                int(layer_stats.get("delta_logit_grad_nonzero_batches", 0)),
+                max(int(delta_logit_grad_summary["count"]), 1),
+                float(layer_stats.get("bridge_grad_lost_batches", 0)) / max(int(delta_raw_grad_summary["count"]), 1),
+                float(layer_stats.get("loss_output_zero_batches", 0)) / max(int(logit_summary["count"]), 1),
+            )
             input_norm_summary = self._scalar_series_summary(layer_stats.get("input_norms", []))
             input_var_summary = self._scalar_series_summary(layer_stats.get("input_vars", []))
             representation_norm_summary = self._scalar_series_summary(layer_stats.get("representation_norms", []))
@@ -1714,6 +1908,22 @@ class NHLoRATrainer:
                 float(representation_var_summary["mean"]),
                 latest_input_similarity_to_task_start,
             )
+            self.logger.info(
+                "[PlannerControlHead][Task %d][Epoch %d][Layer %d] head_weight_norm_mean=%.4e head_bias_norm_mean=%.4e head_weight_l2_from_init_mean=%.4e head_bias_l2_from_init_mean=%.4e delta_from_representation_mean=%.4e delta_from_representation_abs_mean=%.4e delta_bias_mean=%.4e delta_bias_abs_mean=%.4e delta_bias_share_mean=%.4f delta_abs_vs_representation_norm_corr=%.4f",
+                context["task_number"],
+                int(context["current_epoch"]),
+                int(block_id),
+                float(head_weight_norm_summary["mean"]),
+                float(head_bias_norm_summary["mean"]),
+                float(head_weight_drift_summary["mean"]),
+                float(head_bias_drift_summary["mean"]),
+                float(delta_from_representation_summary["mean"]),
+                float(delta_from_representation_abs_summary["mean"]),
+                float(delta_bias_summary["mean"]),
+                float(delta_bias_abs_summary["mean"]),
+                float(delta_bias_share_summary["mean"]),
+                delta_representation_correlation,
+            )
             contribution_stats = contribution_accumulator.get(int(block_id), {})
             shared_pre_count = max(int(contribution_stats.get("shared_pre_beta_norm_count", 0)), 1)
             shared_post_count = max(int(contribution_stats.get("shared_post_beta_norm_count", 0)), 1)
@@ -1737,6 +1947,31 @@ class NHLoRATrainer:
                 float(contribution_stats.get("slot_zero_contribution_calls", 0)) / structural_calls,
                 float(contribution_stats.get("beta_gt_099_with_structural_slot_calls", 0)) / structural_calls,
                 float(contribution_stats.get("beta_gt_0999_with_structural_slot_calls", 0)) / structural_calls,
+            )
+            self.logger.info(
+                "[PlannerResidualCap][Task %d][Epoch %d][Layer %d] delta_scale=%.4f frac_near_pos_cap=%.4f frac_near_neg_cap=%.4f frac_near_any_cap=%.4f mean_abs_gap_to_cap=%.4e cap_state=%s",
+                context["task_number"],
+                int(context["current_epoch"]),
+                int(block_id),
+                delta_scale,
+                frac_near_pos_cap,
+                frac_near_neg_cap,
+                frac_near_any_cap,
+                mean_abs_gap_to_cap,
+                cap_state,
+            )
+            self.logger.info(
+                "[PlannerResidualSummary][Task %d][Epoch %d][Layer %d] anchor_beta_mean=%.4f effective_beta_mean=%.4f delta_logit_mean=%.4e cap_state=%s slot_structurally_available_fraction=%.4f shared_to_slot_ratio=%.4e layer6_focus=%s",
+                context["task_number"],
+                int(context["current_epoch"]),
+                int(block_id),
+                float(anchor_beta_summary["mean"]),
+                float(beta_summary["mean"]),
+                float(delta_logit_summary["mean"]),
+                cap_state,
+                float(contribution_stats.get("slot_structurally_available_calls", 0)) / max(slot_count, 1),
+                shared_to_slot_ratio,
+                "yes" if int(block_id) == 6 else "no",
             )
 
     def _log_planner_parameter_drift(self, context: Dict[str, Any]) -> None:
@@ -1990,6 +2225,10 @@ class NHLoRATrainer:
                     control_outputs.shared_gate.retain_grad()
                 if control_outputs.shared_gate_logit.requires_grad:
                     control_outputs.shared_gate_logit.retain_grad()
+                if control_outputs.delta_raw.requires_grad:
+                    control_outputs.delta_raw.retain_grad()
+                if control_outputs.delta_logit is not None and control_outputs.delta_logit.requires_grad:
+                    control_outputs.delta_logit.retain_grad()
             control_outputs_by_block[int(block_id)] = control_outputs
             if self._planner_use_learned_shared_gate():
                 layer_cfg["shared_gate"] = control_outputs.shared_gate

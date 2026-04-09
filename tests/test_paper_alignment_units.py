@@ -331,7 +331,15 @@ class PaperAlignmentUnitTests(unittest.TestCase):
         self.assertEqual(tuple(policy_outputs.shared_gate.shape), (1, 1))
         self.assertEqual(tuple(control_outputs.shared_gate.shape), (1, 1))
         self.assertEqual(tuple(control_outputs.delta_raw.shape), (1, 1))
+        self.assertEqual(tuple(control_outputs.delta_from_representation.shape), (1, 1))
+        self.assertEqual(tuple(control_outputs.delta_bias.shape), (1, 1))
         self.assertTrue(torch.allclose(control_outputs.delta_raw, torch.zeros_like(control_outputs.delta_raw)))
+        self.assertTrue(
+            torch.allclose(control_outputs.delta_from_representation, torch.zeros_like(control_outputs.delta_from_representation))
+        )
+        self.assertTrue(torch.allclose(control_outputs.delta_bias, torch.zeros_like(control_outputs.delta_bias)))
+        self.assertGreaterEqual(float(control_outputs.control_head_weight_norm), 0.0)
+        self.assertAlmostEqual(float(control_outputs.control_head_bias_norm), 0.0, places=6)
 
     def test_hybrid_anchored_gate_stays_on_anchor_at_zero_init_and_moves_monotonically(self):
         repo_root = Path(__file__).resolve().parents[1]
@@ -1916,6 +1924,13 @@ class PaperAlignmentUnitTests(unittest.TestCase):
         self.assertAlmostEqual(NHLoRATrainer._fraction_above(values, 2.0), 2 / 5, places=6)
         self.assertAlmostEqual(NHLoRATrainer._fraction_above(values, 4.59511985013459), 2 / 5, places=6)
         self.assertAlmostEqual(NHLoRATrainer._fraction_below(values, 0.2), 1 / 5, places=6)
+        self.assertAlmostEqual(NHLoRATrainer._fraction_abs_above([-1.0, 0.5, 4.5], 2.0), 1 / 3, places=6)
+        self.assertAlmostEqual(NHLoRATrainer._fraction_within([1.9, 2.0, 2.2], 2.0, 0.11), 2 / 3, places=6)
+        self.assertAlmostEqual(NHLoRATrainer._mean_abs_gap_to_target([1.5, 2.0, 2.5], 2.0), 1 / 3, places=6)
+        self.assertGreater(
+            NHLoRATrainer._paired_series_correlation([1.0, 2.0, 3.0], [2.0, 4.0, 6.0]),
+            0.99,
+        )
 
     def test_planner_control_contribution_debug_records_shared_and_slot_activity(self):
         layer = NHLoRALayer(
@@ -1999,12 +2014,21 @@ class PaperAlignmentUnitTests(unittest.TestCase):
         self.assertIn("frac_anchor_gt_099=", joined_messages)
         self.assertIn("[PlannerControlDelta][Task 2][Epoch 1][Layer 1]", joined_messages)
         self.assertIn("beta_anchor_gap_mean_abs=", joined_messages)
+        self.assertIn("[PlannerResidualRaw][Task 2][Epoch 1][Layer 1]", joined_messages)
+        self.assertIn("frac_abs_gt_6=", joined_messages)
         self.assertIn("[PlannerControlLogits][Task 2][Epoch 1][Layer 1]", joined_messages)
         self.assertIn("frac_gt_logit099=", joined_messages)
         self.assertIn("[PlannerControlValues][Task 2][Epoch 1][Layer 1]", joined_messages)
         self.assertIn("frac_gt_099=", joined_messages)
         self.assertIn("[PlannerControlGradients][Task 2][Epoch 1][Layer 1]", joined_messages)
         self.assertIn("logit_grad_effectively_zero_fraction=", joined_messages)
+        self.assertIn("[PlannerResidualGradients][Task 2][Epoch 1][Layer 1]", joined_messages)
+        self.assertIn("bridge_grad_lost_fraction=", joined_messages)
+        self.assertIn("[PlannerControlHead][Task 2][Epoch 1][Layer 1]", joined_messages)
+        self.assertIn("delta_bias_share_mean=", joined_messages)
+        self.assertIn("[PlannerResidualCap][Task 2][Epoch 1][Layer 1]", joined_messages)
+        self.assertIn("cap_state=", joined_messages)
+        self.assertIn("[PlannerResidualSummary][Task 2][Epoch 1][Layer 1]", joined_messages)
         self.assertIn("[PlannerContribution][Task 2][Epoch 1][Layer 1]", joined_messages)
         self.assertIn("[PlannerControlInputs][Task 2][Epoch 1][Layer 1]", joined_messages)
         self.assertIn("[PlannerControlInputCompare][Task 2][Epoch 1]", joined_messages)
