@@ -129,7 +129,7 @@ Dengan:
 
 Repo harus mendukung benchmark berikut:
 - CIFAR-100
-- CUB-200-2011
+- ImageNet-A
 - ImageNet-R
 - OmniBenchmark
 

@@ -153,6 +153,17 @@ The design paper is the primary source of truth. When paper detail was ambiguous
   `requested -> materialized -> applied -> fallback -> post_outcome` traces.
   They are observational only and do not change thresholds, CHU behavior,
   router behavior, classifier behavior, residual gating, or soft-rank status.
+- Benchmark transition note: Stage 15 keeps NH-LoRA method semantics unchanged
+  while updating the benchmark surface. The repository now adds native
+  `imagenet_a` support through the same continual ImageFolder contract used by
+  `imagenet_r`, removes the `cub200` adapter from the public registry/config
+  surface, and adds explicit probe configs for:
+  - `imagenet_r_hybrid`
+  - `imagenet_a_hybrid`
+  - `cifar100_hybrid_all_layers`
+  These changes are for benchmark wiring, portability gating, and config
+  separation only; they do not retune thresholds, alter planner behavior,
+  redesign CHU/router/classifier behavior, or change residual-gate semantics.
 
 ### CHU
 

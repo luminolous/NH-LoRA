@@ -4,6 +4,7 @@ import json
 import unittest
 from pathlib import Path
 
+from src.datasets.registry import DATASET_REGISTRY
 from src.utils.config import load_config
 from src.utils.metrics import write_summary
 
@@ -65,6 +66,27 @@ class ConfigAndSummarySmokeTest(unittest.TestCase):
         self.assertNotIn("seed_mean", payload)
         self.assertNotIn("seed_wall_time_total_mean", payload)
         self.assertNotIn("kept_slots_mean", payload)
+
+    def test_stage15_benchmark_transition_configs_and_registry(self):
+        repo_root = Path(__file__).resolve().parents[1]
+
+        imagenet_a_config = load_config(repo_root / "configs" / "imagenet_a.yaml")
+        self.assertEqual(imagenet_a_config["benchmark"]["dataset_name"], "imagenet_a")
+        self.assertEqual(imagenet_a_config["benchmark"]["classes_per_task"], 20)
+
+        imagenet_r_hybrid_config = load_config(repo_root / "configs" / "imagenet_r_hybrid.yaml")
+        self.assertEqual(imagenet_r_hybrid_config["training"]["planner_mode"], "hybrid")
+        self.assertTrue(imagenet_r_hybrid_config["training"]["planner_audit_logging"])
+
+        all_layers_probe = load_config(repo_root / "configs" / "cifar100_hybrid_all_layers.yaml")
+        self.assertEqual(all_layers_probe["model"]["selected_blocks"], list(range(12)))
+        baseline = load_config(repo_root / "configs" / "cifar100_hybrid.yaml")
+        self.assertEqual(baseline["model"]["selected_blocks"], [6, 7, 8, 9, 10, 11])
+
+        self.assertIn("imagenet_a", DATASET_REGISTRY)
+        self.assertNotIn("cub200", DATASET_REGISTRY)
+        self.assertFalse((repo_root / "configs" / "cub200.yaml").exists())
+        self.assertFalse((repo_root / "scripts" / "run_cub200.sh").exists())
 
 
 if __name__ == "__main__":

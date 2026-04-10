@@ -156,9 +156,14 @@ If the last structural action for a layer is `reuse_shared` or `freeze_old_stron
 
 ## Benchmarks
 
+Current final evaluation target set:
+
 - CIFAR-100
-- CUB-200-2011
+- ImageNet-A
 - ImageNet-R
+
+Legacy optional adapter retained in the repo:
+
 - OmniBenchmark
 
 Dataset adapters are unified at the engine boundary but remain benchmark-specific internally where the benchmark requires it.
@@ -178,8 +183,13 @@ Set dataset paths in the benchmark YAML files, then run:
 
 ```bash
 bash scripts/run_cifar100.sh
-bash scripts/run_cub200.sh
+bash scripts/run_imagenet_a.sh
 bash scripts/run_imagenet_r.sh
+```
+
+Optional legacy benchmark:
+
+```bash
 bash scripts/run_omnibenchmark.sh
 ```
 

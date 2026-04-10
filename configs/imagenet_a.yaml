@@ -1,12 +1,12 @@
 _base_: base.yaml
 
 benchmark:
-  name: cub200
-  dataset_name: cub200
-  data_root: /path/to/datasets/CUB_200_2011
+  name: imagenet_a
+  dataset_name: imagenet_a
+  data_root: /path/to/datasets/imagenet-a
   scenario: class_incremental
-  num_tasks: 20
-  classes_per_task: 10
+  num_tasks: 10
+  classes_per_task: 20
   image_size: 224
 
 training:
@@ -21,4 +21,4 @@ warmup:
   num_batches: 5
 
 output:
-  benchmark_subdir: cub200
+  benchmark_subdir: imagenet_a

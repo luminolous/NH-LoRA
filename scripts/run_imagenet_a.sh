@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CONFIG="configs/cub200.yaml"
-BENCHMARK="cub200"
+CONFIG="configs/imagenet_a.yaml"
+BENCHMARK="imagenet_a"
 SEEDS=(1 2 3 4 5)
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 

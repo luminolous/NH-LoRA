@@ -9,10 +9,12 @@ from unittest.mock import patch
 
 import numpy as np
 import torch
+from PIL import Image
 from torch import nn
 from torch.nn import functional as F
 
 from src.datasets.base import ContinualBenchmark, SampleRecord, TaskDefinition
+from src.datasets.registry import build_benchmark
 from src.datasets.transforms import build_cifar_test_transform
 from src.engine.trainer import NHLoRATrainer
 from src.models.chu import ConsolidationHomeostasisUnit
@@ -73,6 +75,19 @@ def _build_tiny_benchmark(num_tasks: int = 1):
         train_transform=transform,
         test_transform=transform,
     )
+
+
+def _write_imagefolder_dataset(root: Path, split_to_classes: dict[str, list[str]], samples_per_class: int = 2):
+    for split, class_names in split_to_classes.items():
+        for class_idx, class_name in enumerate(class_names):
+            class_dir = root / split / class_name
+            class_dir.mkdir(parents=True, exist_ok=True)
+            for sample_id in range(samples_per_class):
+                image = np.zeros((32, 32, 3), dtype=np.uint8)
+                image[..., 0] = (class_idx * 53 + sample_id * 7) % 255
+                image[..., 1] = (class_idx * 31 + sample_id * 11) % 255
+                image[..., 2] = (class_idx * 17 + sample_id * 13) % 255
+                Image.fromarray(image).save(class_dir / f"{split}_{sample_id}.png")
 
 
 def _build_test_config(output_root: str):
@@ -446,6 +461,44 @@ class PaperAlignmentUnitTests(unittest.TestCase):
         delta_from_representation = F.linear(normalized, output_head.weight, bias=None)
         delta_from_scaled_representation = F.linear(normalized_scaled, output_head.weight, bias=None)
         self.assertTrue(torch.allclose(delta_from_representation, delta_from_scaled_representation, atol=1e-6))
+
+    def test_stage15_imagenet_a_builder_matches_imagefolder_contract_and_cub_is_removed(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "stage15_imagenet_a_builder_unit"
+        dataset_root = workspace_tmp / "imagenet_a_fixture"
+        _write_imagefolder_dataset(
+            dataset_root,
+            {
+                "train": ["ant", "bear", "cat", "dog"],
+                "test": ["ant", "bear", "cat", "dog"],
+            },
+            samples_per_class=2,
+        )
+
+        config = {
+            "benchmark": {
+                "dataset_name": "imagenet_a",
+                "data_root": str(dataset_root),
+                "num_tasks": 2,
+                "classes_per_task": 2,
+                "image_size": 224,
+            }
+        }
+        benchmark = build_benchmark(config)
+
+        self.assertEqual(benchmark.name, "imagenet_a")
+        self.assertEqual(benchmark.num_classes, 4)
+        self.assertEqual(len(benchmark.tasks), 2)
+        self.assertEqual(benchmark.tasks[0].class_ids, [0, 1])
+        self.assertEqual(benchmark.tasks[1].class_ids, [2, 3])
+        self.assertTrue(all(record.path for record in benchmark.tasks[0].train_records))
+        self.assertEqual(len(benchmark.tasks[0].train_records), 4)
+        self.assertEqual(len(benchmark.tasks[1].test_records), 4)
+        self.assertEqual(benchmark.tasks[0].metadata["benchmark"], "imagenet_a")
+        self.assertIn("class_to_idx", benchmark.tasks[0].metadata)
+
+        with self.assertRaises(KeyError):
+            build_benchmark({"benchmark": {"dataset_name": "cub200"}})
 
     def test_softsign_bounded_residual_keeps_gradient_on_large_delta_raw(self):
         repo_root = Path(__file__).resolve().parents[1]
