@@ -128,8 +128,14 @@ class NHLoRATrainer:
         self._planner_action_history: Dict[int, List[Dict[str, Any]]] = {
             int(block_id): [] for block_id in self.model.selected_blocks
         }
+        self._planner_policy_record_history: Dict[int, List[Dict[str, Any]]] = {
+            int(block_id): [] for block_id in self.model.selected_blocks
+        }
         self._planner_growth_history: List[Dict[str, Any]] = []
         self._planner_layer_structure_history: Dict[int, List[Dict[str, Any]]] = {
+            int(block_id): [] for block_id in self.model.selected_blocks
+        }
+        self._planner_realization_history: Dict[int, List[Dict[str, Any]]] = {
             int(block_id): [] for block_id in self.model.selected_blocks
         }
 
@@ -950,6 +956,305 @@ class NHLoRATrainer:
             return "open_new_slot"
         return "freeze_old_strong_retention"
 
+    @staticmethod
+    def _policy_output_index(name: str) -> int:
+        indices = {
+            "novelty": 0,
+            "conflict": 1,
+            "rank": 2,
+            "consolidate": 3,
+            "shared_gate": 4,
+        }
+        return int(indices[name])
+
+    @staticmethod
+    def _policy_tensor_scalar(tensor: torch.Tensor | None, index: int) -> float:
+        if tensor is None or not isinstance(tensor, torch.Tensor) or tensor.numel() == 0:
+            return 0.0
+        detached = tensor.detach().float()
+        if detached.dim() == 1:
+            if index >= detached.numel():
+                return 0.0
+            return float(detached[index].item())
+        if detached.size(-1) <= index:
+            return 0.0
+        return float(detached[..., index].mean().item())
+
+    @staticmethod
+    def _component_bias_share(activation_value: float, bias_value: float) -> float:
+        total = abs(float(activation_value)) + abs(float(bias_value))
+        if total <= 1e-12:
+            return 0.0
+        return float(abs(float(bias_value)) / total)
+
+    @staticmethod
+    def _requested_growth(action: object) -> bool:
+        return str(action) in {"open_new_slot", "expand_rank_existing_slot"}
+
+    @staticmethod
+    def _threshold_proximity_flags(
+        novelty_margin: float,
+        conflict_margin: float,
+        *,
+        near_eps: float = 0.05,
+    ) -> Dict[str, bool]:
+        return {
+            "near_novelty_miss": bool(-near_eps <= novelty_margin < 0.0),
+            "near_conflict_miss": bool(-near_eps <= conflict_margin < 0.0),
+            "far_below_novelty": bool(novelty_margin < -near_eps),
+            "far_below_conflict": bool(conflict_margin < -near_eps),
+            "far_below_both": bool(novelty_margin < -near_eps and conflict_margin < -near_eps),
+        }
+
+    @staticmethod
+    def _planner_threshold_proximity_summary(
+        entries: List[Dict[str, object]],
+        *,
+        near_eps: float = 0.05,
+    ) -> Dict[str, object]:
+        if not entries:
+            return {
+                "requested_growth_frequency": 0.0,
+                "open_requested_frequency": 0.0,
+                "expand_requested_frequency": 0.0,
+                "near_novelty_miss_frequency": 0.0,
+                "near_conflict_miss_frequency": 0.0,
+                "far_below_both_frequency": 0.0,
+            }
+        total = len(entries)
+        requested_growth = 0
+        open_requested = 0
+        expand_requested = 0
+        near_novelty = 0
+        near_conflict = 0
+        far_below_both = 0
+        for entry in entries:
+            action = str(entry.get("action", ""))
+            if NHLoRATrainer._requested_growth(action):
+                requested_growth += 1
+            if action == "open_new_slot":
+                open_requested += 1
+            if action == "expand_rank_existing_slot":
+                expand_requested += 1
+            flags = NHLoRATrainer._threshold_proximity_flags(
+                float(entry.get("novelty_margin", 0.0)),
+                float(entry.get("conflict_margin", 0.0)),
+                near_eps=near_eps,
+            )
+            near_novelty += int(flags["near_novelty_miss"])
+            near_conflict += int(flags["near_conflict_miss"])
+            far_below_both += int(flags["far_below_both"])
+        return {
+            "requested_growth_frequency": float(requested_growth / total),
+            "open_requested_frequency": float(open_requested / total),
+            "expand_requested_frequency": float(expand_requested / total),
+            "near_novelty_miss_frequency": float(near_novelty / total),
+            "near_conflict_miss_frequency": float(near_conflict / total),
+            "far_below_both_frequency": float(far_below_both / total),
+        }
+
+    @staticmethod
+    def _planner_rank_gap(ranking: List[Dict[str, object]], *, action: str) -> float:
+        if len(ranking) < 2:
+            return 0.0
+        top = ranking[0]
+        runner_up = ranking[1]
+        if action == "open_new_slot":
+            return float(top.get("conflict_margin", 0.0)) - float(runner_up.get("conflict_margin", 0.0))
+        if action == "expand_rank_existing_slot":
+            return float(top.get("novelty_margin", 0.0)) - float(runner_up.get("novelty_margin", 0.0))
+        return 0.0
+
+    @staticmethod
+    def _planner_rank_stability_summary(task_summaries: List[Dict[str, object]]) -> Dict[str, object]:
+        open_runner_ups: Dict[int, int] = {}
+        expand_runner_ups: Dict[int, int] = {}
+        open_gap_values: List[float] = []
+        expand_gap_values: List[float] = []
+        for summary in task_summaries:
+            open_ranking = summary.get("open_ranking", [])
+            expand_ranking = summary.get("expand_ranking", [])
+            if len(open_ranking) >= 2:
+                runner_up = int(open_ranking[1]["block_id"])
+                open_runner_ups[runner_up] = open_runner_ups.get(runner_up, 0) + 1
+            if len(expand_ranking) >= 2:
+                runner_up = int(expand_ranking[1]["block_id"])
+                expand_runner_ups[runner_up] = expand_runner_ups.get(runner_up, 0) + 1
+            open_gap_values.append(NHLoRATrainer._planner_rank_gap(open_ranking, action="open_new_slot"))
+            expand_gap_values.append(
+                NHLoRATrainer._planner_rank_gap(expand_ranking, action="expand_rank_existing_slot")
+            )
+        winner_distribution = NHLoRATrainer._growth_winner_distribution(task_summaries)
+        return {
+            "open_winners": winner_distribution["open_winners"],
+            "expand_winners": winner_distribution["expand_winners"],
+            "open_runner_ups": open_runner_ups,
+            "expand_runner_ups": expand_runner_ups,
+            "avg_open_gap_to_runner_up": float(sum(open_gap_values) / len(open_gap_values)) if open_gap_values else 0.0,
+            "avg_expand_gap_to_runner_up": float(sum(expand_gap_values) / len(expand_gap_values))
+            if expand_gap_values
+            else 0.0,
+        }
+
+    @staticmethod
+    def _planner_history_conditioning_summary(entries: List[Dict[str, object]]) -> Dict[str, object]:
+        if not entries:
+            return {
+                "history_used_frequency": 0.0,
+                "history_entropy_mean": 0.0,
+                "history_max_weight_mean": 0.0,
+                "requested_growth_history_entropy_mean": 0.0,
+                "requested_growth_history_max_weight_mean": 0.0,
+                "history_max_weight_vs_novelty_corr": 0.0,
+                "history_max_weight_vs_conflict_corr": 0.0,
+            }
+        total = len(entries)
+        entropy_values = [float(entry.get("history_attention_entropy", 0.0)) for entry in entries]
+        max_weight_values = [float(entry.get("history_attention_max_weight", 0.0)) for entry in entries]
+        growth_entries = [entry for entry in entries if NHLoRATrainer._requested_growth(entry.get("action"))]
+        growth_entropy_values = [float(entry.get("history_attention_entropy", 0.0)) for entry in growth_entries]
+        growth_max_weight_values = [float(entry.get("history_attention_max_weight", 0.0)) for entry in growth_entries]
+        novelty_values = [float(entry.get("novelty_margin", 0.0)) for entry in entries]
+        conflict_values = [float(entry.get("conflict_margin", 0.0)) for entry in entries]
+        return {
+            "history_used_frequency": float(
+                sum(1 for entry in entries if bool(entry.get("history_attention_used", False))) / total
+            ),
+            "history_entropy_mean": float(sum(entropy_values) / len(entropy_values)) if entropy_values else 0.0,
+            "history_max_weight_mean": float(sum(max_weight_values) / len(max_weight_values))
+            if max_weight_values
+            else 0.0,
+            "requested_growth_history_entropy_mean": float(sum(growth_entropy_values) / len(growth_entropy_values))
+            if growth_entropy_values
+            else 0.0,
+            "requested_growth_history_max_weight_mean": float(sum(growth_max_weight_values) / len(growth_max_weight_values))
+            if growth_max_weight_values
+            else 0.0,
+            "history_max_weight_vs_novelty_corr": NHLoRATrainer._paired_series_correlation(
+                max_weight_values,
+                novelty_values,
+            ),
+            "history_max_weight_vs_conflict_corr": NHLoRATrainer._paired_series_correlation(
+                max_weight_values,
+                conflict_values,
+            ),
+        }
+
+    @staticmethod
+    def _planner_post_task_outcome(
+        *,
+        requested_growth: bool,
+        materialized_growth: bool,
+        applied_growth: bool,
+        post_shared_only: bool,
+    ) -> str:
+        if applied_growth and not post_shared_only:
+            return "live_and_growing"
+        if applied_growth and post_shared_only:
+            return "temporarily_expanded_then_collapsed"
+        if requested_growth and not materialized_growth:
+            return "never_really_materialized"
+        if post_shared_only:
+            return "shared_only"
+        return "live_and_growing"
+
+    @staticmethod
+    def _final_outcome_from_trajectory(history_summary: Dict[str, object]) -> str:
+        tasks = history_summary.get("tasks", [])
+        if not tasks:
+            return "never_really_materialized"
+        if bool(history_summary.get("opened_then_shared_only", False)):
+            return "temporarily_expanded_then_collapsed"
+        post_shared_only_flags = history_summary.get("post_shared_only_flags", [])
+        final_shared_only = bool(post_shared_only_flags[-1]) if post_shared_only_flags else True
+        if final_shared_only:
+            return "shared_only"
+        return "live_and_growing"
+
+    @staticmethod
+    def _top_reason_counts(reason_counts: Dict[str, int], *, limit: int = 3) -> List[Tuple[str, int]]:
+        return sorted(
+            [(str(reason), int(count)) for reason, count in reason_counts.items()],
+            key=lambda item: (-item[1], item[0]),
+        )[:limit]
+
+    def _planner_realization_trace_summary(self, block_ids: List[int]) -> Dict[str, object]:
+        selected_block_ids = [
+            int(block_id)
+            for block_id in block_ids
+            if int(block_id) in self._planner_policy_record_history
+        ]
+        policy_entries = [
+            entry
+            for block_id in selected_block_ids
+            for entry in self._planner_policy_record_history.get(int(block_id), [])
+        ]
+        realization_entries = [
+            entry
+            for block_id in selected_block_ids
+            for entry in self._planner_realization_history.get(int(block_id), [])
+        ]
+        threshold_summary = self._planner_threshold_proximity_summary(policy_entries)
+        history_summary = self._planner_history_conditioning_summary(policy_entries)
+        fallback_counts: Dict[str, int] = {}
+        outcome_counts: Dict[str, int] = {}
+        requested_growth_count = 0
+        materialized_growth_count = 0
+        applied_growth_count = 0
+        for entry in realization_entries:
+            requested_growth_count += int(bool(entry.get("requested_growth", False)))
+            materialized_growth_count += int(bool(entry.get("materialized_growth", False)))
+            applied_growth_count += int(bool(entry.get("applied_growth", False)))
+            fallback_reason = str(entry.get("fallback_reason", "none"))
+            fallback_counts[fallback_reason] = fallback_counts.get(fallback_reason, 0) + 1
+            post_outcome = str(entry.get("post_outcome", "shared_only"))
+            outcome_counts[post_outcome] = outcome_counts.get(post_outcome, 0) + 1
+        total_realization = len(realization_entries)
+        novelty_margin_values = [float(entry.get("novelty_margin", 0.0)) for entry in policy_entries]
+        conflict_margin_values = [float(entry.get("conflict_margin", 0.0)) for entry in policy_entries]
+        novelty_bias_share_values = [float(entry.get("novelty_bias_share", 0.0)) for entry in policy_entries]
+        conflict_bias_share_values = [float(entry.get("conflict_bias_share", 0.0)) for entry in policy_entries]
+        final_shared_only_layers: List[int] = []
+        final_non_shared_layers: List[int] = []
+        final_outcomes_by_layer: Dict[int, str] = {}
+        for block_id in selected_block_ids:
+            history = self._aggregate_layer_lifecycle_history(self._planner_layer_structure_history.get(int(block_id), []))
+            final_outcome = self._final_outcome_from_trajectory(history)
+            final_outcomes_by_layer[int(block_id)] = final_outcome
+            if final_outcome == "shared_only" or final_outcome == "temporarily_expanded_then_collapsed":
+                final_shared_only_layers.append(int(block_id))
+            else:
+                final_non_shared_layers.append(int(block_id))
+        return {
+            "policy_entry_count": len(policy_entries),
+            "realization_entry_count": total_realization,
+            "requested_growth_frequency": float(requested_growth_count / total_realization) if total_realization else 0.0,
+            "materialized_growth_frequency": float(materialized_growth_count / total_realization)
+            if total_realization
+            else 0.0,
+            "applied_growth_frequency": float(applied_growth_count / total_realization) if total_realization else 0.0,
+            "novelty_margin_mean": float(sum(novelty_margin_values) / len(novelty_margin_values))
+            if novelty_margin_values
+            else 0.0,
+            "conflict_margin_mean": float(sum(conflict_margin_values) / len(conflict_margin_values))
+            if conflict_margin_values
+            else 0.0,
+            "novelty_bias_share_mean": float(sum(novelty_bias_share_values) / len(novelty_bias_share_values))
+            if novelty_bias_share_values
+            else 0.0,
+            "conflict_bias_share_mean": float(sum(conflict_bias_share_values) / len(conflict_bias_share_values))
+            if conflict_bias_share_values
+            else 0.0,
+            "threshold_summary": threshold_summary,
+            "history_summary": history_summary,
+            "fallback_counts": fallback_counts,
+            "top_fallbacks": self._top_reason_counts(fallback_counts),
+            "outcome_counts": outcome_counts,
+            "final_outcomes_by_layer": final_outcomes_by_layer,
+            "final_shared_only_layers": sorted(final_shared_only_layers),
+            "final_non_shared_layers": sorted(final_non_shared_layers),
+        }
+
     def _planner_optimizer_membership(self, optimizer) -> Dict[str, object]:
         return self._optimizer_membership_for_parameters(optimizer, self.planner.parameters())
 
@@ -1197,24 +1502,66 @@ class NHLoRATrainer:
         novelty_margin = novelty - tau_novelty
         conflict_margin = conflict - tau_conflict
         attention_stats = self._history_attention_stats(signals.history_attention)
+        novelty_index = self._policy_output_index("novelty")
+        conflict_index = self._policy_output_index("conflict")
+        rank_index = self._policy_output_index("rank")
+        consolidate_index = self._policy_output_index("consolidate")
+        shared_gate_index = self._policy_output_index("shared_gate")
+        novelty_from_representation = self._policy_tensor_scalar(signals.output_from_representation, novelty_index)
+        novelty_bias = self._policy_tensor_scalar(signals.output_bias, novelty_index)
+        conflict_from_representation = self._policy_tensor_scalar(signals.output_from_representation, conflict_index)
+        conflict_bias = self._policy_tensor_scalar(signals.output_bias, conflict_index)
+        threshold_flags = self._threshold_proximity_flags(
+            novelty_margin,
+            conflict_margin,
+        )
+        action = self._planner_decision_label(
+            novelty=novelty,
+            conflict=conflict,
+            tau_novelty=tau_novelty,
+            tau_conflict=tau_conflict,
+        )
         return {
             "task_number": int(task_number),
             "block_id": int(block_id),
-            "action": self._planner_decision_label(
-                novelty=novelty,
-                conflict=conflict,
-                tau_novelty=tau_novelty,
-                tau_conflict=tau_conflict,
-            ),
+            "action": action,
             "novelty": novelty,
             "conflict": conflict,
             "tau_novelty": tau_novelty,
             "tau_conflict": tau_conflict,
             "novelty_margin": novelty_margin,
             "conflict_margin": conflict_margin,
+            "requested_growth": bool(self._requested_growth(action)),
             "shared_gate": float(signals.shared_gate.item()),
             "consolidate": float(signals.consolidate.item()),
             "rank_budget": int(signals.rank_budget),
+            "novelty_logit": self._policy_tensor_scalar(signals.raw_outputs, novelty_index),
+            "conflict_logit": self._policy_tensor_scalar(signals.raw_outputs, conflict_index),
+            "rank_logit": self._policy_tensor_scalar(signals.raw_outputs, rank_index),
+            "consolidate_logit": self._policy_tensor_scalar(signals.raw_outputs, consolidate_index),
+            "shared_gate_logit": self._policy_tensor_scalar(signals.raw_outputs, shared_gate_index),
+            "novelty_from_representation": novelty_from_representation,
+            "novelty_bias": novelty_bias,
+            "novelty_bias_share": self._component_bias_share(novelty_from_representation, novelty_bias),
+            "conflict_from_representation": conflict_from_representation,
+            "conflict_bias": self._policy_tensor_scalar(signals.output_bias, conflict_index),
+            "conflict_bias_share": self._component_bias_share(conflict_from_representation, conflict_bias),
+            "rank_from_representation": self._policy_tensor_scalar(signals.output_from_representation, rank_index),
+            "rank_bias": self._policy_tensor_scalar(signals.output_bias, rank_index),
+            "consolidate_from_representation": self._policy_tensor_scalar(
+                signals.output_from_representation,
+                consolidate_index,
+            ),
+            "consolidate_bias": self._policy_tensor_scalar(signals.output_bias, consolidate_index),
+            "shared_gate_from_representation": self._policy_tensor_scalar(
+                signals.output_from_representation,
+                shared_gate_index,
+            ),
+            "shared_gate_bias": self._policy_tensor_scalar(signals.output_bias, shared_gate_index),
+            "policy_head_weight_norm": float(signals.policy_head_weight_norm or 0.0),
+            "policy_head_bias_norm": float(signals.policy_head_bias_norm or 0.0),
+            "novelty_head_row_norm": self._policy_tensor_scalar(signals.policy_head_row_norms, novelty_index),
+            "conflict_head_row_norm": self._policy_tensor_scalar(signals.policy_head_row_norms, conflict_index),
             "planner_input_norm": float(signals.planner_input.detach().norm().item())
             if signals.planner_input is not None
             else 0.0,
@@ -1225,6 +1572,11 @@ class NHLoRATrainer:
             "history_attention_count": int(attention_stats["count"]),
             "history_attention_entropy": float(attention_stats["entropy"]),
             "history_attention_max_weight": float(attention_stats["max_weight"]),
+            "near_novelty_miss": bool(threshold_flags["near_novelty_miss"]),
+            "near_conflict_miss": bool(threshold_flags["near_conflict_miss"]),
+            "far_below_novelty": bool(threshold_flags["far_below_novelty"]),
+            "far_below_conflict": bool(threshold_flags["far_below_conflict"]),
+            "far_below_both": bool(threshold_flags["far_below_both"]),
         }
 
     @staticmethod
@@ -1314,8 +1666,15 @@ class NHLoRATrainer:
                 "expanded": expanded and not opened,
                 "rank_delta": int(plan.rank_delta),
                 "fallback_action": None if plan.fallback_action is None else str(plan.fallback_action),
+                "applied_fallback_action": None
+                if applied.get("fallback_action") is None
+                else str(applied.get("fallback_action")),
                 "candidate_count": len(plan.candidate_slots),
+                "applied_candidate_count": len(self._candidate_slot_ids(applied)),
                 "shared_only": bool(plan.shared_only),
+                "applied_shared_only": bool(applied.get("shared_only", plan.shared_only)),
+                "created_new_slot": bool(plan.create_new_slot),
+                "applied_created_new_slot": bool(applied.get("created_new_slot", False)),
             }
         growth_layers.sort()
         opened_layers.sort()
@@ -1645,6 +2004,176 @@ class NHLoRATrainer:
             int(distribution["layer6_growth_tasks"]),
         )
 
+    def _log_stage14_policy_signal_audit(self, context: Dict[str, Any]) -> None:
+        if not self._planner_audit_enabled():
+            return
+        records = context.get("planner_audit_records", {})
+        if not records:
+            return
+        for block_id in sorted(records):
+            record = dict(records[int(block_id)])
+            self._planner_policy_record_history.setdefault(int(block_id), []).append(record)
+            self.logger.info(
+                "[PlannerPolicyLogits][Task %d][Layer %d] novelty_logit=%.4f conflict_logit=%.4f rank_logit=%.4f consolidate_logit=%.4f shared_gate_logit=%.4f head_weight_norm=%.4e head_bias_norm=%.4e novelty_head_row_norm=%.4e conflict_head_row_norm=%.4e",
+                context["task_number"],
+                int(block_id),
+                float(record["novelty_logit"]),
+                float(record["conflict_logit"]),
+                float(record["rank_logit"]),
+                float(record["consolidate_logit"]),
+                float(record["shared_gate_logit"]),
+                float(record["policy_head_weight_norm"]),
+                float(record["policy_head_bias_norm"]),
+                float(record["novelty_head_row_norm"]),
+                float(record["conflict_head_row_norm"]),
+            )
+            self.logger.info(
+                "[PlannerPolicyDecomposition][Task %d][Layer %d] novelty_from_rep=%.4f novelty_bias=%.4f novelty_bias_share=%.4f conflict_from_rep=%.4f conflict_bias=%.4f conflict_bias_share=%.4f rank_from_rep=%.4f rank_bias=%.4f shared_gate_from_rep=%.4f shared_gate_bias=%.4f",
+                context["task_number"],
+                int(block_id),
+                float(record["novelty_from_representation"]),
+                float(record["novelty_bias"]),
+                float(record["novelty_bias_share"]),
+                float(record["conflict_from_representation"]),
+                float(record["conflict_bias"]),
+                float(record["conflict_bias_share"]),
+                float(record["rank_from_representation"]),
+                float(record["rank_bias"]),
+                float(record["shared_gate_from_representation"]),
+                float(record["shared_gate_bias"]),
+            )
+            self.logger.info(
+                "[PlannerThresholdProximity][Task %d][Layer %d] requested_growth=%s near_novelty_miss=%s near_conflict_miss=%s far_below_novelty=%s far_below_conflict=%s far_below_both=%s",
+                context["task_number"],
+                int(block_id),
+                bool(record["requested_growth"]),
+                bool(record["near_novelty_miss"]),
+                bool(record["near_conflict_miss"]),
+                bool(record["far_below_novelty"]),
+                bool(record["far_below_conflict"]),
+                bool(record["far_below_both"]),
+            )
+        rank_summary = self._planner_rank_stability_summary(self._planner_growth_history)
+        self.logger.info(
+            "[PlannerPolicyRankStability][Task %d] open_winners=%s open_runner_ups=%s avg_open_gap=%.4f expand_winners=%s expand_runner_ups=%s avg_expand_gap=%.4f",
+            context["task_number"],
+            rank_summary["open_winners"],
+            rank_summary["open_runner_ups"],
+            float(rank_summary["avg_open_gap_to_runner_up"]),
+            rank_summary["expand_winners"],
+            rank_summary["expand_runner_ups"],
+            float(rank_summary["avg_expand_gap_to_runner_up"]),
+        )
+
+    def _log_stage14_policy_realization_audit(self, context: Dict[str, Any]) -> None:
+        if not self._planner_audit_enabled():
+            return
+        growth_summary = context.get("planner_growth_task_summary", {})
+        lifecycle = context.get("stage5_slot_lifecycle", {})
+        materialized_lifecycle = lifecycle.get("materialized", {})
+        applied_lifecycle = lifecycle.get("applied", {})
+        post_profile = lifecycle.get("PostCHUProfile", {})
+        if not growth_summary or not post_profile:
+            return
+        for block_id in self.model.selected_blocks:
+            block_id = int(block_id)
+            layer_outcome = growth_summary.get("layer_outcomes", {}).get(block_id, {})
+            if not layer_outcome:
+                continue
+            materialized_summary = materialized_lifecycle.get(block_id, {})
+            applied_summary = applied_lifecycle.get(block_id, {})
+            post_summary = post_profile.get(block_id, {})
+            requested_action = str(layer_outcome.get("requested_action", "n/a"))
+            materialized_action = str(layer_outcome.get("materialized_action", "n/a"))
+            applied_action = str(layer_outcome.get("applied_action", materialized_action))
+            requested_growth = bool(self._requested_growth(requested_action))
+            materialized_growth = bool(layer_outcome.get("opened", False) or layer_outcome.get("expanded", False))
+            applied_growth = bool(materialized_growth or layer_outcome.get("applied_created_new_slot", False))
+            materialized_fallback = str(materialized_summary.get("fallback_reason", "none"))
+            applied_fallback = str(applied_summary.get("fallback_reason", materialized_fallback))
+            fallback_reason = applied_fallback if applied_fallback != "none" else materialized_fallback
+            post_outcome = self._planner_post_task_outcome(
+                requested_growth=requested_growth,
+                materialized_growth=materialized_growth,
+                applied_growth=applied_growth,
+                post_shared_only=bool(post_summary.get("shared_only", False)),
+            )
+            realization_entry = {
+                "task_number": int(context["task_number"]),
+                "block_id": block_id,
+                "requested_action": requested_action,
+                "materialized_action": materialized_action,
+                "applied_action": applied_action,
+                "requested_growth": requested_growth,
+                "materialized_growth": materialized_growth,
+                "applied_growth": applied_growth,
+                "materialized_fallback_reason": materialized_fallback,
+                "applied_fallback_reason": applied_fallback,
+                "fallback_reason": fallback_reason,
+                "post_outcome": post_outcome,
+                "post_shared_only": bool(post_summary.get("shared_only", False)),
+                "applied_live_count": len(applied_summary.get("live_slot_ids", [])),
+                "post_live_count": len(post_summary.get("live_slot_ids", [])),
+            }
+            self._planner_realization_history.setdefault(block_id, []).append(realization_entry)
+            self.logger.info(
+                "[PlannerRealizationTrace][Task %d][Layer %d] requested=%s materialized=%s applied=%s requested_growth=%s materialized_growth=%s applied_growth=%s materialized_fallback=%s applied_fallback=%s post_outcome=%s applied_live=%d post_live=%d post_shared_only=%s",
+                context["task_number"],
+                block_id,
+                requested_action,
+                materialized_action,
+                applied_action,
+                requested_growth,
+                materialized_growth,
+                applied_growth,
+                materialized_fallback,
+                applied_fallback,
+                post_outcome,
+                int(realization_entry["applied_live_count"]),
+                int(realization_entry["post_live_count"]),
+                bool(realization_entry["post_shared_only"]),
+            )
+        comparison_groups = [
+            ("Layer6", [6]),
+            ("Layer9", [9]),
+            ("Layers7_8_10_11", [7, 8, 10, 11]),
+        ]
+        for label, block_ids in comparison_groups:
+            available_block_ids = [int(block_id) for block_id in block_ids if int(block_id) in self.model.selected_blocks]
+            if not available_block_ids:
+                continue
+            summary = self._planner_realization_trace_summary(available_block_ids)
+            threshold_summary = summary["threshold_summary"]
+            history_summary = summary["history_summary"]
+            self.logger.info(
+                "[PlannerPolicyDeconcentration][Task %d][Group %s] novelty_margin_mean=%.4f conflict_margin_mean=%.4f requested_growth_freq=%.4f near_novelty_miss_freq=%.4f near_conflict_miss_freq=%.4f far_below_both_freq=%.4f history_used_freq=%.4f history_entropy_mean=%.4f history_max_weight_mean=%.4f novelty_bias_share_mean=%.4f conflict_bias_share_mean=%.4f",
+                context["task_number"],
+                label,
+                float(summary["novelty_margin_mean"]),
+                float(summary["conflict_margin_mean"]),
+                float(threshold_summary["requested_growth_frequency"]),
+                float(threshold_summary["near_novelty_miss_frequency"]),
+                float(threshold_summary["near_conflict_miss_frequency"]),
+                float(threshold_summary["far_below_both_frequency"]),
+                float(history_summary["history_used_frequency"]),
+                float(history_summary["history_entropy_mean"]),
+                float(history_summary["history_max_weight_mean"]),
+                float(summary["novelty_bias_share_mean"]),
+                float(summary["conflict_bias_share_mean"]),
+            )
+            self.logger.info(
+                "[PlannerRequestedAppliedTrace][Task %d][Group %s] requested_growth_freq=%.4f materialized_growth_freq=%.4f applied_growth_freq=%.4f main_fallbacks=%s final_shared_only_layers=%s final_non_shared_layers=%s final_outcomes=%s",
+                context["task_number"],
+                label,
+                float(summary["requested_growth_frequency"]),
+                float(summary["materialized_growth_frequency"]),
+                float(summary["applied_growth_frequency"]),
+                summary["top_fallbacks"],
+                summary["final_shared_only_layers"],
+                summary["final_non_shared_layers"],
+                summary["final_outcomes_by_layer"],
+            )
+
     def _log_stage13_structural_shared_only_audit(
         self,
         context: Dict[str, Any],
@@ -1778,6 +2307,7 @@ class NHLoRATrainer:
             sorted(multi_slot_layers_post),
             sorted(contracted_layers),
         )
+        self._log_stage14_policy_realization_audit(context)
 
     def _log_planner_layer_focus(self, context: Dict[str, Any]) -> None:
         if not self._planner_audit_enabled():
@@ -1934,6 +2464,7 @@ class NHLoRATrainer:
         )
         self._log_planner_layer_focus(context)
         self._log_stage13_policy_growth_summary(context)
+        self._log_stage14_policy_signal_audit(context)
 
     def _log_hybrid_planner_prepare(self, context: Dict[str, Any]) -> None:
         if not self._hybrid_planner_enabled():

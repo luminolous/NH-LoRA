@@ -144,6 +144,15 @@ The design paper is the primary source of truth. When paper detail was ambiguous
   Pre-CHU vs Post-CHU contraction. They are observational only and do not patch
   residual gating, thresholds, CHU behavior, router behavior, classifier
   behavior, or inference semantics.
+- Policy-side deconcentration audit note: Stage 14 keeps the same
+  `training.planner_audit_logging` flag and extends it with policy-side
+  growth-opportunity diagnostics plus requested-to-realized trace logging. These
+  additions report raw policy logits, activation-vs-bias decomposition for
+  novelty/conflict, cross-task rank stability, threshold-proximity summaries,
+  history-conditioning summaries, and explicit
+  `requested -> materialized -> applied -> fallback -> post_outcome` traces.
+  They are observational only and do not change thresholds, CHU behavior,
+  router behavior, classifier behavior, residual gating, or soft-rank status.
 
 ### CHU
 

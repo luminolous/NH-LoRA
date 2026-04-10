@@ -20,6 +20,12 @@ class PlannerSignals:
     history_context: torch.Tensor | None = None
     planner_input: torch.Tensor | None = None
     planner_representation: torch.Tensor | None = None
+    raw_outputs: torch.Tensor | None = None
+    output_from_representation: torch.Tensor | None = None
+    output_bias: torch.Tensor | None = None
+    policy_head_weight_norm: float | None = None
+    policy_head_bias_norm: float | None = None
+    policy_head_row_norms: torch.Tensor | None = None
 
 
 @dataclass
@@ -335,6 +341,14 @@ class PlannerPolicyBranch(_PlannerBranchBase):
             task_embedding,
             history_summary,
         )
+        output_head = self.output_heads[str(block_id)]
+        output_from_representation = F.linear(planner_representation, output_head.weight, bias=None)
+        if output_head.bias is None:
+            output_bias = torch.zeros_like(output_from_representation)
+            bias_norm = 0.0
+        else:
+            output_bias = output_head.bias.view(1, -1).expand_as(output_from_representation)
+            bias_norm = float(output_head.bias.detach().norm().item())
         novelty = torch.sigmoid(outputs[:, 0:1])
         conflict = torch.sigmoid(outputs[:, 1:2])
         rank_score = torch.sigmoid(outputs[:, 2:3])
@@ -352,6 +366,12 @@ class PlannerPolicyBranch(_PlannerBranchBase):
             history_context=history_context,
             planner_input=planner_input,
             planner_representation=planner_representation,
+            raw_outputs=outputs,
+            output_from_representation=output_from_representation,
+            output_bias=output_bias,
+            policy_head_weight_norm=float(output_head.weight.detach().norm().item()),
+            policy_head_bias_norm=bias_norm,
+            policy_head_row_norms=output_head.weight.detach().norm(dim=1),
         )
 
 

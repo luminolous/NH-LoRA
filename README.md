@@ -120,6 +120,15 @@ Post-CHU profile contraction so long-horizon shared-only collapse can be
 classified without changing planner decisions, CHU, router behavior, classifier
 behavior, or hybrid residual-control semantics.
 
+Stage 14 keeps the same behavior and extends `training.planner_audit_logging`
+with policy-side deconcentration diagnostics plus a requested-to-realized growth
+trace. These logs add raw policy-logit decomposition, threshold-proximity and
+history-conditioning summaries, cross-task rank stability, and explicit
+`requested -> materialized -> applied -> fallback -> post_outcome` traces so we
+can separate pure policy-side growth concentration from realization failure.
+They remain observational and do not change thresholds, CHU, router behavior,
+classifier behavior, residual-gate behavior, or soft-rank status.
+
 ## Bootstrap Task 1
 
 Task 1 is intentionally special:

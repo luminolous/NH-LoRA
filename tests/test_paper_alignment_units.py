@@ -304,6 +304,36 @@ class PaperAlignmentUnitTests(unittest.TestCase):
         )
         self.assertTrue(torch.allclose(signals.planner_input, expected, atol=1e-6))
 
+    def test_planner_policy_branch_exposes_raw_logits_and_decomposition(self):
+        planner = HorizonPlanner(
+            selected_blocks=[0],
+            task_embedding_dim=4,
+            history_dim=6,
+            hidden_dim=8,
+            layer_embedding_dim=3,
+            rank_min=1,
+            rank_max=4,
+            tau_novelty=0.5,
+            tau_conflict=0.5,
+        )
+        task_embedding = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
+        history_summary = torch.tensor([[0.2, 0.1, 0.3, 0.4, 0.0, 0.5]])
+
+        signals = planner(0, task_embedding=task_embedding, history_summary=history_summary)
+
+        self.assertIsNotNone(signals.raw_outputs)
+        self.assertIsNotNone(signals.output_from_representation)
+        self.assertIsNotNone(signals.output_bias)
+        self.assertIsNotNone(signals.policy_head_row_norms)
+        self.assertGreater(float(signals.policy_head_weight_norm), 0.0)
+        self.assertTrue(
+            torch.allclose(
+                signals.raw_outputs,
+                signals.output_from_representation + signals.output_bias,
+                atol=1e-6,
+            )
+        )
+
     def test_hybrid_planner_exposes_separate_policy_and_control_params(self):
         planner = HorizonPlanner(
             selected_blocks=[0],
@@ -1854,6 +1884,10 @@ class PaperAlignmentUnitTests(unittest.TestCase):
         self.assertIn("[PlannerInputAudit][Task 2]", joined_messages)
         self.assertIn("[PlannerTrainPath][Task 2] in_optimizer=True", joined_messages)
         self.assertIn("[PlannerAudit][Task 2][Layer 1]", joined_messages)
+        self.assertIn("[PlannerPolicyLogits][Task 2][Layer 1]", joined_messages)
+        self.assertIn("[PlannerPolicyDecomposition][Task 2][Layer 1]", joined_messages)
+        self.assertIn("[PlannerThresholdProximity][Task 2][Layer 1]", joined_messages)
+        self.assertIn("[PlannerPolicyRankStability][Task 2]", joined_messages)
         self.assertIn("[PlannerTrajectory][Layer 1]", joined_messages)
         self.assertIn("[PlannerGrowthTask][Task 2]", joined_messages)
         self.assertIn("[PlannerGrowthConcentration][Task 2]", joined_messages)
@@ -2201,6 +2235,151 @@ class PaperAlignmentUnitTests(unittest.TestCase):
         self.assertTrue(lifecycle_history["ever_multi_slot"])
         self.assertTrue(lifecycle_history["opened_then_shared_only"])
         self.assertEqual(lifecycle_history["collapsed_after_growth_tasks"], [2])
+
+    def test_stage14_threshold_proximity_rank_stability_and_trace_helpers(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "stage14_policy_trace_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        trainer = NHLoRATrainer(config, configure_logger(level=logging.WARNING), benchmark=benchmark)
+
+        entries = [
+            {
+                "action": "freeze_old_strong_retention",
+                "novelty_margin": -0.02,
+                "conflict_margin": -0.08,
+                "history_attention_used": True,
+                "history_attention_entropy": 0.4,
+                "history_attention_max_weight": 0.7,
+            },
+            {
+                "action": "open_new_slot",
+                "novelty_margin": 0.15,
+                "conflict_margin": 0.20,
+                "history_attention_used": True,
+                "history_attention_entropy": 0.2,
+                "history_attention_max_weight": 0.9,
+            },
+        ]
+        threshold_summary = NHLoRATrainer._planner_threshold_proximity_summary(entries)
+        self.assertAlmostEqual(threshold_summary["requested_growth_frequency"], 0.5, places=6)
+        self.assertAlmostEqual(threshold_summary["near_novelty_miss_frequency"], 0.5, places=6)
+        self.assertAlmostEqual(threshold_summary["far_below_both_frequency"], 0.0, places=6)
+
+        rank_stability = NHLoRATrainer._planner_rank_stability_summary(
+            [
+                {
+                    "open_ranking": [
+                        {"block_id": 1, "conflict_margin": 0.30, "novelty_margin": 0.10},
+                        {"block_id": 2, "conflict_margin": 0.20, "novelty_margin": 0.05},
+                    ],
+                    "expand_ranking": [
+                        {"block_id": 2, "novelty_margin": 0.40, "conflict_margin": -0.10},
+                        {"block_id": 1, "novelty_margin": 0.35, "conflict_margin": -0.15},
+                    ],
+                    "open_winner": 1,
+                    "expand_winner": 2,
+                    "growth_layers": [1, 2],
+                }
+            ]
+        )
+        self.assertEqual(rank_stability["open_winners"], {1: 1})
+        self.assertEqual(rank_stability["expand_winners"], {2: 1})
+        self.assertEqual(rank_stability["open_runner_ups"], {2: 1})
+        self.assertGreater(rank_stability["avg_open_gap_to_runner_up"], 0.0)
+
+        trainer._planner_policy_record_history[1] = [
+            {
+                "action": "open_new_slot",
+                "novelty_margin": 0.20,
+                "conflict_margin": 0.30,
+                "novelty_bias_share": 0.10,
+                "conflict_bias_share": 0.15,
+                "history_attention_used": True,
+                "history_attention_entropy": 0.2,
+                "history_attention_max_weight": 0.8,
+            },
+            {
+                "action": "freeze_old_strong_retention",
+                "novelty_margin": -0.02,
+                "conflict_margin": -0.10,
+                "novelty_bias_share": 0.12,
+                "conflict_bias_share": 0.18,
+                "history_attention_used": True,
+                "history_attention_entropy": 0.5,
+                "history_attention_max_weight": 0.6,
+            },
+        ]
+        trainer._planner_policy_record_history[2] = [
+            {
+                "action": "expand_rank_existing_slot",
+                "novelty_margin": 0.25,
+                "conflict_margin": -0.05,
+                "novelty_bias_share": 0.08,
+                "conflict_bias_share": 0.11,
+                "history_attention_used": True,
+                "history_attention_entropy": 0.3,
+                "history_attention_max_weight": 0.7,
+            }
+        ]
+        trainer._planner_realization_history[1] = [
+            {
+                "requested_growth": True,
+                "materialized_growth": False,
+                "applied_growth": False,
+                "fallback_reason": "empty_candidates",
+                "post_outcome": "never_really_materialized",
+            },
+            {
+                "requested_growth": False,
+                "materialized_growth": False,
+                "applied_growth": False,
+                "fallback_reason": "shared_only",
+                "post_outcome": "shared_only",
+            },
+        ]
+        trainer._planner_realization_history[2] = [
+            {
+                "requested_growth": True,
+                "materialized_growth": True,
+                "applied_growth": True,
+                "fallback_reason": "none",
+                "post_outcome": "live_and_growing",
+            }
+        ]
+        trainer._planner_layer_structure_history[1] = [
+            {
+                "task_number": 1,
+                "opened": False,
+                "expanded": False,
+                "pre_live_count": 1,
+                "post_live_count": 1,
+                "post_retained_count": 1,
+                "post_shared_only": True,
+            }
+        ]
+        trainer._planner_layer_structure_history[2] = [
+            {
+                "task_number": 1,
+                "opened": True,
+                "expanded": False,
+                "pre_live_count": 1,
+                "post_live_count": 2,
+                "post_retained_count": 2,
+                "post_shared_only": False,
+            }
+        ]
+
+        trace_summary = trainer._planner_realization_trace_summary([1, 2])
+        self.assertAlmostEqual(trace_summary["requested_growth_frequency"], 2.0 / 3.0, places=6)
+        self.assertAlmostEqual(trace_summary["materialized_growth_frequency"], 1.0 / 3.0, places=6)
+        self.assertAlmostEqual(trace_summary["applied_growth_frequency"], 1.0 / 3.0, places=6)
+        self.assertEqual(trace_summary["final_shared_only_layers"], [1])
+        self.assertEqual(trace_summary["final_non_shared_layers"], [2])
+        self.assertEqual(trace_summary["top_fallbacks"][0][0], "empty_candidates")
+        self.assertEqual(trace_summary["final_outcomes_by_layer"][1], "shared_only")
+        self.assertEqual(trace_summary["final_outcomes_by_layer"][2], "live_and_growing")
 
     def test_stage13_structural_audit_is_silent_when_disabled(self):
         repo_root = Path(__file__).resolve().parents[1]
