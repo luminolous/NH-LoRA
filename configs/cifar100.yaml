@@ -10,9 +10,11 @@ benchmark:
   image_size: 224
 
 training:
-  batch_size: 64
-  epochs_per_task: 30
+  batch_size: 16
+  epochs_per_task: 15
   lr: 5e-4
+  planner_mode: hybrid
+  planner_control_delta_logit_scale: 2.0
 
 runtime:
   num_workers: 8

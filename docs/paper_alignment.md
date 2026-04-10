@@ -68,6 +68,126 @@ The design paper is the primary source of truth. When paper detail was ambiguous
   - [src/models/classifier.py](/C:/Users/Syauqi%20Nabil/research/self/NH-LoRA/src/models/classifier.py)
   - [src/engine/trainer.py](/C:/Users/Syauqi%20Nabil/research/self/NH-LoRA/src/engine/trainer.py)
   - `NHLoRATrainer._expand_classifier_for_task`
+- Diagnostic note: `training.classifier_lr_scale`, `training.freeze_new_classifier_epochs`,
+  and `training.freeze_all_classifier_epochs` are default-off Stage 2 ablation knobs for
+  testing head dominance. They do not add rehearsal memory or alter the paper objective
+  when left at defaults.
+- Routing audit note: `training.routing_debug_logging` also enables Stage 5
+  diagnostics that report raw planner decisions, materialized/applied candidate slot ids,
+  retained inference-profile slot ids, and same-input train-vs-eval route comparisons.
+  These logs are observational and do not change planner, CHU, objective, or inference
+  policy.
+- Planner audit note: `training.planner_audit_logging` enables Stage 7
+  diagnostics that report per-layer `novelty` / `conflict` margins against
+  `tau_novelty` / `tau_conflict`, planner action trajectories, optimizer
+  membership, pre-step planner grad stats, planner parameter drift from
+  initialization and post-Task-1, and task-state/planner-input summaries.
+  These logs are observational and do not change planner thresholds, CHU,
+  routing, or inference semantics.
+- Hybrid planner note: `training.planner_mode=hybrid` enables the Stage 8
+  Checkpoint A split between pre-task structural policy and task-loss-trained
+  forward control. In this mode, the policy branch is explicitly not trained by
+  task loss, while the control branch recomputes learned shared-gate values in a
+  graph-preserving way during training forward passes. Discrete structural
+  actions, CHU, routing semantics, and inference-profile hard action semantics
+  remain unchanged in this pass, and soft-rank training is intentionally
+  deferred.
+- Planner-control saturation audit note: the same `training.planner_audit_logging`
+  flag now also exposes Stage 9 diagnostics for early-onset shared-gate
+  saturation in hybrid mode. These logs report pre-sigmoid beta-logit
+  distributions, post-sigmoid saturation fractions, branch-specific
+  `planner_policy` vs `planner_control` gradient traces, shared-vs-slot
+  contribution balance, and control-input similarity summaries. These diagnostics
+  are observational only and do not tune thresholds, clip beta, add
+  regularizers, or change CHU/routing/classifier semantics.
+- Hybrid shared-gate stabilization note: Stage 10 keeps `training.planner_mode=hybrid`
+  opt-in and changes only the learned control-gate parameterization. Instead of
+  learning an unconstrained absolute `beta`, the control branch now predicts a
+  bounded residual in logit space around the policy-side `shared_gate` stored in
+  the applied structural plan:
+  - `anchor_beta = applied_plan["shared_gate"]`
+  - `anchor_logit = logit(clamp(anchor_beta, 1e-4, 1 - 1e-4))`
+  - `delta_logit = planner_control_delta_logit_scale * bounded_transform(delta_raw)`
+  - `effective_logit = anchor_logit + delta_logit`
+  - `effective_beta = sigmoid(effective_logit)`
+  The control output head is zero-initialized so hybrid training begins at the
+  policy anchor. This pass does not alter structural planning, CHU, routing,
+  classifier behavior, or Stage 5 inference-profile semantics. The default
+  `training.planner_control_delta_logit_scale=2.0` is only a first validation
+  hypothesis and is not yet claimed as a final tuned value.
+- Residual-control audit note: Stage 11 keeps the same `training.planner_audit_logging`
+  flag and adds diagnostics for post-bootstrap residual saturation in hybrid mode.
+  These logs report `delta_raw` percentiles and threshold fractions, bounded-transform derivative
+  collapse, control-head weight/bias norm and drift from init, bias-vs-activation
+  contributions to `delta_raw`, gradient-chain traces across `delta_raw`,
+  `delta_logit`, and effective logit, cap-usage summaries relative to
+  `planner_control_delta_logit_scale`, and per-layer residual interpretation
+  summaries. These additions are observational only and do not retune thresholds,
+  change bootstrap structural planning, redesign CHU/router/classifier behavior,
+  or enable soft-rank.
+- Residual representation-scale stabilization note: Stage 12 keeps the same
+  hybrid anchor semantics but changes the residual path in two narrow ways:
+  - the control representation is RMS-normalized immediately before the residual
+    gate head,
+  - the bounded residual transform is `softsign` instead of `tanh`:
+    - `delta_logit = planner_control_delta_logit_scale * softsign(delta_raw)`
+  This targets the Stage 11 finding that `delta_raw` was dominated by the
+  representation term and then lost gradient at the bounded transform. Stage 12
+  remains hybrid-only, keeps `planner_control_delta_logit_scale=2.0` unchanged
+  for isolation, and does not retune thresholds, redesign CHU/router/classifier
+  behavior, alter Stage 5 inference-profile semantics, or enable soft-rank.
+- Structural shared-only concentration audit note: Stage 13 keeps the same
+  `training.planner_audit_logging` flag and extends it with diagnostics for the
+  post-Stage-12 structural bottleneck. These logs summarize policy-side
+  open/expand rankings per task, cross-layer growth winner concentration,
+  per-layer structure lifecycle over tasks, route/usage concentration, and
+  Pre-CHU vs Post-CHU contraction. They are observational only and do not patch
+  residual gating, thresholds, CHU behavior, router behavior, classifier
+  behavior, or inference semantics.
+- Policy-side deconcentration audit note: Stage 14 keeps the same
+  `training.planner_audit_logging` flag and extends it with policy-side
+  growth-opportunity diagnostics plus requested-to-realized trace logging. These
+  additions report raw policy logits, activation-vs-bias decomposition for
+  novelty/conflict, cross-task rank stability, threshold-proximity summaries,
+  history-conditioning summaries, and explicit
+  `requested -> materialized -> applied -> fallback -> post_outcome` traces.
+  They are observational only and do not change thresholds, CHU behavior,
+  router behavior, classifier behavior, residual gating, or soft-rank status.
+- Benchmark transition note: Stage 15 keeps NH-LoRA method semantics unchanged
+  while updating the benchmark surface. The repository now adds native
+  `imagenet_a` support through the same continual ImageFolder contract used by
+  `imagenet_r`, removes the `cub200` adapter from the public registry/config
+  surface, and keeps explicit hybrid benchmark configs for:
+  - `imagenet_r_hybrid`
+  - `imagenet_a_hybrid`
+  These changes are for benchmark wiring, portability gating, and config
+  separation only; they do not retune thresholds, alter planner behavior,
+  redesign CHU/router/classifier behavior, or change residual-gate semantics.
+- Full-block default and ImageNet-A correctness note: Stage 16 still does not
+  change NH-LoRA method semantics, but it promotes full-block injection
+  `[0..11]` to the global base-config default and hardens the `imagenet_a`
+  adapter with fail-fast validation:
+  - `train/` and `test/` must both exist
+  - the train/test class-folder sets must match exactly
+  - the benchmark must expose exactly 200 classes
+  Stage 16 also adds benchmark sanity summaries that log benchmark class/task
+  counts plus per-task class and sample counts before training. These additions
+  are observational and correctness-focused only; they do not retune thresholds,
+  alter planner behavior, redesign CHU/router/classifier behavior, or change
+  residual-gate semantics.
+- Retention bottleneck audit note: Stage 17 still does not change NH-LoRA
+  method semantics, but it extends the existing retention/evaluation debug path
+  with task-boundary forgetting decomposition. These diagnostics log:
+  - current-task train accuracy vs seen-task evaluation accuracy
+  - per-old-task drop from best-prior and latest-prior accuracy
+  - teacher-vs-student old-logit drift and feature-drift summaries
+  - old-vs-new classifier calibration on seen-task evaluation data
+  - eval-time route/profile availability for old tasks
+  - Pre-CHU vs Post-CHU forgetting deltas
+  - per-layer retention attribution over later tasks
+  These additions are observational only; they do not retune losses, change
+  planner/control semantics, alter residual gating, or redesign CHU/router
+  behavior.
 
 ### CHU
 

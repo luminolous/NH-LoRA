@@ -20,12 +20,12 @@ Dokumen ini menjelaskan cara menjalankan eksperimen NH-LoRA dengan pola:
 configs/
   base.yaml
   cifar100.yaml
-  cub200.yaml
+  imagenet_a.yaml
   imagenet_r.yaml
   omnibenchmark.yaml
 scripts/
   run_cifar100.sh
-  run_cub200.sh
+  run_imagenet_a.sh
   run_imagenet_r.sh
   run_omnibenchmark.sh
   run_all.sh
@@ -61,19 +61,19 @@ outputs/
       seed_1.json
       seed_2.json
       ...
-    cub200/
+    imagenet_a/
       seed_1.json
       ...
   summaries/
     cifar100_summary.json
-    cub200_summary.json
+    imagenet_a_summary.json
     imagenet_r_summary.json
     omnibenchmark_summary.json
   checkpoints/
     cifar100/
       seed_1/
       seed_2/
-    cub200/
+    imagenet_a/
       seed_1/
 ```
 
@@ -87,10 +87,10 @@ outputs/
 bash scripts/run_cifar100.sh
 ```
 
-### CUB-200-2011
+### ImageNet-A
 
 ```bash
-bash scripts/run_cub200.sh
+bash scripts/run_imagenet_a.sh
 ```
 
 ### ImageNet-R
@@ -105,11 +105,18 @@ bash scripts/run_imagenet_r.sh
 bash scripts/run_omnibenchmark.sh
 ```
 
-### Menjalankan Semua Benchmark Secara Berurutan
+### Menjalankan Semua Benchmark Target Secara Berurutan
 
 ```bash
 bash scripts/run_all.sh
 ```
+
+`run_all.sh` saat ini menarget:
+- CIFAR-100
+- ImageNet-A
+- ImageNet-R
+
+OmniBenchmark tetap punya runner terpisah bila dibutuhkan.
 
 ---
 
@@ -124,7 +131,7 @@ nohup bash scripts/run_cifar100.sh > outputs/logs/nohup_cifar100.out 2>&1 &
 Contoh untuk benchmark lain:
 
 ```bash
-nohup bash scripts/run_cub200.sh > outputs/logs/nohup_cub200.out 2>&1 &
+nohup bash scripts/run_imagenet_a.sh > outputs/logs/nohup_imagenet_a.out 2>&1 &
 nohup bash scripts/run_imagenet_r.sh > outputs/logs/nohup_imagenet_r.out 2>&1 &
 nohup bash scripts/run_omnibenchmark.sh > outputs/logs/nohup_omnibenchmark.out 2>&1 &
 ```

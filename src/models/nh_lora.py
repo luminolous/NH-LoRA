@@ -128,19 +128,24 @@ class NHLoRAModel(nn.Module):
                 ),
                 reverse=True,
             )
+            shared_only_action = layer.last_structural_action in {
+                "reuse_shared",
+                "freeze_old_strong_retention",
+            }
+            active_candidates = [] if shared_only_action else live_slots
             profile[block_id] = {
                 "action": "inference_profile",
                 "requested_action": layer.last_structural_action,
-                "active_slot_candidates": live_slots,
-                "selected_slot": live_slots[0] if len(live_slots) == 1 else None,
+                "active_slot_candidates": active_candidates,
+                "selected_slot": active_candidates[0] if len(active_candidates) == 1 else None,
                 "rank_cfg": {slot_id: layer.slot_metadata[slot_id].rank for slot_id in layer.live_slot_ids()},
                 "shared_gate": layer.last_shared_gate,
                 "consolidate_flag": layer.last_consolidate_flag,
-                "deterministic": len(live_slots) <= 1,
+                "deterministic": True if shared_only_action else len(active_candidates) <= 1,
                 "created_new_slot": False,
                 "fallback_action": None,
                 "strong_retention": layer.last_structural_action == "freeze_old_strong_retention",
-                "shared_only": len(live_slots) == 0,
+                "shared_only": shared_only_action or len(active_candidates) == 0,
                 "compatibility_scores": {},
             }
         return profile

@@ -3,21 +3,25 @@ from __future__ import annotations
 import logging
 import os
 import unittest
+from copy import deepcopy
 from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
 import torch
+from PIL import Image
 from torch import nn
+from torch.nn import functional as F
 
 from src.datasets.base import ContinualBenchmark, SampleRecord, TaskDefinition
+from src.datasets.registry import build_benchmark
 from src.datasets.transforms import build_cifar_test_transform
 from src.engine.trainer import NHLoRATrainer
 from src.models.chu import ConsolidationHomeostasisUnit
 from src.models.lora import NHLoRALayer
 from src.models.losses import feature_retention, growth_penalty, rank_penalty, routing_balance_loss, slot_orthogonality
 from src.models.nh_lora import NHLoRAModel
-from src.models.planner import HorizonPlanner, MaterializedLayerPlan, PlannerSignals, materialize_action
+from src.models.planner import HorizonPlanner, MaterializedLayerPlan, PlannerControlOutputs, PlannerSignals, materialize_action
 from src.utils.logging_utils import configure_logger
 from src.utils.seeding import seed_everything
 
@@ -71,6 +75,23 @@ def _build_tiny_benchmark(num_tasks: int = 1):
         train_transform=transform,
         test_transform=transform,
     )
+
+
+def _write_imagefolder_dataset(root: Path, split_to_classes: dict[str, list[str]], samples_per_class: int = 2):
+    for split, class_names in split_to_classes.items():
+        for class_idx, class_name in enumerate(class_names):
+            class_dir = root / split / class_name
+            class_dir.mkdir(parents=True, exist_ok=True)
+            for sample_id in range(samples_per_class):
+                image = np.zeros((32, 32, 3), dtype=np.uint8)
+                image[..., 0] = (class_idx * 53 + sample_id * 7) % 255
+                image[..., 1] = (class_idx * 31 + sample_id * 11) % 255
+                image[..., 2] = (class_idx * 17 + sample_id * 13) % 255
+                Image.fromarray(image).save(class_dir / f"{split}_{sample_id}.png")
+
+
+def _make_class_names(count: int) -> list[str]:
+    return [f"class_{index:03d}" for index in range(count)]
 
 
 def _build_test_config(output_root: str):
@@ -161,11 +182,34 @@ def _build_test_config(output_root: str):
             "use_scheduler": True,
             "scheduler": "cosine",
             "freeze_old_classifier_weights": True,
+            "classifier_lr_scale": 1.0,
+            "freeze_new_classifier_epochs": 0,
+            "freeze_all_classifier_epochs": 0,
             "retention_debug_logging": True,
             "retention_feature_diff_logging": False,
             "retention_feature_diff_max_epochs": 3,
             "routing_debug_logging": False,
             "routing_debug_max_epochs": 3,
+            "planner_audit_logging": False,
+            "planner_mode": "legacy",
+            "planner_control_recompute": "per_batch",
+            "planner_policy_trainable": False,
+            "planner_control_trainable": True,
+            "planner_use_learned_shared_gate": True,
+            "planner_control_delta_logit_scale": 2.0,
+            "planner_soft_rank_training": False,
+            "planner_soft_rank_temperature": 0.5,
+            "planner_hard_rank_eval": True,
+            "adapter_delta_debug_logging": False,
+            "adapter_delta_debug_max_epochs": 3,
+            "final_feature_diff_debug_logging": False,
+            "final_feature_diff_debug_max_epochs": 3,
+            "classifier_drift_debug_logging": False,
+            "classifier_drift_debug_max_epochs": 3,
+            "grad_norm_debug_logging": False,
+            "grad_norm_debug_max_epochs": 3,
+            "logit_margin_debug_logging": False,
+            "logit_margin_debug_max_epochs": 3,
         },
         "loss": {
             "lambda_kd": 0.5,
@@ -199,6 +243,28 @@ class _ListLogger:
 
 
 class PaperAlignmentUnitTests(unittest.TestCase):
+    def _build_stage4_model(self, insertion_points):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / ("stage4_" + "_".join(insertion_points))
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        config["model"]["insertion_points"] = list(insertion_points)
+        return NHLoRAModel(config)
+
+    def _stage4_planner_cfg(self, slot_id: int, accumulator=None):
+        planner_cfg = {
+            "active_slot_candidates": [slot_id],
+            "selected_slot": slot_id,
+            "rank_cfg": {slot_id: 1},
+            "shared_gate": 1.0,
+            "deterministic": True,
+            "shared_only": False,
+        }
+        if accumulator is not None:
+            planner_cfg["_debug_delta_stats"] = accumulator
+            planner_cfg["_debug_block_id"] = 1
+        return planner_cfg
+
     def test_dynamic_slot_params_follow_layer_device(self):
         target_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         layer = NHLoRALayer(
@@ -256,6 +322,304 @@ class PaperAlignmentUnitTests(unittest.TestCase):
             dim=-1,
         )
         self.assertTrue(torch.allclose(signals.planner_input, expected, atol=1e-6))
+
+    def test_planner_policy_branch_exposes_raw_logits_and_decomposition(self):
+        planner = HorizonPlanner(
+            selected_blocks=[0],
+            task_embedding_dim=4,
+            history_dim=6,
+            hidden_dim=8,
+            layer_embedding_dim=3,
+            rank_min=1,
+            rank_max=4,
+            tau_novelty=0.5,
+            tau_conflict=0.5,
+        )
+        task_embedding = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
+        history_summary = torch.tensor([[0.2, 0.1, 0.3, 0.4, 0.0, 0.5]])
+
+        signals = planner(0, task_embedding=task_embedding, history_summary=history_summary)
+
+        self.assertIsNotNone(signals.raw_outputs)
+        self.assertIsNotNone(signals.output_from_representation)
+        self.assertIsNotNone(signals.output_bias)
+        self.assertIsNotNone(signals.policy_head_row_norms)
+        self.assertGreater(float(signals.policy_head_weight_norm), 0.0)
+        self.assertTrue(
+            torch.allclose(
+                signals.raw_outputs,
+                signals.output_from_representation + signals.output_bias,
+                atol=1e-6,
+            )
+        )
+
+    def test_hybrid_planner_exposes_separate_policy_and_control_params(self):
+        planner = HorizonPlanner(
+            selected_blocks=[0],
+            task_embedding_dim=4,
+            history_dim=6,
+            hidden_dim=8,
+            layer_embedding_dim=3,
+            rank_min=1,
+            rank_max=4,
+            tau_novelty=0.5,
+            tau_conflict=0.5,
+        )
+        policy_param_ids = {id(parameter) for parameter in planner.policy_parameters()}
+        control_param_ids = {id(parameter) for parameter in planner.control_parameters()}
+
+        self.assertTrue(policy_param_ids)
+        self.assertTrue(control_param_ids)
+        self.assertTrue(policy_param_ids.isdisjoint(control_param_ids))
+
+        task_embedding = torch.randn(1, 4)
+        history_summary = torch.randn(1, 6)
+        policy_outputs = planner.forward_policy(0, task_embedding=task_embedding, history_summary=history_summary)
+        control_outputs = planner.forward_control(0, task_embedding=task_embedding, history_summary=history_summary)
+
+        self.assertEqual(tuple(policy_outputs.shared_gate.shape), (1, 1))
+        self.assertEqual(tuple(control_outputs.shared_gate.shape), (1, 1))
+        self.assertEqual(tuple(control_outputs.delta_raw.shape), (1, 1))
+        self.assertEqual(tuple(control_outputs.delta_from_representation.shape), (1, 1))
+        self.assertEqual(tuple(control_outputs.delta_bias.shape), (1, 1))
+        self.assertTrue(torch.allclose(control_outputs.delta_raw, torch.zeros_like(control_outputs.delta_raw)))
+        self.assertTrue(
+            torch.allclose(control_outputs.delta_from_representation, torch.zeros_like(control_outputs.delta_from_representation))
+        )
+        self.assertTrue(torch.allclose(control_outputs.delta_bias, torch.zeros_like(control_outputs.delta_bias)))
+        self.assertGreaterEqual(float(control_outputs.control_head_weight_norm), 0.0)
+        self.assertAlmostEqual(float(control_outputs.control_head_bias_norm), 0.0, places=6)
+
+    def test_hybrid_anchored_gate_stays_on_anchor_at_zero_init_and_moves_monotonically(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "hybrid_anchor_gate_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        config["training"]["planner_mode"] = "hybrid"
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        trainer = NHLoRATrainer(config, configure_logger(level=logging.WARNING), benchmark=benchmark)
+
+        raw_outputs = PlannerControlOutputs(
+            shared_gate=torch.tensor([[0.5]], dtype=torch.float32),
+            shared_gate_logit=torch.zeros(1, 1),
+            delta_raw=torch.zeros(1, 1),
+        )
+        anchored = trainer._compose_hybrid_control_outputs(raw_outputs, anchor_beta=0.7)
+        self.assertAlmostEqual(float(anchored.shared_gate.item()), 0.7, places=6)
+        self.assertAlmostEqual(float(anchored.anchor_beta.item()), 0.7, places=6)
+        self.assertAlmostEqual(float(anchored.delta_logit.item()), 0.0, places=6)
+
+        positive = trainer._compose_hybrid_control_outputs(
+            PlannerControlOutputs(
+                shared_gate=torch.sigmoid(torch.tensor([[1.0]], dtype=torch.float32)),
+                shared_gate_logit=torch.tensor([[1.0]], dtype=torch.float32),
+                delta_raw=torch.tensor([[1.0]], dtype=torch.float32),
+            ),
+            anchor_beta=0.5,
+        )
+        negative = trainer._compose_hybrid_control_outputs(
+            PlannerControlOutputs(
+                shared_gate=torch.sigmoid(torch.tensor([[-1.0]], dtype=torch.float32)),
+                shared_gate_logit=torch.tensor([[-1.0]], dtype=torch.float32),
+                delta_raw=torch.tensor([[-1.0]], dtype=torch.float32),
+            ),
+            anchor_beta=0.5,
+        )
+        self.assertGreater(float(positive.shared_gate.item()), 0.5)
+        self.assertLess(float(negative.shared_gate.item()), 0.5)
+        self.assertLessEqual(
+            float(positive.delta_logit.abs().max().item()),
+            float(config["training"]["planner_control_delta_logit_scale"]) + 1e-6,
+        )
+        expected_positive_delta = float(
+            config["training"]["planner_control_delta_logit_scale"]
+            * F.softsign(torch.tensor([[1.0]], dtype=torch.float32)).item()
+        )
+        self.assertAlmostEqual(float(positive.delta_logit.item()), expected_positive_delta, places=6)
+
+    def test_planner_control_representation_normalization_is_rms_stable(self):
+        planner = HorizonPlanner(
+            selected_blocks=[0],
+            task_embedding_dim=4,
+            history_dim=6,
+            hidden_dim=8,
+            layer_embedding_dim=3,
+            rank_min=1,
+            rank_max=4,
+            tau_novelty=0.5,
+            tau_conflict=0.5,
+        )
+        representation = torch.tensor([[1.0, -2.0, 3.0, -4.0, 5.0, -6.0, 7.0, -8.0]], dtype=torch.float32)
+        scaled_representation = representation * 11.0
+        normalized = planner.control_branch._normalize_control_representation(representation)
+        normalized_scaled = planner.control_branch._normalize_control_representation(scaled_representation)
+        rms = torch.sqrt(normalized.pow(2).mean(dim=-1))
+        self.assertTrue(torch.allclose(normalized, normalized_scaled, atol=1e-6))
+        self.assertTrue(torch.allclose(rms, torch.ones_like(rms), atol=1e-6))
+
+        output_head = planner.control_branch.output_heads["0"]
+        with torch.no_grad():
+            output_head.weight.fill_(1.0)
+            if output_head.bias is not None:
+                output_head.bias.zero_()
+        delta_from_representation = F.linear(normalized, output_head.weight, bias=None)
+        delta_from_scaled_representation = F.linear(normalized_scaled, output_head.weight, bias=None)
+        self.assertTrue(torch.allclose(delta_from_representation, delta_from_scaled_representation, atol=1e-6))
+
+    def test_stage16_imagenet_a_builder_requires_exact_200_matching_classes(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "stage16_imagenet_a_builder_unit"
+        dataset_root = workspace_tmp / "imagenet_a_fixture"
+        class_names = _make_class_names(200)
+        _write_imagefolder_dataset(
+            dataset_root,
+            {
+                "train": class_names,
+                "test": class_names,
+            },
+            samples_per_class=1,
+        )
+
+        config = {
+            "benchmark": {
+                "dataset_name": "imagenet_a",
+                "data_root": str(dataset_root),
+                "num_tasks": 10,
+                "classes_per_task": 20,
+                "image_size": 224,
+            }
+        }
+        benchmark = build_benchmark(config)
+
+        self.assertEqual(benchmark.name, "imagenet_a")
+        self.assertEqual(benchmark.num_classes, 200)
+        self.assertEqual(len(benchmark.tasks), 10)
+        self.assertEqual(benchmark.tasks[0].class_ids, list(range(20)))
+        self.assertEqual(benchmark.tasks[1].class_ids, list(range(20, 40)))
+        self.assertTrue(all(record.path for record in benchmark.tasks[0].train_records))
+        self.assertEqual(len(benchmark.tasks[0].train_records), 20)
+        self.assertEqual(len(benchmark.tasks[1].test_records), 20)
+        self.assertEqual(benchmark.tasks[0].metadata["benchmark"], "imagenet_a")
+        self.assertIn("class_to_idx", benchmark.tasks[0].metadata)
+        self.assertEqual(benchmark.tasks[0].metadata["class_count"], 20)
+        self.assertEqual(benchmark.tasks[0].metadata["train_sample_count"], 20)
+        self.assertEqual(benchmark.metadata["class_name_count"], 200)
+        self.assertEqual(benchmark.metadata["split_class_names"]["train"][:3], class_names[:3])
+        self.assertEqual(benchmark.metadata["split_class_names"]["test"][-3:], class_names[-3:])
+
+        with self.assertRaises(KeyError):
+            build_benchmark({"benchmark": {"dataset_name": "cub200"}})
+
+    def test_stage16_imagenet_a_builder_rejects_mismatched_train_test_classes(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "stage16_imagenet_a_mismatch_unit"
+        dataset_root = workspace_tmp / "imagenet_a_fixture"
+        train_class_names = _make_class_names(200)
+        test_class_names = list(train_class_names)
+        test_class_names[-1] = "class_999"
+        _write_imagefolder_dataset(
+            dataset_root,
+            {
+                "train": train_class_names,
+                "test": test_class_names,
+            },
+            samples_per_class=1,
+        )
+
+        config = {
+            "benchmark": {
+                "dataset_name": "imagenet_a",
+                "data_root": str(dataset_root),
+                "num_tasks": 10,
+                "classes_per_task": 20,
+                "image_size": 224,
+            }
+        }
+
+        with self.assertRaisesRegex(ValueError, "mismatched class folders"):
+            build_benchmark(config)
+
+    def test_stage16_imagenet_a_builder_rejects_wrong_class_count(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "stage16_imagenet_a_classcount_unit"
+        dataset_root = workspace_tmp / "imagenet_a_fixture"
+        class_names = _make_class_names(199)
+        _write_imagefolder_dataset(
+            dataset_root,
+            {
+                "train": class_names,
+                "test": class_names,
+            },
+            samples_per_class=1,
+        )
+
+        config = {
+            "benchmark": {
+                "dataset_name": "imagenet_a",
+                "data_root": str(dataset_root),
+                "num_tasks": 10,
+                "classes_per_task": 20,
+                "image_size": 224,
+            }
+        }
+
+        with self.assertRaisesRegex(ValueError, "expects exactly 200 classes"):
+            build_benchmark(config)
+
+    def test_stage16_imagenet_a_builder_rejects_missing_split_root(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "stage16_imagenet_a_missing_split_unit"
+        dataset_root = workspace_tmp / "imagenet_a_fixture"
+        class_names = _make_class_names(200)
+        _write_imagefolder_dataset(
+            dataset_root,
+            {
+                "train": class_names,
+            },
+            samples_per_class=1,
+        )
+
+        config = {
+            "benchmark": {
+                "dataset_name": "imagenet_a",
+                "data_root": str(dataset_root),
+                "num_tasks": 10,
+                "classes_per_task": 20,
+                "image_size": 224,
+            }
+        }
+
+        with self.assertRaisesRegex(FileNotFoundError, "expects a 'test' directory"):
+            build_benchmark(config)
+
+    def test_softsign_bounded_residual_keeps_gradient_on_large_delta_raw(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "hybrid_softsign_gradient_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        config["training"]["planner_mode"] = "hybrid"
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        trainer = NHLoRATrainer(config, configure_logger(level=logging.WARNING), benchmark=benchmark)
+
+        delta_raw = torch.tensor([[10.0]], dtype=torch.float32, requires_grad=True)
+        outputs = trainer._compose_hybrid_control_outputs(
+            PlannerControlOutputs(
+                shared_gate=torch.sigmoid(delta_raw.detach()),
+                shared_gate_logit=delta_raw.detach(),
+                delta_raw=delta_raw,
+            ),
+            anchor_beta=0.5,
+        )
+        loss = outputs.shared_gate.sum()
+        loss.backward()
+
+        self.assertIsNotNone(delta_raw.grad)
+        self.assertGreater(abs(float(delta_raw.grad.item())), 0.0)
+        self.assertAlmostEqual(
+            float(outputs.delta_logit.item()),
+            float(config["training"]["planner_control_delta_logit_scale"] * F.softsign(torch.tensor([[10.0]])).item()),
+            places=6,
+        )
 
     def test_materialize_action_is_pure_and_reuse_shared_is_shared_only(self):
         layer = NHLoRALayer(
@@ -602,8 +966,19 @@ class PaperAlignmentUnitTests(unittest.TestCase):
 
         layer.last_structural_action = "reuse_shared"
         profile = model.build_inference_profile()
-        self.assertEqual(profile[1]["active_slot_candidates"], [first_slot, second_slot])
-        self.assertFalse(profile[1]["shared_only"])
+        self.assertEqual(profile[1]["active_slot_candidates"], [])
+        self.assertIsNone(profile[1]["selected_slot"])
+        self.assertTrue(profile[1]["deterministic"])
+        self.assertTrue(profile[1]["shared_only"])
+        self.assertEqual(profile[1]["rank_cfg"], {first_slot: 1, second_slot: 1})
+
+        layer.last_structural_action = "freeze_old_strong_retention"
+        profile = model.build_inference_profile()
+        self.assertEqual(profile[1]["active_slot_candidates"], [])
+        self.assertIsNone(profile[1]["selected_slot"])
+        self.assertTrue(profile[1]["deterministic"])
+        self.assertTrue(profile[1]["shared_only"])
+        self.assertTrue(profile[1]["strong_retention"])
 
     def test_retention_feature_representation_modes(self):
         repo_root = Path(__file__).resolve().parents[1]
@@ -779,6 +1154,104 @@ class PaperAlignmentUnitTests(unittest.TestCase):
 
         self.assertTrue(torch.allclose(trainer.model.classifier.weight.grad, torch.ones_like(trainer.model.classifier.weight.grad)))
 
+    def test_classifier_lr_scale_default_keeps_classifier_in_base_group(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "classifier_lr_default_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        logger = configure_logger(level=logging.WARNING)
+        trainer = NHLoRATrainer(config, logger, benchmark=benchmark)
+        trainer.model.classifier.expand(2)
+
+        optimizer = trainer._build_optimizer()
+        classifier_param_ids = {id(parameter) for parameter in trainer.model.classifier.parameters()}
+        classifier_groups = [
+            group
+            for group in optimizer.param_groups
+            if any(id(parameter) in classifier_param_ids for parameter in group["params"])
+        ]
+
+        self.assertEqual(len(classifier_groups), 1)
+        self.assertAlmostEqual(float(classifier_groups[0]["lr"]), float(config["training"]["lr"]), places=12)
+        self.assertGreater(len(classifier_groups[0]["params"]), len(classifier_param_ids))
+
+    def test_classifier_lr_scale_nondefault_uses_separate_param_group(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "classifier_lr_scaled_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        config["training"]["classifier_lr_scale"] = 0.25
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        logger = configure_logger(level=logging.WARNING)
+        trainer = NHLoRATrainer(config, logger, benchmark=benchmark)
+        trainer.model.classifier.expand(2)
+
+        optimizer = trainer._build_optimizer()
+        classifier_param_ids = {id(parameter) for parameter in trainer.model.classifier.parameters()}
+        classifier_groups = [
+            group
+            for group in optimizer.param_groups
+            if any(id(parameter) in classifier_param_ids for parameter in group["params"])
+        ]
+
+        self.assertEqual(len(classifier_groups), 1)
+        self.assertAlmostEqual(float(classifier_groups[0]["lr"]), float(config["training"]["lr"]) * 0.25, places=12)
+        self.assertTrue(all(id(parameter) in classifier_param_ids for parameter in classifier_groups[0]["params"]))
+
+    def test_freeze_all_classifier_epochs_masks_all_rows(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "classifier_freeze_all_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        config["training"]["freeze_old_classifier_weights"] = False
+        config["training"]["freeze_all_classifier_epochs"] = 2
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        logger = configure_logger(level=logging.WARNING)
+        trainer = NHLoRATrainer(config, logger, benchmark=benchmark)
+        trainer.model.classifier.expand(4)
+        trainer.model.classifier.weight.grad = torch.ones_like(trainer.model.classifier.weight)
+
+        trainer._mask_old_classifier_gradients({"old_num_classes": 2, "current_epoch": 1})
+
+        self.assertTrue(torch.allclose(trainer.model.classifier.weight.grad, torch.zeros_like(trainer.model.classifier.weight.grad)))
+
+    def test_freeze_new_classifier_epochs_masks_only_new_rows(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "classifier_freeze_new_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        config["training"]["freeze_old_classifier_weights"] = False
+        config["training"]["freeze_new_classifier_epochs"] = 2
+        config["training"]["classifier_lr_scale"] = 0.5
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        logger = configure_logger(level=logging.WARNING)
+        trainer = NHLoRATrainer(config, logger, benchmark=benchmark)
+        trainer.model.classifier.expand(4)
+        trainer.model.classifier.weight.grad = torch.ones_like(trainer.model.classifier.weight)
+
+        trainer._mask_old_classifier_gradients({"old_num_classes": 2, "current_epoch": 1})
+
+        self.assertTrue(torch.allclose(trainer.model.classifier.weight.grad[:2], torch.ones_like(trainer.model.classifier.weight.grad[:2])))
+        self.assertTrue(torch.allclose(trainer.model.classifier.weight.grad[2:], torch.zeros_like(trainer.model.classifier.weight.grad[2:])))
+
+    def test_freeze_new_classifier_epochs_expires_after_configured_epochs(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "classifier_freeze_new_expired_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        config["training"]["freeze_old_classifier_weights"] = False
+        config["training"]["freeze_new_classifier_epochs"] = 1
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        logger = configure_logger(level=logging.WARNING)
+        trainer = NHLoRATrainer(config, logger, benchmark=benchmark)
+        trainer.model.classifier.expand(4)
+        trainer.model.classifier.weight.grad = torch.ones_like(trainer.model.classifier.weight)
+
+        trainer._mask_old_classifier_gradients({"old_num_classes": 2, "current_epoch": 2})
+
+        self.assertTrue(torch.allclose(trainer.model.classifier.weight.grad, torch.ones_like(trainer.model.classifier.weight.grad)))
+
     def test_teacher_profile_is_built_from_teacher_model(self):
         repo_root = Path(__file__).resolve().parents[1]
         workspace_tmp = repo_root / "outputs" / "test_tmp" / "teacher_profile_unit"
@@ -790,7 +1263,7 @@ class PaperAlignmentUnitTests(unittest.TestCase):
         layer = trainer.model.layers["1"]
         first_slot = layer.add_slot(initial_rank=1, task_id=1)
         second_slot = layer.add_slot(initial_rank=1, task_id=2)
-        layer.last_structural_action = "reuse_shared"
+        layer.last_structural_action = "expand_rank_existing_slot"
         trainer.inference_profile = {1: {"active_slot_candidates": []}}
 
         _, teacher_profile = trainer._build_teacher_payload()
@@ -873,6 +1346,508 @@ class PaperAlignmentUnitTests(unittest.TestCase):
         self.assertIn("avg_candidate_count=2.00", joined_messages)
         self.assertIn("avg_topk=2.00", joined_messages)
 
+    def test_stage5_slot_lifecycle_summary_exposes_slot_ids_without_mutating_inputs(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "stage5_slot_lifecycle_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        logger = _ListLogger()
+        trainer = NHLoRATrainer(config, logger, benchmark=benchmark)
+        layer = trainer.model.layers["1"]
+        first_slot = layer.add_slot(initial_rank=1, task_id=1)
+        second_slot = layer.add_slot(initial_rank=1, task_id=2)
+        layer.slot_metadata[first_slot].retained_for_inference = False
+        layer.slot_metadata[first_slot].usage_ema = 0.1
+        layer.slot_metadata[second_slot].usage_ema = 0.7
+        layer.freeze_slot(second_slot)
+        config_like = {
+            "active_slot_candidates": [second_slot],
+            "selected_slot": second_slot,
+            "shared_only": False,
+            "fallback_action": None,
+        }
+        before_config = deepcopy(config_like)
+        before_state = deepcopy(layer.export_structure_state())
+
+        summary = trainer._slot_lifecycle_summary(1, config_like=config_like)
+
+        self.assertEqual(summary["live_slot_ids"], [first_slot, second_slot])
+        self.assertEqual(summary["retained_slot_ids"], [second_slot])
+        self.assertEqual(summary["candidate_slot_ids"], [second_slot])
+        self.assertEqual(summary["selected_slot_id"], second_slot)
+        self.assertEqual(summary["frozen_slot_ids"], [second_slot])
+        self.assertEqual(summary["fallback_reason"], "none")
+        self.assertEqual(config_like, before_config)
+        self.assertEqual(layer.export_structure_state(), before_state)
+
+    def test_stage5_profile_summary_preserves_retained_slots_when_shared_only(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "stage5_profile_summary_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        logger = _ListLogger()
+        trainer = NHLoRATrainer(config, logger, benchmark=benchmark)
+        layer = trainer.model.layers["1"]
+        first_slot = layer.add_slot(initial_rank=1, task_id=1)
+        second_slot = layer.add_slot(initial_rank=1, task_id=2)
+        layer.slot_metadata[first_slot].retained_for_inference = False
+        layer.slot_metadata[second_slot].retained_for_inference = True
+        layer.last_structural_action = "expand_rank_existing_slot"
+
+        profile = trainer.model.build_inference_profile()
+        summary = trainer._slot_lifecycle_summary(1, config_like=profile[1])
+
+        self.assertEqual(summary["live_slot_ids"], [first_slot, second_slot])
+        self.assertEqual(summary["retained_slot_ids"], [second_slot])
+        self.assertEqual(summary["candidate_slot_ids"], [second_slot])
+        self.assertFalse(profile[1]["shared_only"])
+
+        layer.last_structural_action = "reuse_shared"
+        shared_only_profile = trainer.model.build_inference_profile()
+        shared_only_summary = trainer._slot_lifecycle_summary(1, config_like=shared_only_profile[1])
+
+        self.assertEqual(shared_only_summary["retained_slot_ids"], [second_slot])
+        self.assertEqual(shared_only_summary["candidate_slot_ids"], [])
+        self.assertTrue(shared_only_profile[1]["shared_only"])
+
+        layer.slot_metadata[second_slot].retained_for_inference = False
+        empty_profile = trainer.model.build_inference_profile()
+        empty_summary = trainer._slot_lifecycle_summary(1, config_like=empty_profile[1])
+
+        self.assertEqual(empty_summary["retained_slot_ids"], [])
+        self.assertEqual(empty_summary["candidate_slot_ids"], [])
+        self.assertTrue(empty_profile[1]["shared_only"])
+
+    def test_stage5_route_comparison_flags_empty_applied_nonempty_profile(self):
+        flags = NHLoRATrainer._route_comparison_flags(
+            applied_candidates=[],
+            train_candidates=[],
+            eval_applied_candidates=[],
+            profile_candidates=[0],
+            eval_profile_candidates=[0],
+        )
+
+        self.assertTrue(flags["applied_empty_profile_nonempty"])
+        self.assertFalse(flags["train_eval_applied_mismatch"])
+        self.assertFalse(flags["eval_profile_mismatch"])
+
+    def test_stage5_plan_debug_does_not_mutate_plan_or_profile_state(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "stage5_no_mutation_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        config["training"]["routing_debug_logging"] = True
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        logger = _ListLogger()
+        trainer = NHLoRATrainer(config, logger, benchmark=benchmark)
+        layer = trainer.model.layers["1"]
+        slot_id = layer.add_slot(initial_rank=1, task_id=1)
+        materialized_plan = MaterializedLayerPlan(
+            requested_action="expand_rank_existing_slot",
+            action="expand_rank_existing_slot",
+            selected_slot=slot_id,
+            target_rank=2,
+            rank_delta=1,
+            create_new_slot=False,
+            new_slot_rank=None,
+            candidate_slots=[slot_id],
+            shared_only=False,
+        )
+        applied_plan = {
+            "action": "expand_rank_existing_slot",
+            "requested_action": "expand_rank_existing_slot",
+            "active_slot_candidates": [slot_id],
+            "selected_slot": slot_id,
+            "rank_cfg": {slot_id: 1},
+            "shared_only": False,
+            "deterministic": True,
+            "created_new_slot": False,
+            "fallback_action": None,
+        }
+        profile = trainer.model.build_inference_profile()
+        before_materialized = deepcopy(materialized_plan)
+        before_applied = deepcopy(applied_plan)
+        before_profile = deepcopy(profile)
+        before_state = deepcopy(layer.export_structure_state())
+        context = {
+            "task_number": 2,
+            "raw_planner": {},
+            "materialized_plans": {1: materialized_plan},
+            "applied_plans": {1: applied_plan},
+        }
+
+        trainer._log_stage5_plan_debug(context)
+        trainer._log_stage5_lifecycle_for_profile(context, "Profile", profile)
+
+        self.assertEqual(materialized_plan, before_materialized)
+        self.assertEqual(applied_plan, before_applied)
+        self.assertEqual(profile, before_profile)
+        self.assertEqual(layer.export_structure_state(), before_state)
+        self.assertIn("[MaterializedPlan][Task 2][Layer 1]", "\n".join(logger.messages))
+
+    def test_stage5_train_eval_comparison_uses_same_input_and_restores_rng(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "stage5_mode_compare_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        config["training"]["routing_debug_logging"] = True
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        logger = _ListLogger()
+        trainer = NHLoRATrainer(config, logger, benchmark=benchmark)
+        trainer.model.classifier.expand(2)
+        layer = trainer.model.layers["1"]
+        slot_id = layer.add_slot(initial_rank=1, task_id=1)
+        applied_plan = {
+            "active_slot_candidates": [slot_id],
+            "selected_slot": slot_id,
+            "rank_cfg": {slot_id: 1},
+            "shared_only": False,
+            "deterministic": True,
+        }
+        materialized_plan = MaterializedLayerPlan(
+            requested_action="expand_rank_existing_slot",
+            action="expand_rank_existing_slot",
+            selected_slot=slot_id,
+            target_rank=1,
+            rank_delta=0,
+            create_new_slot=False,
+            new_slot_rank=None,
+            candidate_slots=[slot_id],
+        )
+        trainer.inference_profile = trainer.model.build_inference_profile()
+        trainer.model.train()
+        torch.manual_seed(1505)
+        probe_images = torch.randn(2, 3, 32, 32)
+        rng_before = torch.random.get_rng_state().clone()
+        context = {
+            "task_number": 2,
+            "task_state": None,
+            "applied_plans": {1: applied_plan},
+            "materialized_plans": {1: materialized_plan},
+            "routing_debug_probe_images": probe_images,
+            "routing_debug_probe_source": "unit-same-input",
+        }
+
+        trainer._log_stage5_train_eval_comparison(context)
+
+        self.assertTrue(trainer.model.training)
+        self.assertTrue(torch.equal(torch.random.get_rng_state(), rng_before))
+        joined_messages = "\n".join(logger.messages)
+        self.assertIn("[RouteModeCompare][Task 2] input_source=unit-same-input", joined_messages)
+        self.assertIn("[RouteModeCompare][Task 2][Layer 1]", joined_messages)
+
+    def test_stage5_shared_only_inference_profile_matches_applied_plan(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "stage5_shared_only_profile_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        config["training"]["routing_debug_logging"] = True
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        logger = _ListLogger()
+        trainer = NHLoRATrainer(config, logger, benchmark=benchmark)
+        trainer.model.classifier.expand(2)
+        layer = trainer.model.layers["1"]
+        slot_id = layer.add_slot(initial_rank=1, task_id=1)
+        layer.slot_metadata[slot_id].retained_for_inference = True
+        layer.last_structural_action = "reuse_shared"
+        materialized_plan = MaterializedLayerPlan(
+            requested_action="reuse_shared",
+            action="reuse_shared",
+            selected_slot=None,
+            target_rank=None,
+            rank_delta=0,
+            create_new_slot=False,
+            new_slot_rank=None,
+            candidate_slots=[],
+            shared_only=True,
+        )
+        applied_plan = {
+            "action": "reuse_shared",
+            "requested_action": "reuse_shared",
+            "active_slot_candidates": [],
+            "selected_slot": None,
+            "rank_cfg": {slot_id: 1},
+            "shared_only": True,
+            "deterministic": True,
+            "created_new_slot": False,
+            "fallback_action": None,
+        }
+        trainer.inference_profile = trainer.model.build_inference_profile()
+        trainer.model.train()
+        torch.manual_seed(1517)
+        probe_images = torch.randn(2, 3, 32, 32)
+        context = {
+            "task_number": 3,
+            "task_state": None,
+            "applied_plans": {1: applied_plan},
+            "materialized_plans": {1: materialized_plan},
+            "routing_debug_probe_images": probe_images,
+            "routing_debug_probe_source": "unit-shared-only",
+        }
+
+        trainer._log_stage5_train_eval_comparison(context)
+
+        joined_messages = "\n".join(logger.messages)
+        self.assertIn("[RouteModeCompare][Task 3] input_source=unit-shared-only", joined_messages)
+        self.assertIn("shared_only_train=True", joined_messages)
+        self.assertIn("shared_only_profile=True", joined_messages)
+        self.assertIn("mismatch_applied_empty_profile_nonempty=False", joined_messages)
+        self.assertIn("mismatch_train_eval_applied=False", joined_messages)
+        self.assertIn("mismatch_eval_profile=False", joined_messages)
+
+    def test_stage4_zero_lora_block_parity_preserves_out_proj_semantics(self):
+        torch.manual_seed(1404)
+        for insertion_points in (["q_proj", "v_proj"], ["q_proj", "v_proj", "out_proj"]):
+            with self.subTest(insertion_points=insertion_points):
+                model = self._build_stage4_model(insertion_points)
+                model.eval()
+                block = model.backbone.core_model.blocks[1]
+                layer = model.layers["1"]
+                slot_id = layer.add_slot(initial_rank=1, task_id=1)
+                tokens = torch.randn(2, 5, model.backbone.embed_dim)
+
+                plain = model.backbone._forward_block_plain(block, tokens)
+                adapted, _ = model.backbone._forward_block_with_adapter(
+                    block,
+                    tokens,
+                    layer,
+                    self._stage4_planner_cfg(slot_id),
+                    task_state=None,
+                )
+
+                self.assertTrue(torch.allclose(adapted, plain, atol=1e-6))
+
+    def test_stage4_active_adapter_changes_output_and_delta_logger(self):
+        torch.manual_seed(1405)
+        model = self._build_stage4_model(["q_proj", "v_proj"])
+        model.eval()
+        block = model.backbone.core_model.blocks[1]
+        layer = model.layers["1"]
+        slot_id = layer.add_slot(initial_rank=1, task_id=1)
+        with torch.no_grad():
+            for point_name in ("q_proj", "v_proj"):
+                bank = layer.point_banks[point_name]
+                bank.shared_b.fill_(0.05)
+                bank.slot_b[slot_id].fill_(0.05)
+        tokens = torch.randn(2, 5, model.backbone.embed_dim)
+        accumulator = {}
+
+        plain = model.backbone._forward_block_plain(block, tokens)
+        adapted, _ = model.backbone._forward_block_with_adapter(
+            block,
+            tokens,
+            layer,
+            self._stage4_planner_cfg(slot_id, accumulator=accumulator),
+            task_state=None,
+        )
+
+        self.assertGreater(float((adapted - plain).abs().max().item()), 1e-6)
+        self.assertIn(1, accumulator)
+        shared_max = max(
+            point_stats["shared"]["max_abs"]
+            for point_stats in accumulator[1].values()
+            if "shared" in point_stats
+        )
+        slot_max = max(
+            point_stats["slot"]["max_abs"]
+            for point_stats in accumulator[1].values()
+            if "slot" in point_stats
+        )
+        self.assertGreater(shared_max, 0.0)
+        self.assertGreater(slot_max, 0.0)
+
+    def test_stage4_ce_grad_flows_to_active_slot_and_shared_b(self):
+        torch.manual_seed(1406)
+        model = self._build_stage4_model(["q_proj", "v_proj"])
+        model.train()
+        model.classifier.expand(2)
+        layer = model.layers["1"]
+        slot_id = layer.add_slot(initial_rank=1, task_id=1)
+        images = torch.randn(4, 3, 32, 32)
+        labels = torch.tensor([0, 1, 0, 1])
+
+        outputs = model.forward_with_state(
+            images,
+            task_state=None,
+            planner_out={1: self._stage4_planner_cfg(slot_id)},
+        )
+        loss = F.cross_entropy(outputs["logits"], labels)
+        loss.backward()
+
+        slot_grad_norm = 0.0
+        shared_grad_norm = 0.0
+        for point_name in ("q_proj", "v_proj"):
+            bank = layer.point_banks[point_name]
+            self.assertIsNotNone(bank.slot_b[slot_id].grad)
+            self.assertIsNotNone(bank.shared_b.grad)
+            slot_grad_norm += float(bank.slot_b[slot_id].grad.norm().item())
+            shared_grad_norm += float(bank.shared_b.grad.norm().item())
+        self.assertTrue(outputs["features"].requires_grad)
+        self.assertGreater(slot_grad_norm, 0.0)
+        self.assertGreater(shared_grad_norm, 0.0)
+
+    def test_adapter_delta_debug_records_shared_and_slot_stats(self):
+        layer = NHLoRALayer(
+            embed_dim=8,
+            selected_points=["q_proj"],
+            shared_rank=2,
+            slot_r_max=4,
+            slot_init_rank=1,
+            bootstrap_slot_rank=1,
+            max_slots=2,
+            router_topk=1,
+            router_temperature=1.0,
+            task_embedding_dim=8,
+        )
+        slot_id = layer.add_slot(initial_rank=1, task_id=1)
+        hidden_states = torch.randn(2, 5, 8)
+        accumulator = {}
+        planner_cfg = {
+            "shared_gate": 1.0,
+            "rank_cfg": {slot_id: 1},
+            "_debug_delta_stats": accumulator,
+            "_debug_block_id": 7,
+        }
+
+        shared_delta = layer._shared_delta("q_proj", hidden_states, planner_cfg)
+        slot_delta = layer._slot_delta(
+            "q_proj",
+            hidden_states,
+            route_state={"candidate_slots": [slot_id]},
+            planner_cfg=planner_cfg,
+        )
+
+        self.assertEqual(shared_delta.shape, hidden_states.shape)
+        self.assertEqual(slot_delta.shape, hidden_states.shape)
+        self.assertIn(7, accumulator)
+        self.assertIn("q_proj", accumulator[7])
+        self.assertEqual(accumulator[7]["q_proj"]["shared"]["calls"], 1)
+        self.assertEqual(accumulator[7]["q_proj"]["slot"]["calls"], 1)
+        self.assertIn("norm_sum", accumulator[7]["q_proj"]["shared"])
+        self.assertIn("mean_abs_sum", accumulator[7]["q_proj"]["slot"])
+
+    def test_shared_gate_tensor_changes_effective_shared_delta(self):
+        layer = NHLoRALayer(
+            embed_dim=8,
+            selected_points=["q_proj"],
+            shared_rank=2,
+            slot_r_max=4,
+            slot_init_rank=1,
+            bootstrap_slot_rank=1,
+            max_slots=2,
+            router_topk=1,
+            router_temperature=1.0,
+            task_embedding_dim=8,
+        )
+        bank = layer.point_banks["q_proj"]
+        with torch.no_grad():
+            bank.shared_b.fill_(0.05)
+        hidden_states = torch.randn(2, 5, 8)
+
+        low_gate = layer._shared_delta("q_proj", hidden_states, {"shared_gate": torch.tensor([[0.2]])})
+        high_gate = layer._shared_delta("q_proj", hidden_states, {"shared_gate": torch.tensor([[0.8]])})
+
+        self.assertFalse(torch.allclose(low_gate, high_gate))
+        self.assertGreater(float(high_gate.norm().item()), float(low_gate.norm().item()))
+
+    def test_stage1_debug_helpers_are_config_gated_and_log_expected_records(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "stage1_debug_helpers_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        for flag in (
+            "adapter_delta_debug_logging",
+            "final_feature_diff_debug_logging",
+            "classifier_drift_debug_logging",
+            "grad_norm_debug_logging",
+            "logit_margin_debug_logging",
+        ):
+            config["training"][flag] = True
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        logger = _ListLogger()
+        trainer = NHLoRATrainer(config, logger, benchmark=benchmark)
+        trainer.model.classifier.expand(4)
+
+        context = {
+            "task_number": 2,
+            "current_epoch": 1,
+            "old_num_classes": 2,
+            "applied_plans": {1: {"shared_gate": 1.0}},
+            "grad_norm_debug_accumulator": {
+                group: {"sum": 0.0, "max": 0.0, "batches": 0}
+                for group in ("shared", "slot", "router", "planner_policy", "planner_control", "planner", "classifier")
+            },
+        }
+        disabled_config = _build_test_config(str(workspace_tmp))
+        disabled_trainer = NHLoRATrainer(disabled_config, _ListLogger(), benchmark=benchmark)
+        disabled_context = dict(context)
+        disabled_context["applied_plans"] = {1: {"shared_gate": 1.0}}
+        self.assertIs(disabled_trainer._plans_for_training_forward(disabled_context), disabled_context["applied_plans"])
+
+        debug_plans = trainer._plans_for_training_forward(context)
+        self.assertIn("_debug_delta_stats", debug_plans[1])
+        self.assertNotIn("_debug_delta_stats", context["applied_plans"][1])
+
+        feature_dim = trainer.model.backbone.embed_dim
+        outputs = {
+            "features": torch.randn(3, feature_dim),
+            "logits": torch.tensor(
+                [
+                    [0.2, 0.1, 1.1, 1.3],
+                    [0.1, 0.4, 1.2, 1.1],
+                    [0.0, 0.3, 0.9, 1.0],
+                ]
+            ),
+        }
+        teacher_outputs = {"features": outputs["features"] + 0.01}
+        context["old_classifier_weight_snapshot"] = trainer.model.classifier.weight[:2].detach().clone()
+        with torch.no_grad():
+            trainer.model.classifier.weight[:2].add_(0.01)
+
+        trainer._log_final_feature_diff_debug(context, outputs, teacher_outputs)
+        trainer._log_logit_margin_debug(context, outputs)
+        trainer._log_classifier_drift_debug(context)
+
+        layer = trainer.model.layers["1"]
+        slot_id = layer.add_slot(initial_rank=1, task_id=1)
+        bank = layer.point_banks["q_proj"]
+        bank.shared_a.grad = torch.ones_like(bank.shared_a) * 0.01
+        bank.slot_a[slot_id].grad = torch.ones_like(bank.slot_a[slot_id]) * 0.02
+        layer.query_proj.weight.grad = torch.ones_like(layer.query_proj.weight) * 0.03
+        trainer.model.classifier.weight.grad = torch.ones_like(trainer.model.classifier.weight) * 0.04
+        planner_param = next(trainer.planner.parameters())
+        planner_param.grad = torch.ones_like(planner_param) * 0.05
+        control_param = next(trainer.planner.control_parameters())
+        control_param.grad = torch.ones_like(control_param) * 0.06
+        trainer._accumulate_grad_norm_debug(context)
+        trainer._log_grad_norm_debug(context)
+
+        context["adapter_delta_debug_accumulator"] = {
+            1: {
+                "q_proj": {
+                    "shared": {"calls": 1, "norm_sum": 1.0, "mean_abs_sum": 0.5, "max_abs": 0.7},
+                    "slot": {"calls": 1, "norm_sum": 0.0, "mean_abs_sum": 0.0, "max_abs": 0.0},
+                }
+            }
+        }
+        trainer._log_adapter_delta_debug(context)
+
+        joined_messages = "\n".join(logger.messages)
+        self.assertIn("[FinalFeatureDiff][Task 2][Epoch 1]", joined_messages)
+        self.assertIn("[LogitMargin][Task 2][Epoch 1]", joined_messages)
+        self.assertIn("[ClassifierDrift][Task 2][Epoch 1]", joined_messages)
+        self.assertIn("[GradNorm][Task 2][Epoch 1][shared]", joined_messages)
+        self.assertIn("[GradNorm][Task 2][Epoch 1][slot]", joined_messages)
+        self.assertIn("[GradNorm][Task 2][Epoch 1][router]", joined_messages)
+        self.assertIn("[GradNorm][Task 2][Epoch 1][planner_policy]", joined_messages)
+        self.assertIn("[GradNorm][Task 2][Epoch 1][planner_control]", joined_messages)
+        self.assertIn("[GradNorm][Task 2][Epoch 1][planner]", joined_messages)
+        self.assertIn("[GradNorm][Task 2][Epoch 1][classifier]", joined_messages)
+        self.assertIn("[AdapterDelta][Task 2][Epoch 1][Layer 1][q_proj][shared]", joined_messages)
+        self.assertIn("[AdapterDelta][Task 2][Epoch 1][Layer 1][q_proj][slot]", joined_messages)
+
     def test_seed_config_logging_tolerates_missing_optional_fields(self):
         repo_root = Path(__file__).resolve().parents[1]
         workspace_tmp = repo_root / "outputs" / "test_tmp" / "seed_config_log_unit"
@@ -893,6 +1868,22 @@ class PaperAlignmentUnitTests(unittest.TestCase):
         self.assertIn("retention_feature_representation=cls", joined_messages)
         self.assertIn("retention_feature_diff_logging=", joined_messages)
         self.assertIn("routing_debug_logging=", joined_messages)
+        self.assertIn("planner_audit_logging=", joined_messages)
+        self.assertIn("adapter_delta_debug_logging=", joined_messages)
+        self.assertIn("final_feature_diff_debug_logging=", joined_messages)
+        self.assertIn("classifier_drift_debug_logging=", joined_messages)
+        self.assertIn("grad_norm_debug_logging=", joined_messages)
+        self.assertIn("logit_margin_debug_logging=", joined_messages)
+        self.assertIn("classifier_lr_scale=", joined_messages)
+        self.assertIn("freeze_new_classifier_epochs=", joined_messages)
+        self.assertIn("freeze_all_classifier_epochs=", joined_messages)
+        self.assertIn("planner_mode=", joined_messages)
+        self.assertIn("planner_control_recompute=", joined_messages)
+        self.assertIn("planner_policy_trainable=", joined_messages)
+        self.assertIn("planner_control_trainable=", joined_messages)
+        self.assertIn("planner_use_learned_shared_gate=", joined_messages)
+        self.assertIn("planner_soft_rank_training=", joined_messages)
+        self.assertIn("planner_hard_rank_eval=", joined_messages)
 
     def test_seed_config_warns_for_full_token_retention_features(self):
         repo_root = Path(__file__).resolve().parents[1]
@@ -909,6 +1900,813 @@ class PaperAlignmentUnitTests(unittest.TestCase):
         joined_messages = "\n".join(logger.messages)
         self.assertIn("retention_feature_representation=full_tokens", joined_messages)
         self.assertIn("can use substantially more memory", joined_messages)
+
+    def test_benchmark_sanity_summary_logs_counts_without_mutating_benchmark(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "benchmark_sanity_summary_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        benchmark = _build_tiny_benchmark(num_tasks=2)
+        benchmark.metadata = {
+            "dataset_type": "imagefolder",
+            "class_name_count": 4,
+            "split_class_names": {
+                "train": ["ant", "bear", "cat", "dog"],
+                "test": ["ant", "bear", "cat", "dog"],
+            },
+        }
+        benchmark.tasks[0].metadata = {
+            "class_names": ["ant", "bear"],
+            "class_count": 2,
+            "train_sample_count": len(benchmark.tasks[0].train_records),
+            "test_sample_count": len(benchmark.tasks[0].test_records),
+        }
+        benchmark.tasks[1].metadata = {
+            "class_names": ["cat", "dog"],
+            "class_count": 2,
+            "train_sample_count": len(benchmark.tasks[1].train_records),
+            "test_sample_count": len(benchmark.tasks[1].test_records),
+        }
+        before_benchmark_metadata = deepcopy(benchmark.metadata)
+        before_task_metadata = deepcopy([task.metadata for task in benchmark.tasks])
+        logger = _ListLogger()
+        trainer = NHLoRATrainer(config, logger, benchmark=benchmark)
+
+        trainer._log_benchmark_sanity_summary()
+
+        joined_messages = "\n".join(logger.messages)
+        self.assertIn("[BenchmarkSummary] name=tiny_alignment num_classes=4 num_tasks=2", joined_messages)
+        self.assertIn("[BenchmarkSummary][ImageFolder] class_name_count=4", joined_messages)
+        self.assertIn("[BenchmarkTaskSummary][Task 1] class_count=2 train_samples=8 test_samples=4", joined_messages)
+        self.assertIn("class_name_preview=['ant', 'bear']", joined_messages)
+        self.assertEqual(before_benchmark_metadata, benchmark.metadata)
+        self.assertEqual(before_task_metadata, [task.metadata for task in benchmark.tasks])
+
+    def test_planner_decision_label_matches_threshold_quadrants(self):
+        self.assertEqual(
+            NHLoRATrainer._planner_decision_label(
+                novelty=0.2,
+                conflict=0.2,
+                tau_novelty=0.5,
+                tau_conflict=0.5,
+            ),
+            "reuse_shared",
+        )
+        self.assertEqual(
+            NHLoRATrainer._planner_decision_label(
+                novelty=0.7,
+                conflict=0.2,
+                tau_novelty=0.5,
+                tau_conflict=0.5,
+            ),
+            "expand_rank_existing_slot",
+        )
+        self.assertEqual(
+            NHLoRATrainer._planner_decision_label(
+                novelty=0.7,
+                conflict=0.8,
+                tau_novelty=0.5,
+                tau_conflict=0.5,
+            ),
+            "open_new_slot",
+        )
+        self.assertEqual(
+            NHLoRATrainer._planner_decision_label(
+                novelty=0.2,
+                conflict=0.8,
+                tau_novelty=0.5,
+                tau_conflict=0.5,
+            ),
+            "freeze_old_strong_retention",
+        )
+
+    def test_planner_parameter_distance_summary_tracks_zero_and_nonzero(self):
+        planner = HorizonPlanner(
+            selected_blocks=[0],
+            task_embedding_dim=4,
+            history_dim=6,
+            hidden_dim=8,
+            layer_embedding_dim=3,
+            rank_min=1,
+            rank_max=4,
+            tau_novelty=0.5,
+            tau_conflict=0.5,
+        )
+        init_snapshot = NHLoRATrainer._snapshot_named_parameters(planner)
+        zero_distance = NHLoRATrainer._parameter_distance_summary(
+            NHLoRATrainer._snapshot_named_parameters(planner),
+            init_snapshot,
+        )
+
+        self.assertIsNotNone(zero_distance)
+        self.assertAlmostEqual(float(zero_distance["l2"]), 0.0, places=8)
+        self.assertAlmostEqual(float(zero_distance["max_abs"]), 0.0, places=8)
+
+        with torch.no_grad():
+            next(planner.parameters()).add_(0.125)
+
+        moved_distance = NHLoRATrainer._parameter_distance_summary(
+            NHLoRATrainer._snapshot_named_parameters(planner),
+            init_snapshot,
+        )
+
+        self.assertGreater(float(moved_distance["l2"]), 0.0)
+        self.assertGreater(float(moved_distance["max_abs"]), 0.0)
+
+    def test_planner_audit_prepare_reports_optimizer_membership_without_mutating_inputs(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "planner_audit_prepare_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        config["training"]["planner_audit_logging"] = True
+        benchmark = _build_tiny_benchmark(num_tasks=2)
+        logger = _ListLogger()
+        trainer = NHLoRATrainer(config, logger, benchmark=benchmark)
+        task_state, warmup_info = trainer._run_warmup_sensing(benchmark.tasks[1])
+        raw_planner = trainer._compute_raw_planner(task_state)
+        materialized_plans = trainer._materialize_structure(task_state, raw_planner, task_id=2)
+        applied_plans = {
+            int(block_id): {
+                "action": plan.action,
+                "requested_action": plan.requested_action,
+                "shared_only": bool(plan.shared_only),
+            }
+            for block_id, plan in materialized_plans.items()
+        }
+        optimizer = trainer._build_optimizer()
+        before_embedding = task_state.embedding.detach().clone()
+        before_signals = {
+            block_id: (
+                float(signals.novelty.item()),
+                float(signals.conflict.item()),
+                float(signals.shared_gate.item()),
+            )
+            for block_id, signals in raw_planner.items()
+        }
+        context = {
+            "task_number": 2,
+            "task_state": task_state,
+            "raw_planner": raw_planner,
+            "materialized_plans": materialized_plans,
+            "applied_plans": applied_plans,
+            "optimizer": optimizer,
+            "warmup_info": warmup_info,
+        }
+
+        trainer._log_planner_audit_prepare(context)
+
+        self.assertTrue(torch.allclose(task_state.embedding, before_embedding))
+        after_signals = {
+            block_id: (
+                float(signals.novelty.item()),
+                float(signals.conflict.item()),
+                float(signals.shared_gate.item()),
+            )
+            for block_id, signals in raw_planner.items()
+        }
+        self.assertEqual(before_signals, after_signals)
+        self.assertTrue(context["planner_optimizer_summary"]["in_optimizer"])
+        joined_messages = "\n".join(logger.messages)
+        self.assertIn("[PlannerInputAudit][Task 2]", joined_messages)
+        self.assertIn("[PlannerTrainPath][Task 2] in_optimizer=True", joined_messages)
+        self.assertIn("[PlannerAudit][Task 2][Layer 1]", joined_messages)
+        self.assertIn("[PlannerPolicyLogits][Task 2][Layer 1]", joined_messages)
+        self.assertIn("[PlannerPolicyDecomposition][Task 2][Layer 1]", joined_messages)
+        self.assertIn("[PlannerThresholdProximity][Task 2][Layer 1]", joined_messages)
+        self.assertIn("[PlannerPolicyRankStability][Task 2]", joined_messages)
+        self.assertIn("[PlannerTrajectory][Layer 1]", joined_messages)
+        self.assertIn("[PlannerGrowthTask][Task 2]", joined_messages)
+        self.assertIn("[PlannerGrowthConcentration][Task 2]", joined_messages)
+
+    def test_planner_audit_prepare_is_silent_when_disabled(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "planner_audit_disabled_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        config["training"]["planner_audit_logging"] = False
+        benchmark = _build_tiny_benchmark(num_tasks=2)
+        logger = _ListLogger()
+        trainer = NHLoRATrainer(config, logger, benchmark=benchmark)
+        task_state, warmup_info = trainer._run_warmup_sensing(benchmark.tasks[1])
+        context = {
+            "task_number": 2,
+            "task_state": task_state,
+            "raw_planner": trainer._compute_raw_planner(task_state),
+            "optimizer": trainer._build_optimizer(),
+            "warmup_info": warmup_info,
+        }
+
+        trainer._log_planner_audit_prepare(context)
+
+        self.assertEqual(logger.messages, [])
+
+    def test_planner_epoch_audit_reports_pre_step_grad_and_optimizer_steps(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "planner_epoch_audit_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        config["training"]["planner_audit_logging"] = True
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        logger = _ListLogger()
+        trainer = NHLoRATrainer(config, logger, benchmark=benchmark)
+        optimizer = trainer._build_optimizer()
+        for parameter in trainer.planner.parameters():
+            parameter.grad = torch.zeros_like(parameter)
+        first_parameter = next(trainer.planner.parameters())
+        first_parameter.grad.fill_(0.25)
+        context = {
+            "task_number": 2,
+            "current_epoch": 1,
+            "optimizer": optimizer,
+            "planner_optimizer_summary": trainer._planner_optimizer_membership(optimizer),
+            "planner_audit_epoch_accumulator": {
+                "batches": 0,
+                "grad_l2_sum": 0.0,
+                "grad_l2_max": 0.0,
+                "grad_present_batches": 0,
+                "grad_nonzero_batches": 0,
+                "optimizer_steps": 0,
+            },
+        }
+
+        trainer._accumulate_planner_audit_pre_step(context)
+        trainer._record_planner_optimizer_step(context)
+        trainer._log_planner_epoch_audit(context)
+
+        joined_messages = "\n".join(logger.messages)
+        self.assertIn("[PlannerTrainPath][Task 2][Epoch 1]", joined_messages)
+        self.assertIn("grad_present_batches=1/1", joined_messages)
+        self.assertIn("grad_nonzero_batches=1/1", joined_messages)
+        self.assertIn("optimizer_steps=1", joined_messages)
+
+    def test_hybrid_optimizer_excludes_policy_branch_and_tracks_control_branch(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "hybrid_optimizer_membership_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        config["training"]["planner_mode"] = "hybrid"
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        logger = configure_logger(level=logging.WARNING)
+        trainer = NHLoRATrainer(config, logger, benchmark=benchmark)
+
+        optimizer = trainer._build_optimizer()
+        policy_summary = trainer._planner_policy_optimizer_membership(optimizer)
+        control_summary = trainer._planner_control_optimizer_membership(optimizer)
+
+        self.assertFalse(policy_summary["in_optimizer"])
+        self.assertEqual(policy_summary["requires_grad_parameters"], 0)
+        self.assertEqual(policy_summary["matched_parameters"], 0)
+        self.assertTrue(control_summary["in_optimizer"])
+        self.assertGreater(control_summary["requires_grad_parameters"], 0)
+        self.assertGreater(control_summary["matched_parameters"], 0)
+
+    def test_hybrid_planner_control_receives_gradients_and_drifts(self):
+        seed_everything(11, deterministic=True)
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "hybrid_control_grad_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        config["training"]["planner_mode"] = "hybrid"
+        benchmark = _build_tiny_benchmark(num_tasks=2)
+        logger = configure_logger(level=logging.WARNING)
+        trainer = NHLoRATrainer(config, logger, benchmark=benchmark)
+        context = trainer._prepare_task_context(benchmark.tasks[1])
+        layer = trainer.model.layers["1"]
+        with torch.no_grad():
+            for point_name in ("q_proj", "v_proj"):
+                bank = layer.point_banks[point_name]
+                bank.shared_b.fill_(0.05)
+
+        train_dataset, _ = benchmark.build_task_datasets(1)
+        loader = trainer._build_train_loader(train_dataset)
+        batch = next(iter(loader))
+        images, labels = trainer._prepare_images_labels(batch)
+        optimizer = context["optimizer"]
+        optimizer.zero_grad(set_to_none=True)
+        before_snapshot = trainer._snapshot_named_parameters(trainer.planner.control_branch)
+        planner_out = trainer._plans_for_training_forward(context)
+        self.assertIsInstance(planner_out[1]["shared_gate"], torch.Tensor)
+        self.assertTrue(planner_out[1]["shared_gate"].requires_grad)
+
+        outputs = trainer.model.forward_with_state(images, context["task_state"], planner_out)
+        loss = F.cross_entropy(outputs["logits"], labels)
+        loss.backward()
+
+        control_grad_norm = sum(
+            float(parameter.grad.norm().item())
+            for parameter in trainer.planner.control_parameters()
+            if parameter.grad is not None
+        )
+        policy_grads = [
+            parameter.grad for parameter in trainer.planner.policy_parameters() if parameter.grad is not None
+        ]
+        self.assertGreater(control_grad_norm, 0.0)
+        self.assertEqual(policy_grads, [])
+
+        optimizer.step()
+        after_snapshot = trainer._snapshot_named_parameters(trainer.planner.control_branch)
+        drift = trainer._parameter_distance_summary(after_snapshot, before_snapshot)
+        self.assertIsNotNone(drift)
+        self.assertGreater(float(drift["l2"]), 0.0)
+
+    def test_planner_control_scalar_summary_reports_percentiles_and_threshold_fractions(self):
+        values = [0.1, 0.5, 1.0, 4.7, 7.2]
+        summary = NHLoRATrainer._scalar_series_summary(values)
+
+        self.assertEqual(int(summary["count"]), len(values))
+        self.assertAlmostEqual(float(summary["min"]), min(values), places=6)
+        self.assertAlmostEqual(float(summary["max"]), max(values), places=6)
+        self.assertGreaterEqual(float(summary["p99"]), float(summary["p90"]))
+        self.assertAlmostEqual(NHLoRATrainer._fraction_above(values, 2.0), 2 / 5, places=6)
+        self.assertAlmostEqual(NHLoRATrainer._fraction_above(values, 4.59511985013459), 2 / 5, places=6)
+        self.assertAlmostEqual(NHLoRATrainer._fraction_below(values, 0.2), 1 / 5, places=6)
+        self.assertAlmostEqual(NHLoRATrainer._fraction_abs_above([-1.0, 0.5, 4.5], 2.0), 1 / 3, places=6)
+        self.assertAlmostEqual(NHLoRATrainer._fraction_within([1.9, 2.0, 2.2], 2.0, 0.11), 2 / 3, places=6)
+        self.assertAlmostEqual(NHLoRATrainer._mean_abs_gap_to_target([1.5, 2.0, 2.5], 2.0), 1 / 3, places=6)
+        self.assertGreater(
+            NHLoRATrainer._paired_series_correlation([1.0, 2.0, 3.0], [2.0, 4.0, 6.0]),
+            0.99,
+        )
+
+    def test_stage13_growth_ranking_and_task_summary_helpers(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "stage13_growth_summary_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        trainer = NHLoRATrainer(config, configure_logger(level=logging.WARNING), benchmark=benchmark)
+
+        records = {
+            1: {
+                "action": "open_new_slot",
+                "novelty_margin": 0.20,
+                "conflict_margin": 0.70,
+                "shared_gate": 0.40,
+                "rank_budget": 2,
+            },
+            2: {
+                "action": "open_new_slot",
+                "novelty_margin": 0.15,
+                "conflict_margin": 0.30,
+                "shared_gate": 0.45,
+                "rank_budget": 2,
+            },
+            3: {
+                "action": "expand_rank_existing_slot",
+                "novelty_margin": 0.50,
+                "conflict_margin": -0.10,
+                "shared_gate": 0.60,
+                "rank_budget": 3,
+            },
+            4: {
+                "action": "expand_rank_existing_slot",
+                "novelty_margin": 0.25,
+                "conflict_margin": -0.20,
+                "shared_gate": 0.55,
+                "rank_budget": 2,
+            },
+        }
+        materialized_plans = {
+            1: MaterializedLayerPlan(
+                requested_action="open_new_slot",
+                action="open_new_slot",
+                selected_slot=None,
+                target_rank=None,
+                rank_delta=0,
+                create_new_slot=True,
+                new_slot_rank=2,
+            ),
+            2: MaterializedLayerPlan(
+                requested_action="open_new_slot",
+                action="expand_rank_existing_slot",
+                selected_slot=0,
+                target_rank=3,
+                rank_delta=1,
+                create_new_slot=False,
+                new_slot_rank=None,
+                fallback_action="expand_rank_existing_slot",
+            ),
+            3: MaterializedLayerPlan(
+                requested_action="expand_rank_existing_slot",
+                action="expand_rank_existing_slot",
+                selected_slot=0,
+                target_rank=4,
+                rank_delta=2,
+                create_new_slot=False,
+                new_slot_rank=None,
+            ),
+            4: MaterializedLayerPlan(
+                requested_action="expand_rank_existing_slot",
+                action="expand_rank_existing_slot",
+                selected_slot=1,
+                target_rank=2,
+                rank_delta=0,
+                create_new_slot=False,
+                new_slot_rank=None,
+            ),
+        }
+        applied_plans = {
+            block_id: {"action": plan.action, "shared_only": False}
+            for block_id, plan in materialized_plans.items()
+        }
+
+        open_ranking = NHLoRATrainer._planner_candidate_ranking(records, action="open_new_slot")
+        expand_ranking = NHLoRATrainer._planner_candidate_ranking(records, action="expand_rank_existing_slot")
+        summary = trainer._planner_growth_task_summary(
+            task_number=4,
+            records=records,
+            materialized_plans=materialized_plans,
+            applied_plans=applied_plans,
+        )
+
+        self.assertEqual([entry["block_id"] for entry in open_ranking], [1, 2])
+        self.assertEqual([entry["block_id"] for entry in expand_ranking], [3, 4])
+        self.assertEqual(summary["open_winner"], 1)
+        self.assertEqual(summary["expand_winner"], 3)
+        self.assertEqual(summary["growth_layers"], [1, 2, 3])
+        self.assertEqual(summary["opened_layers"], [1])
+        self.assertEqual(summary["expanded_layers"], [2, 3])
+        self.assertEqual(summary["fallback_layers"], [2])
+        distribution = NHLoRATrainer._growth_winner_distribution([summary])
+        self.assertEqual(distribution["open_winners"], {1: 1})
+        self.assertEqual(distribution["expand_winners"], {3: 1})
+        self.assertEqual(distribution["actual_growth_counts"], {1: 1, 2: 1, 3: 1})
+        self.assertEqual(distribution["zero_growth_tasks"], [])
+
+    def test_stage13_route_usage_concentration_summary_tracks_candidate_and_usage_collapse(self):
+        route_stats = {
+            "batches": 2,
+            "empty_candidate_batches": 0,
+            "candidate_count_sum": 4.0,
+            "selected_count_sum": 3.0,
+            "nonzero_usage_slot_count_sum": 3.0,
+            "usage_top1_share_sum": 1.5,
+            "usage_entropy_sum": 0.7,
+            "usage_mass_by_slot": {0: 1.5, 1: 0.5},
+        }
+        lifecycle_summary = {
+            "candidate_slot_ids": [0, 1],
+            "shared_only": False,
+            "usage_ema_by_slot": {0: 0.8, 1: 0.2},
+            "cumulative_usage_by_slot": {0: 2.0, 1: 1.0},
+        }
+
+        summary = NHLoRATrainer._route_usage_concentration_summary(
+            route_stats,
+            lifecycle_summary=lifecycle_summary,
+        )
+
+        self.assertAlmostEqual(summary["train_candidate_count_mean"], 2.0, places=6)
+        self.assertAlmostEqual(summary["train_selected_count_mean"], 1.5, places=6)
+        self.assertAlmostEqual(summary["usage_top1_share_mean"], 0.75, places=6)
+        self.assertAlmostEqual(summary["aggregated_usage_top1_share"], 0.75, places=6)
+        self.assertAlmostEqual(summary["usage_ema_top1_share"], 0.8, places=6)
+        self.assertAlmostEqual(summary["cumulative_usage_top1_share"], 2.0 / 3.0, places=6)
+        self.assertFalse(summary["candidate_but_zero_usage"])
+        self.assertEqual(summary["profile_candidate_count"], 2)
+        self.assertFalse(summary["profile_shared_only"])
+
+    def test_stage13_profile_contraction_diff_and_lifecycle_aggregation_helpers(self):
+        pre_summary = {
+            "live_slot_ids": [0, 1],
+            "retained_slot_ids": [0, 1],
+            "candidate_slot_ids": [0, 1],
+            "frozen_slot_ids": [],
+            "pruned_slot_ids": [],
+            "shared_only": False,
+        }
+        post_summary = {
+            "live_slot_ids": [0],
+            "retained_slot_ids": [0],
+            "candidate_slot_ids": [],
+            "frozen_slot_ids": [0],
+            "pruned_slot_ids": [1],
+            "shared_only": True,
+        }
+
+        diff = NHLoRATrainer._profile_contraction_diff(pre_summary, post_summary)
+        self.assertEqual(diff["live_delta"], -1)
+        self.assertEqual(diff["retained_delta"], -1)
+        self.assertEqual(diff["candidate_delta"], -2)
+        self.assertEqual(diff["frozen_delta"], 1)
+        self.assertEqual(diff["pruned_delta"], 1)
+        self.assertTrue(diff["shared_only_changed"])
+        self.assertTrue(diff["contracted"])
+
+        lifecycle_history = NHLoRATrainer._aggregate_layer_lifecycle_history(
+            [
+                {
+                    "task_number": 1,
+                    "opened": True,
+                    "expanded": False,
+                    "pre_live_count": 1,
+                    "post_live_count": 2,
+                    "post_retained_count": 2,
+                    "post_shared_only": False,
+                },
+                {
+                    "task_number": 2,
+                    "opened": False,
+                    "expanded": True,
+                    "pre_live_count": 2,
+                    "post_live_count": 1,
+                    "post_retained_count": 1,
+                    "post_shared_only": True,
+                },
+            ]
+        )
+        self.assertEqual(lifecycle_history["opened_tasks"], [1])
+        self.assertEqual(lifecycle_history["expanded_tasks"], [2])
+        self.assertEqual(lifecycle_history["grew_tasks"], [1, 2])
+        self.assertTrue(lifecycle_history["ever_multi_slot"])
+        self.assertTrue(lifecycle_history["opened_then_shared_only"])
+        self.assertEqual(lifecycle_history["collapsed_after_growth_tasks"], [2])
+
+    def test_stage14_threshold_proximity_rank_stability_and_trace_helpers(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "stage14_policy_trace_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        trainer = NHLoRATrainer(config, configure_logger(level=logging.WARNING), benchmark=benchmark)
+
+        entries = [
+            {
+                "action": "freeze_old_strong_retention",
+                "novelty_margin": -0.02,
+                "conflict_margin": -0.08,
+                "history_attention_used": True,
+                "history_attention_entropy": 0.4,
+                "history_attention_max_weight": 0.7,
+            },
+            {
+                "action": "open_new_slot",
+                "novelty_margin": 0.15,
+                "conflict_margin": 0.20,
+                "history_attention_used": True,
+                "history_attention_entropy": 0.2,
+                "history_attention_max_weight": 0.9,
+            },
+        ]
+        threshold_summary = NHLoRATrainer._planner_threshold_proximity_summary(entries)
+        self.assertAlmostEqual(threshold_summary["requested_growth_frequency"], 0.5, places=6)
+        self.assertAlmostEqual(threshold_summary["near_novelty_miss_frequency"], 0.5, places=6)
+        self.assertAlmostEqual(threshold_summary["far_below_both_frequency"], 0.0, places=6)
+
+        rank_stability = NHLoRATrainer._planner_rank_stability_summary(
+            [
+                {
+                    "open_ranking": [
+                        {"block_id": 1, "conflict_margin": 0.30, "novelty_margin": 0.10},
+                        {"block_id": 2, "conflict_margin": 0.20, "novelty_margin": 0.05},
+                    ],
+                    "expand_ranking": [
+                        {"block_id": 2, "novelty_margin": 0.40, "conflict_margin": -0.10},
+                        {"block_id": 1, "novelty_margin": 0.35, "conflict_margin": -0.15},
+                    ],
+                    "open_winner": 1,
+                    "expand_winner": 2,
+                    "growth_layers": [1, 2],
+                }
+            ]
+        )
+        self.assertEqual(rank_stability["open_winners"], {1: 1})
+        self.assertEqual(rank_stability["expand_winners"], {2: 1})
+        self.assertEqual(rank_stability["open_runner_ups"], {2: 1})
+        self.assertGreater(rank_stability["avg_open_gap_to_runner_up"], 0.0)
+
+        trainer._planner_policy_record_history[1] = [
+            {
+                "action": "open_new_slot",
+                "novelty_margin": 0.20,
+                "conflict_margin": 0.30,
+                "novelty_bias_share": 0.10,
+                "conflict_bias_share": 0.15,
+                "history_attention_used": True,
+                "history_attention_entropy": 0.2,
+                "history_attention_max_weight": 0.8,
+            },
+            {
+                "action": "freeze_old_strong_retention",
+                "novelty_margin": -0.02,
+                "conflict_margin": -0.10,
+                "novelty_bias_share": 0.12,
+                "conflict_bias_share": 0.18,
+                "history_attention_used": True,
+                "history_attention_entropy": 0.5,
+                "history_attention_max_weight": 0.6,
+            },
+        ]
+        trainer._planner_policy_record_history[2] = [
+            {
+                "action": "expand_rank_existing_slot",
+                "novelty_margin": 0.25,
+                "conflict_margin": -0.05,
+                "novelty_bias_share": 0.08,
+                "conflict_bias_share": 0.11,
+                "history_attention_used": True,
+                "history_attention_entropy": 0.3,
+                "history_attention_max_weight": 0.7,
+            }
+        ]
+        trainer._planner_realization_history[1] = [
+            {
+                "requested_growth": True,
+                "materialized_growth": False,
+                "applied_growth": False,
+                "fallback_reason": "empty_candidates",
+                "post_outcome": "never_really_materialized",
+            },
+            {
+                "requested_growth": False,
+                "materialized_growth": False,
+                "applied_growth": False,
+                "fallback_reason": "shared_only",
+                "post_outcome": "shared_only",
+            },
+        ]
+        trainer._planner_realization_history[2] = [
+            {
+                "requested_growth": True,
+                "materialized_growth": True,
+                "applied_growth": True,
+                "fallback_reason": "none",
+                "post_outcome": "live_and_growing",
+            }
+        ]
+        trainer._planner_layer_structure_history[1] = [
+            {
+                "task_number": 1,
+                "opened": False,
+                "expanded": False,
+                "pre_live_count": 1,
+                "post_live_count": 1,
+                "post_retained_count": 1,
+                "post_shared_only": True,
+            }
+        ]
+        trainer._planner_layer_structure_history[2] = [
+            {
+                "task_number": 1,
+                "opened": True,
+                "expanded": False,
+                "pre_live_count": 1,
+                "post_live_count": 2,
+                "post_retained_count": 2,
+                "post_shared_only": False,
+            }
+        ]
+
+        trace_summary = trainer._planner_realization_trace_summary([1, 2])
+        self.assertAlmostEqual(trace_summary["requested_growth_frequency"], 2.0 / 3.0, places=6)
+        self.assertAlmostEqual(trace_summary["materialized_growth_frequency"], 1.0 / 3.0, places=6)
+        self.assertAlmostEqual(trace_summary["applied_growth_frequency"], 1.0 / 3.0, places=6)
+        self.assertEqual(trace_summary["final_shared_only_layers"], [1])
+        self.assertEqual(trace_summary["final_non_shared_layers"], [2])
+        self.assertEqual(trace_summary["top_fallbacks"][0][0], "empty_candidates")
+        self.assertEqual(trace_summary["final_outcomes_by_layer"][1], "shared_only")
+        self.assertEqual(trace_summary["final_outcomes_by_layer"][2], "live_and_growing")
+
+    def test_stage13_structural_audit_is_silent_when_disabled(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "stage13_audit_disabled_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        config["training"]["planner_audit_logging"] = False
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        logger = _ListLogger()
+        trainer = NHLoRATrainer(config, logger, benchmark=benchmark)
+        before_history = deepcopy(trainer._planner_layer_structure_history)
+
+        trainer._log_stage13_structural_shared_only_audit(
+            {
+                "task_number": 1,
+                "stage5_slot_lifecycle": {},
+                "planner_structure_route_accumulator": {},
+                "planner_growth_task_summary": {},
+                "planner_control_contribution_epoch_accumulator": {},
+            },
+            {},
+        )
+
+        self.assertEqual(logger.messages, [])
+        self.assertEqual(before_history, trainer._planner_layer_structure_history)
+
+    def test_planner_control_contribution_debug_records_shared_and_slot_activity(self):
+        layer = NHLoRALayer(
+            embed_dim=8,
+            selected_points=["q_proj"],
+            shared_rank=2,
+            slot_r_max=4,
+            slot_init_rank=1,
+            bootstrap_slot_rank=1,
+            max_slots=2,
+            router_topk=1,
+            router_temperature=1.0,
+            task_embedding_dim=8,
+        )
+        slot_id = layer.add_slot(initial_rank=1, task_id=1)
+        with torch.no_grad():
+            layer.point_banks["q_proj"].shared_b.fill_(0.05)
+            layer.point_banks["q_proj"].slot_b[slot_id].fill_(0.03)
+        hidden_states = torch.randn(2, 4, 8)
+        contribution_accumulator = {}
+        planner_cfg = {
+            "shared_gate": torch.tensor([[0.995]], dtype=hidden_states.dtype),
+            "rank_cfg": {slot_id: 1},
+            "_debug_block_id": 3,
+            "_planner_control_contribution_accumulator": contribution_accumulator,
+        }
+
+        _ = layer._shared_delta("q_proj", hidden_states, planner_cfg)
+        _ = layer._slot_delta(
+            "q_proj",
+            hidden_states,
+            route_state={"candidate_slots": [slot_id]},
+            planner_cfg=planner_cfg,
+        )
+
+        block_stats = contribution_accumulator[3]
+        self.assertGreater(block_stats["shared_pre_beta_norm_count"], 0)
+        self.assertGreater(block_stats["shared_post_beta_norm_count"], 0)
+        self.assertGreater(block_stats["slot_norm_count"], 0)
+        self.assertGreater(block_stats["slot_structurally_available_calls"], 0)
+        self.assertGreater(block_stats["slot_nontrivial_calls"], 0)
+        self.assertGreater(block_stats["beta_gt_099_with_structural_slot_calls"], 0)
+
+    def test_hybrid_planner_control_epoch_logs_stage12_residual_stability_signals(self):
+        seed_everything(17, deterministic=True)
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "hybrid_control_stage12_logging_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        config["training"]["planner_mode"] = "hybrid"
+        config["training"]["planner_audit_logging"] = True
+        benchmark = _build_tiny_benchmark(num_tasks=2)
+        logger = _ListLogger()
+        trainer = NHLoRATrainer(config, logger, benchmark=benchmark)
+        context = trainer._prepare_task_context(benchmark.tasks[1])
+        context["current_epoch"] = 1
+        context["planner_control_epoch_accumulator"] = trainer._new_planner_control_epoch_accumulator()
+        context["planner_control_contribution_epoch_accumulator"] = {}
+        layer = trainer.model.layers["1"]
+        with torch.no_grad():
+            for point_name in ("q_proj", "v_proj"):
+                layer.point_banks[point_name].shared_b.fill_(0.05)
+        train_dataset, _ = benchmark.build_task_datasets(1)
+        loader = trainer._build_train_loader(train_dataset)
+        batch = next(iter(loader))
+        images, labels = trainer._prepare_images_labels(batch)
+        optimizer = context["optimizer"]
+
+        optimizer.zero_grad(set_to_none=True)
+        planner_out = trainer._plans_for_training_forward(context)
+        outputs = trainer.model.forward_with_state(images, context["task_state"], planner_out)
+        loss = F.cross_entropy(outputs["logits"], labels)
+        loss.backward()
+
+        trainer._accumulate_planner_control_pre_step(context)
+        trainer._record_planner_control_optimizer_step(context)
+        trainer._log_planner_control_epoch(context)
+
+        joined_messages = "\n".join(logger.messages)
+        self.assertIn("[PlannerControlAnchor][Task 2][Epoch 1][Layer 1]", joined_messages)
+        self.assertIn("frac_anchor_gt_099=", joined_messages)
+        self.assertIn("[PlannerControlDelta][Task 2][Epoch 1][Layer 1]", joined_messages)
+        self.assertIn("beta_anchor_gap_mean_abs=", joined_messages)
+        self.assertIn("[PlannerResidualRaw][Task 2][Epoch 1][Layer 1]", joined_messages)
+        self.assertIn("frac_abs_gt_6=", joined_messages)
+        self.assertIn("bound_derivative_mean=", joined_messages)
+        self.assertIn("[PlannerControlLogits][Task 2][Epoch 1][Layer 1]", joined_messages)
+        self.assertIn("frac_gt_logit099=", joined_messages)
+        self.assertIn("[PlannerControlValues][Task 2][Epoch 1][Layer 1]", joined_messages)
+        self.assertIn("frac_gt_099=", joined_messages)
+        self.assertIn("[PlannerControlGradients][Task 2][Epoch 1][Layer 1]", joined_messages)
+        self.assertIn("logit_grad_effectively_zero_fraction=", joined_messages)
+        self.assertIn("[PlannerResidualGradients][Task 2][Epoch 1][Layer 1]", joined_messages)
+        self.assertIn("bridge_grad_lost_fraction=", joined_messages)
+        self.assertIn("[PlannerControlHead][Task 2][Epoch 1][Layer 1]", joined_messages)
+        self.assertIn("delta_bias_share_mean=", joined_messages)
+        self.assertIn("[PlannerResidualCap][Task 2][Epoch 1][Layer 1]", joined_messages)
+        self.assertIn("cap_state=", joined_messages)
+        self.assertIn("[PlannerResidualSummary][Task 2][Epoch 1][Layer 1]", joined_messages)
+        self.assertIn("[PlannerContribution][Task 2][Epoch 1][Layer 1]", joined_messages)
+        self.assertIn("[PlannerControlInputs][Task 2][Epoch 1][Layer 1]", joined_messages)
+        self.assertIn("normalized_representation_norm_mean=", joined_messages)
+        self.assertIn("[PlannerControlInputCompare][Task 2][Epoch 1]", joined_messages)
+
+    def test_hybrid_mode_rejects_soft_rank_training_for_stage8a(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "hybrid_soft_rank_guardrail_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        config["training"]["planner_mode"] = "hybrid"
+        config["training"]["planner_soft_rank_training"] = True
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        logger = configure_logger(level=logging.WARNING)
+
+        with self.assertRaises(ValueError):
+            NHLoRATrainer(config, logger, benchmark=benchmark)
 
     def test_forgetting_and_parameter_growth_delta_helpers(self):
         repo_root = Path(__file__).resolve().parents[1]
@@ -956,6 +2754,202 @@ class PaperAlignmentUnitTests(unittest.TestCase):
         self.assertEqual(metrics["parameter_growth_delta"], 32)
         self.assertAlmostEqual(metrics["forgetting"], 0.15, places=6)
         self.assertEqual(metrics["task_wall_time"], 5.0)
+        self.assertIn("weighted_loss_balance", metrics)
+        self.assertIn("forgetting_decomposition", metrics)
+        self.assertAlmostEqual(metrics["weighted_loss_balance"]["weighted_losses"]["cls"], 1.0, places=6)
+        self.assertEqual(len(metrics["forgetting_decomposition"]["tasks"]), 1)
+
+    def test_stage17_weighted_loss_balance_summary_helper(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "stage17_loss_balance_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        trainer = NHLoRATrainer(config, configure_logger(level=logging.WARNING), benchmark=benchmark)
+
+        summary = trainer._weighted_loss_balance_summary(
+            {
+                "cls": 2.0,
+                "kd": 1.0,
+                "feat": 0.5,
+                "orth": 0.1,
+                "rank": 0.2,
+                "grow": 0.3,
+                "route": 0.4,
+            }
+        )
+
+        self.assertAlmostEqual(summary["weighted_losses"]["cls"], 2.0, places=6)
+        self.assertAlmostEqual(summary["weighted_losses"]["kd"], 0.5, places=6)
+        self.assertAlmostEqual(summary["weighted_losses"]["feat"], 0.25, places=6)
+        self.assertAlmostEqual(summary["retention_to_cls_ratio"], 0.375, places=6)
+        self.assertGreater(summary["weighted_shares"]["cls"], summary["weighted_shares"]["kd"])
+
+    def test_stage17_forgetting_decomposition_helper(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "stage17_forgetting_decomp_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        trainer = NHLoRATrainer(config, configure_logger(level=logging.WARNING), benchmark=benchmark)
+        trainer.accuracy_matrix = [[0.8], [0.75, 0.6]]
+
+        summary = trainer._forgetting_decomposition([0.7, 0.5, 0.4])
+
+        self.assertEqual(len(summary["tasks"]), 2)
+        self.assertAlmostEqual(summary["tasks"][0]["drop_from_best"], 0.1, places=6)
+        self.assertAlmostEqual(summary["tasks"][0]["drop_from_latest"], 0.05, places=6)
+        self.assertAlmostEqual(summary["tasks"][1]["drop_from_best"], 0.1, places=6)
+        self.assertAlmostEqual(summary["drop_from_best_summary"]["mean"], 0.1, places=6)
+        self.assertAlmostEqual(summary["drop_from_latest_summary"]["mean"], 0.075, places=6)
+
+    def test_stage17_classifier_calibration_summary_helper(self):
+        old_logits = torch.tensor([[2.0, 1.0], [1.0, 0.0]])
+        new_logits = torch.tensor([[0.5, 0.4], [1.5, 1.4]])
+        old_weights = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+        new_weights = torch.tensor([[0.1, 0.0], [0.0, 0.1]])
+        teacher_old_logits = torch.tensor([[3.0, 1.0], [2.0, 0.0]])
+
+        summary = NHLoRATrainer._classifier_calibration_summary(
+            old_logits=old_logits,
+            new_logits=new_logits,
+            old_classifier_weights=old_weights,
+            new_classifier_weights=new_weights,
+            teacher_old_logits=teacher_old_logits,
+        )
+
+        self.assertGreater(summary["old_logit_norm_mean"], summary["new_logit_norm_mean"])
+        self.assertAlmostEqual(summary["new_wins_ratio"], 0.5, places=6)
+        self.assertAlmostEqual(summary["old_weight_norm_mean"], 1.0, places=6)
+        self.assertAlmostEqual(summary["new_weight_norm_mean"], 0.1, places=6)
+        self.assertGreater(summary["old_logit_compression_ratio"], 0.0)
+
+    def test_stage17_route_profile_retention_summary_helper(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "stage17_route_retention_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        trainer = NHLoRATrainer(config, configure_logger(level=logging.WARNING), benchmark=benchmark)
+
+        route_infos = [
+            {
+                1: {
+                    "candidate_slots": [10, 11],
+                    "shared_only": False,
+                    "routing_distribution": torch.tensor([[0.7, 0.3], [0.6, 0.4]]),
+                },
+                2: {
+                    "candidate_slots": [],
+                    "shared_only": True,
+                    "routing_distribution": torch.zeros(2, 0),
+                },
+            },
+            {
+                1: {
+                    "candidate_slots": [10],
+                    "shared_only": False,
+                    "routing_distribution": torch.tensor([[1.0], [1.0]]),
+                },
+                2: {
+                    "candidate_slots": [20],
+                    "shared_only": False,
+                    "routing_distribution": torch.tensor([[1.0], [1.0]]),
+                },
+            },
+        ]
+
+        summary = trainer._route_profile_retention_summary(route_infos, selected_blocks=[1, 2])
+
+        self.assertEqual(summary["batch_count"], 2)
+        self.assertAlmostEqual(summary["shared_only_layer_count_mean"], 0.5, places=6)
+        self.assertAlmostEqual(summary["multi_slot_available_layer_count_mean"], 0.5, places=6)
+        self.assertAlmostEqual(summary["candidate_slot_count_mean"], 1.0, places=6)
+        self.assertAlmostEqual(summary["per_layer"][1]["multi_slot_available_frequency"], 0.5, places=6)
+        self.assertAlmostEqual(summary["per_layer"][2]["shared_only_frequency"], 0.5, places=6)
+
+    def test_stage17_retention_pre_post_diff_helper(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "stage17_pre_post_diff_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        trainer = NHLoRATrainer(config, configure_logger(level=logging.WARNING), benchmark=benchmark)
+
+        pre_eval = {
+            "retention_audit": {
+                "task_summaries": [
+                    {
+                        "task_number": 1,
+                        "accuracy": 0.60,
+                        "old_logit_mean_abs_diff": 0.20,
+                        "feature_mean_abs_diff": 0.30,
+                        "route_summary": {
+                            "shared_only_layer_count_mean": 2.0,
+                            "multi_slot_available_layer_count_mean": 1.0,
+                        },
+                    }
+                ]
+            }
+        }
+        post_eval = {
+            "retention_audit": {
+                "task_summaries": [
+                    {
+                        "task_number": 1,
+                        "accuracy": 0.55,
+                        "old_logit_mean_abs_diff": 0.25,
+                        "feature_mean_abs_diff": 0.40,
+                        "route_summary": {
+                            "shared_only_layer_count_mean": 3.0,
+                            "multi_slot_available_layer_count_mean": 0.0,
+                        },
+                    }
+                ]
+            }
+        }
+
+        summary = trainer._retention_pre_post_diff(pre_eval, post_eval)
+
+        self.assertEqual(len(summary["tasks"]), 1)
+        self.assertAlmostEqual(summary["tasks"][0]["accuracy_delta"], -0.05, places=6)
+        self.assertAlmostEqual(summary["tasks"][0]["old_logit_mean_abs_diff_delta"], 0.05, places=6)
+        self.assertAlmostEqual(summary["tasks"][0]["feature_mean_abs_diff_delta"], 0.10, places=6)
+        self.assertAlmostEqual(summary["tasks"][0]["shared_only_layer_count_mean_delta"], 1.0, places=6)
+        self.assertAlmostEqual(summary["tasks"][0]["multi_slot_available_layer_count_mean_delta"], -1.0, places=6)
+
+    def test_stage17_retention_audit_respects_retention_debug_flag(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "stage17_retention_disabled_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        config["training"]["retention_debug_logging"] = False
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        logger = _ListLogger()
+        trainer = NHLoRATrainer(config, logger, benchmark=benchmark)
+        history_before = deepcopy(trainer._retention_layer_audit_history)
+
+        trainer._log_retention_boundary_audit(
+            {"task_number": 2, "stage5_slot_lifecycle": {}},
+            epoch_history=[
+                {
+                    "train_accuracy": 0.9,
+                    "loss_total": 1.0,
+                    "loss_cls": 0.8,
+                    "loss_kd": 0.1,
+                    "loss_feat": 0.05,
+                    "loss_orth": 0.01,
+                    "loss_rank": 0.01,
+                    "loss_grow": 0.01,
+                    "loss_route": 0.02,
+                }
+            ],
+            pre_eval={"per_task_acc": [0.7, 0.8], "avg_acc": 0.75, "retention_audit": {"task_summaries": []}},
+            post_eval={"per_task_acc": [0.65, 0.85], "avg_acc": 0.75, "retention_audit": {"task_summaries": []}},
+        )
+
+        self.assertEqual(logger.messages, [])
+        self.assertEqual(trainer._retention_layer_audit_history, history_before)
 
     def test_logger_can_disable_file_handler_for_tee_mode(self):
         repo_root = Path(__file__).resolve().parents[1]

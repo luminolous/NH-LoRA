@@ -1,0 +1,26 @@
+_base_: base.yaml
+
+benchmark:
+  name: cifar100
+  dataset_name: cifar100
+  data_root: data/cifar-100-python
+  scenario: class_incremental
+  num_tasks: 10
+  classes_per_task: 10
+  image_size: 224
+
+training:
+  batch_size: 64
+  epochs_per_task: 30
+  lr: 5e-4
+  planner_mode: hybrid
+  planner_control_delta_logit_scale: 2.0
+
+runtime:
+  num_workers: 8
+
+warmup:
+  num_batches: 5
+
+output:
+  benchmark_subdir: cifar100

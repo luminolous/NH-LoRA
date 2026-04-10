@@ -50,7 +50,7 @@ Memastikan benchmark dapat dimuat dengan kontrak yang konsisten.
 
 ### Hasil yang harus ada
 - dataset wrapper untuk CIFAR-100
-- dataset wrapper untuk CUB-200-2011
+- dataset wrapper untuk ImageNet-A
 - dataset wrapper untuk ImageNet-R
 - dataset wrapper untuk OmniBenchmark
 - task split support
