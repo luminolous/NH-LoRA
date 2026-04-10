@@ -446,6 +446,80 @@ class NHLoRATrainer:
                 "  retention_feature_representation=full_tokens can use substantially more memory and produce heavier debug logs than cls or mean_pool_tokens."
             )
 
+    @staticmethod
+    def _benchmark_class_name_preview(class_names: List[str], limit: int = 5) -> List[str]:
+        preview = [str(name) for name in class_names[:limit]]
+        if len(class_names) > limit:
+            preview.append(f"...(+{len(class_names) - limit} more)")
+        return preview
+
+    def _benchmark_sanity_summary(self) -> Dict[str, Any]:
+        benchmark_metadata = self.benchmark.metadata if isinstance(self.benchmark.metadata, dict) else {}
+        split_class_names = benchmark_metadata.get("split_class_names", {})
+        if not isinstance(split_class_names, dict):
+            split_class_names = {}
+        summary: Dict[str, Any] = {
+            "name": self.benchmark.name,
+            "num_classes": int(self.benchmark.num_classes),
+            "num_tasks": len(self.benchmark.tasks),
+            "dataset_type": benchmark_metadata.get("dataset_type"),
+            "class_name_count": benchmark_metadata.get("class_name_count"),
+            "split_class_names": {
+                str(split): [str(name) for name in class_names]
+                for split, class_names in split_class_names.items()
+                if isinstance(class_names, list)
+            },
+            "tasks": [],
+        }
+        for task in self.benchmark.tasks:
+            task_metadata = task.metadata if isinstance(task.metadata, dict) else {}
+            task_class_names = task_metadata.get("class_names", [])
+            if not isinstance(task_class_names, list):
+                task_class_names = []
+            summary["tasks"].append(
+                {
+                    "task_number": int(task.task_id) + 1,
+                    "class_count": int(task_metadata.get("class_count", len(task.class_ids))),
+                    "train_sample_count": int(task_metadata.get("train_sample_count", len(task.train_records))),
+                    "test_sample_count": int(task_metadata.get("test_sample_count", len(task.test_records))),
+                    "class_ids": [int(class_id) for class_id in task.class_ids],
+                    "class_names": [str(name) for name in task_class_names],
+                }
+            )
+        return summary
+
+    def _log_benchmark_sanity_summary(self) -> None:
+        summary = self._benchmark_sanity_summary()
+        self.logger.info(
+            "[BenchmarkSummary] name=%s num_classes=%d num_tasks=%d",
+            summary["name"],
+            summary["num_classes"],
+            summary["num_tasks"],
+        )
+        split_class_names = summary["split_class_names"]
+        if split_class_names:
+            train_class_names = split_class_names.get("train", [])
+            test_class_names = split_class_names.get("test", [])
+            self.logger.info(
+                "[BenchmarkSummary][ImageFolder] class_name_count=%s train_class_count=%d test_class_count=%d split_class_sets_match=%s train_class_preview=%s test_class_preview=%s",
+                summary.get("class_name_count", "n/a"),
+                len(train_class_names),
+                len(test_class_names),
+                train_class_names == test_class_names,
+                self._benchmark_class_name_preview(train_class_names),
+                self._benchmark_class_name_preview(test_class_names),
+            )
+        for task_summary in summary["tasks"]:
+            self.logger.info(
+                "[BenchmarkTaskSummary][Task %d] class_count=%d train_samples=%d test_samples=%d class_ids=%s class_name_preview=%s",
+                task_summary["task_number"],
+                task_summary["class_count"],
+                task_summary["train_sample_count"],
+                task_summary["test_sample_count"],
+                task_summary["class_ids"],
+                self._benchmark_class_name_preview(task_summary["class_names"], limit=8),
+            )
+
     def _estimate_eta_for_task(self, epoch_durations: List[float], total_epochs: int, current_epoch: int) -> float | None:
         if not bool(self.config["training"].get("estimate_eta", True)) or not epoch_durations:
             return None
@@ -4552,6 +4626,7 @@ class NHLoRATrainer:
             self.training_state["seed"] = int(seed)
 
         self._log_seed_config(seed)
+        self._log_benchmark_sanity_summary()
         seed_wall_start = self._perf_counter()
         for task_index in range(int(self.training_state["current_task_id"]), len(self.benchmark.tasks)):
             task_wall_start = self._perf_counter()

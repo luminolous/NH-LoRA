@@ -69,6 +69,8 @@ class ConfigAndSummarySmokeTest(unittest.TestCase):
 
     def test_stage15_benchmark_transition_configs_and_registry(self):
         repo_root = Path(__file__).resolve().parents[1]
+        base_config = load_config(repo_root / "configs" / "base.yaml")
+        self.assertEqual(base_config["model"]["selected_blocks"], list(range(12)))
 
         imagenet_a_config = load_config(repo_root / "configs" / "imagenet_a.yaml")
         self.assertEqual(imagenet_a_config["benchmark"]["dataset_name"], "imagenet_a")
@@ -81,7 +83,7 @@ class ConfigAndSummarySmokeTest(unittest.TestCase):
         all_layers_probe = load_config(repo_root / "configs" / "cifar100_hybrid_all_layers.yaml")
         self.assertEqual(all_layers_probe["model"]["selected_blocks"], list(range(12)))
         baseline = load_config(repo_root / "configs" / "cifar100_hybrid.yaml")
-        self.assertEqual(baseline["model"]["selected_blocks"], [6, 7, 8, 9, 10, 11])
+        self.assertEqual(baseline["model"]["selected_blocks"], list(range(12)))
 
         self.assertIn("imagenet_a", DATASET_REGISTRY)
         self.assertNotIn("cub200", DATASET_REGISTRY)

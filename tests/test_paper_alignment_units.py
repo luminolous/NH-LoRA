@@ -90,6 +90,10 @@ def _write_imagefolder_dataset(root: Path, split_to_classes: dict[str, list[str]
                 Image.fromarray(image).save(class_dir / f"{split}_{sample_id}.png")
 
 
+def _make_class_names(count: int) -> list[str]:
+    return [f"class_{index:03d}" for index in range(count)]
+
+
 def _build_test_config(output_root: str):
     return {
         "experiment": {
@@ -462,43 +466,131 @@ class PaperAlignmentUnitTests(unittest.TestCase):
         delta_from_scaled_representation = F.linear(normalized_scaled, output_head.weight, bias=None)
         self.assertTrue(torch.allclose(delta_from_representation, delta_from_scaled_representation, atol=1e-6))
 
-    def test_stage15_imagenet_a_builder_matches_imagefolder_contract_and_cub_is_removed(self):
+    def test_stage16_imagenet_a_builder_requires_exact_200_matching_classes(self):
         repo_root = Path(__file__).resolve().parents[1]
-        workspace_tmp = repo_root / "outputs" / "test_tmp" / "stage15_imagenet_a_builder_unit"
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "stage16_imagenet_a_builder_unit"
         dataset_root = workspace_tmp / "imagenet_a_fixture"
+        class_names = _make_class_names(200)
         _write_imagefolder_dataset(
             dataset_root,
             {
-                "train": ["ant", "bear", "cat", "dog"],
-                "test": ["ant", "bear", "cat", "dog"],
+                "train": class_names,
+                "test": class_names,
             },
-            samples_per_class=2,
+            samples_per_class=1,
         )
 
         config = {
             "benchmark": {
                 "dataset_name": "imagenet_a",
                 "data_root": str(dataset_root),
-                "num_tasks": 2,
-                "classes_per_task": 2,
+                "num_tasks": 10,
+                "classes_per_task": 20,
                 "image_size": 224,
             }
         }
         benchmark = build_benchmark(config)
 
         self.assertEqual(benchmark.name, "imagenet_a")
-        self.assertEqual(benchmark.num_classes, 4)
-        self.assertEqual(len(benchmark.tasks), 2)
-        self.assertEqual(benchmark.tasks[0].class_ids, [0, 1])
-        self.assertEqual(benchmark.tasks[1].class_ids, [2, 3])
+        self.assertEqual(benchmark.num_classes, 200)
+        self.assertEqual(len(benchmark.tasks), 10)
+        self.assertEqual(benchmark.tasks[0].class_ids, list(range(20)))
+        self.assertEqual(benchmark.tasks[1].class_ids, list(range(20, 40)))
         self.assertTrue(all(record.path for record in benchmark.tasks[0].train_records))
-        self.assertEqual(len(benchmark.tasks[0].train_records), 4)
-        self.assertEqual(len(benchmark.tasks[1].test_records), 4)
+        self.assertEqual(len(benchmark.tasks[0].train_records), 20)
+        self.assertEqual(len(benchmark.tasks[1].test_records), 20)
         self.assertEqual(benchmark.tasks[0].metadata["benchmark"], "imagenet_a")
         self.assertIn("class_to_idx", benchmark.tasks[0].metadata)
+        self.assertEqual(benchmark.tasks[0].metadata["class_count"], 20)
+        self.assertEqual(benchmark.tasks[0].metadata["train_sample_count"], 20)
+        self.assertEqual(benchmark.metadata["class_name_count"], 200)
+        self.assertEqual(benchmark.metadata["split_class_names"]["train"][:3], class_names[:3])
+        self.assertEqual(benchmark.metadata["split_class_names"]["test"][-3:], class_names[-3:])
 
         with self.assertRaises(KeyError):
             build_benchmark({"benchmark": {"dataset_name": "cub200"}})
+
+    def test_stage16_imagenet_a_builder_rejects_mismatched_train_test_classes(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "stage16_imagenet_a_mismatch_unit"
+        dataset_root = workspace_tmp / "imagenet_a_fixture"
+        train_class_names = _make_class_names(200)
+        test_class_names = list(train_class_names)
+        test_class_names[-1] = "class_999"
+        _write_imagefolder_dataset(
+            dataset_root,
+            {
+                "train": train_class_names,
+                "test": test_class_names,
+            },
+            samples_per_class=1,
+        )
+
+        config = {
+            "benchmark": {
+                "dataset_name": "imagenet_a",
+                "data_root": str(dataset_root),
+                "num_tasks": 10,
+                "classes_per_task": 20,
+                "image_size": 224,
+            }
+        }
+
+        with self.assertRaisesRegex(ValueError, "mismatched class folders"):
+            build_benchmark(config)
+
+    def test_stage16_imagenet_a_builder_rejects_wrong_class_count(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "stage16_imagenet_a_classcount_unit"
+        dataset_root = workspace_tmp / "imagenet_a_fixture"
+        class_names = _make_class_names(199)
+        _write_imagefolder_dataset(
+            dataset_root,
+            {
+                "train": class_names,
+                "test": class_names,
+            },
+            samples_per_class=1,
+        )
+
+        config = {
+            "benchmark": {
+                "dataset_name": "imagenet_a",
+                "data_root": str(dataset_root),
+                "num_tasks": 10,
+                "classes_per_task": 20,
+                "image_size": 224,
+            }
+        }
+
+        with self.assertRaisesRegex(ValueError, "expects exactly 200 classes"):
+            build_benchmark(config)
+
+    def test_stage16_imagenet_a_builder_rejects_missing_split_root(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "stage16_imagenet_a_missing_split_unit"
+        dataset_root = workspace_tmp / "imagenet_a_fixture"
+        class_names = _make_class_names(200)
+        _write_imagefolder_dataset(
+            dataset_root,
+            {
+                "train": class_names,
+            },
+            samples_per_class=1,
+        )
+
+        config = {
+            "benchmark": {
+                "dataset_name": "imagenet_a",
+                "data_root": str(dataset_root),
+                "num_tasks": 10,
+                "classes_per_task": 20,
+                "image_size": 224,
+            }
+        }
+
+        with self.assertRaisesRegex(FileNotFoundError, "expects a 'test' directory"):
+            build_benchmark(config)
 
     def test_softsign_bounded_residual_keeps_gradient_on_large_delta_raw(self):
         repo_root = Path(__file__).resolve().parents[1]
@@ -1808,6 +1900,47 @@ class PaperAlignmentUnitTests(unittest.TestCase):
         joined_messages = "\n".join(logger.messages)
         self.assertIn("retention_feature_representation=full_tokens", joined_messages)
         self.assertIn("can use substantially more memory", joined_messages)
+
+    def test_benchmark_sanity_summary_logs_counts_without_mutating_benchmark(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "benchmark_sanity_summary_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        benchmark = _build_tiny_benchmark(num_tasks=2)
+        benchmark.metadata = {
+            "dataset_type": "imagefolder",
+            "class_name_count": 4,
+            "split_class_names": {
+                "train": ["ant", "bear", "cat", "dog"],
+                "test": ["ant", "bear", "cat", "dog"],
+            },
+        }
+        benchmark.tasks[0].metadata = {
+            "class_names": ["ant", "bear"],
+            "class_count": 2,
+            "train_sample_count": len(benchmark.tasks[0].train_records),
+            "test_sample_count": len(benchmark.tasks[0].test_records),
+        }
+        benchmark.tasks[1].metadata = {
+            "class_names": ["cat", "dog"],
+            "class_count": 2,
+            "train_sample_count": len(benchmark.tasks[1].train_records),
+            "test_sample_count": len(benchmark.tasks[1].test_records),
+        }
+        before_benchmark_metadata = deepcopy(benchmark.metadata)
+        before_task_metadata = deepcopy([task.metadata for task in benchmark.tasks])
+        logger = _ListLogger()
+        trainer = NHLoRATrainer(config, logger, benchmark=benchmark)
+
+        trainer._log_benchmark_sanity_summary()
+
+        joined_messages = "\n".join(logger.messages)
+        self.assertIn("[BenchmarkSummary] name=tiny_alignment num_classes=4 num_tasks=2", joined_messages)
+        self.assertIn("[BenchmarkSummary][ImageFolder] class_name_count=4", joined_messages)
+        self.assertIn("[BenchmarkTaskSummary][Task 1] class_count=2 train_samples=8 test_samples=4", joined_messages)
+        self.assertIn("class_name_preview=['ant', 'bear']", joined_messages)
+        self.assertEqual(before_benchmark_metadata, benchmark.metadata)
+        self.assertEqual(before_task_metadata, [task.metadata for task in benchmark.tasks])
 
     def test_planner_decision_label_matches_threshold_quadrants(self):
         self.assertEqual(

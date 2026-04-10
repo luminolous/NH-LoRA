@@ -164,6 +164,18 @@ The design paper is the primary source of truth. When paper detail was ambiguous
   These changes are for benchmark wiring, portability gating, and config
   separation only; they do not retune thresholds, alter planner behavior,
   redesign CHU/router/classifier behavior, or change residual-gate semantics.
+- Full-block default and ImageNet-A correctness note: Stage 16 still does not
+  change NH-LoRA method semantics, but it promotes full-block injection
+  `[0..11]` to the global base-config default and hardens the `imagenet_a`
+  adapter with fail-fast validation:
+  - `train/` and `test/` must both exist
+  - the train/test class-folder sets must match exactly
+  - the benchmark must expose exactly 200 classes
+  Stage 16 also adds benchmark sanity summaries that log benchmark class/task
+  counts plus per-task class and sample counts before training. These additions
+  are observational and correctness-focused only; they do not retune thresholds,
+  alter planner behavior, redesign CHU/router/classifier behavior, or change
+  residual-gate semantics.
 
 ### CHU
 

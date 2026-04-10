@@ -129,6 +129,15 @@ can separate pure policy-side growth concentration from realization failure.
 They remain observational and do not change thresholds, CHU, router behavior,
 classifier behavior, residual-gate behavior, or soft-rank status.
 
+Stage 16 still keeps NH-LoRA method semantics unchanged, but it makes
+full-block injection `[0..11]` the global default in the base config and
+strengthens the `imagenet_a` dataset contract. `ImageNet-A` now fails fast if
+`train/` or `test/` is missing, if the split class-folder sets differ, or if
+the layout does not contain exactly 200 classes. Benchmark sanity summaries
+also log class counts, task counts, per-task class counts, and train/test
+sample counts at seed start so dataset-layout issues are visible before they
+are mistaken for method behavior.
+
 ## Bootstrap Task 1
 
 Task 1 is intentionally special:
@@ -167,6 +176,12 @@ Legacy optional adapter retained in the repo:
 - OmniBenchmark
 
 Dataset adapters are unified at the engine boundary but remain benchmark-specific internally where the benchmark requires it.
+
+`ImageNet-A` uses a strict ImageFolder contract:
+
+- `train/` and `test/` must both exist under `benchmark.data_root`
+- the class-folder names in `train/` and `test/` must match exactly
+- the benchmark must expose exactly 200 classes
 
 ## Local Validation
 
