@@ -112,6 +112,14 @@ signal when `delta_raw` grows. Stage 12 does not tune thresholds, add
 regularizers, redesign CHU/router/classifier behavior, change Stage 5
 inference-profile semantics, or enable soft-rank.
 
+Stage 13 keeps Stage 12 behavior intact and extends `training.planner_audit_logging`
+with structural shared-only concentration diagnostics. These logs compare
+policy-side growth rankings, cross-layer growth concentration, per-layer
+structure lifecycle across tasks, route/usage concentration, and Pre-CHU vs
+Post-CHU profile contraction so long-horizon shared-only collapse can be
+classified without changing planner decisions, CHU, router behavior, classifier
+behavior, or hybrid residual-control semantics.
+
 ## Bootstrap Task 1
 
 Task 1 is intentionally special:

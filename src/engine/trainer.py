@@ -128,6 +128,10 @@ class NHLoRATrainer:
         self._planner_action_history: Dict[int, List[Dict[str, Any]]] = {
             int(block_id): [] for block_id in self.model.selected_blocks
         }
+        self._planner_growth_history: List[Dict[str, Any]] = []
+        self._planner_layer_structure_history: Dict[int, List[Dict[str, Any]]] = {
+            int(block_id): [] for block_id in self.model.selected_blocks
+        }
 
     def _resolve_device(self, requested_device: str) -> torch.device:
         if requested_device == "cuda" and not torch.cuda.is_available():
@@ -1223,6 +1227,558 @@ class NHLoRATrainer:
             "history_attention_max_weight": float(attention_stats["max_weight"]),
         }
 
+    @staticmethod
+    def _planner_candidate_ranking(
+        records: Dict[int, Dict[str, object]],
+        *,
+        action: str,
+    ) -> List[Dict[str, object]]:
+        ranked: List[Dict[str, object]] = []
+        for block_id, record in records.items():
+            if str(record.get("action", "")) != str(action):
+                continue
+            ranked.append(
+                {
+                    "block_id": int(block_id),
+                    "novelty_margin": float(record.get("novelty_margin", 0.0)),
+                    "conflict_margin": float(record.get("conflict_margin", 0.0)),
+                    "shared_gate": float(record.get("shared_gate", 0.0)),
+                    "rank_budget": int(record.get("rank_budget", 0)),
+                }
+            )
+        if action == "open_new_slot":
+            ranked.sort(
+                key=lambda item: (
+                    -float(item["conflict_margin"]),
+                    -float(item["novelty_margin"]),
+                    int(item["block_id"]),
+                )
+            )
+        elif action == "expand_rank_existing_slot":
+            ranked.sort(
+                key=lambda item: (
+                    -float(item["novelty_margin"]),
+                    float(item["conflict_margin"]),
+                    int(item["block_id"]),
+                )
+            )
+        else:
+            ranked.sort(
+                key=lambda item: (
+                    -float(item["novelty_margin"]),
+                    -float(item["conflict_margin"]),
+                    int(item["block_id"]),
+                )
+            )
+        return ranked
+
+    @staticmethod
+    def _ranking_position(ranking: List[Dict[str, object]], block_id: int) -> int | None:
+        for index, entry in enumerate(ranking, start=1):
+            if int(entry["block_id"]) == int(block_id):
+                return int(index)
+        return None
+
+    def _planner_growth_task_summary(
+        self,
+        *,
+        task_number: int,
+        records: Dict[int, Dict[str, object]],
+        materialized_plans: Dict[int, MaterializedLayerPlan],
+        applied_plans: Dict[int, Dict[str, object]],
+    ) -> Dict[str, object]:
+        open_ranking = self._planner_candidate_ranking(records, action="open_new_slot")
+        expand_ranking = self._planner_candidate_ranking(records, action="expand_rank_existing_slot")
+        growth_layers: List[int] = []
+        opened_layers: List[int] = []
+        expanded_layers: List[int] = []
+        fallback_layers: List[int] = []
+        layer_outcomes: Dict[int, Dict[str, object]] = {}
+        for block_id, plan in materialized_plans.items():
+            opened = bool(plan.create_new_slot)
+            expanded = int(plan.rank_delta) > 0
+            if opened or expanded:
+                growth_layers.append(int(block_id))
+            if opened:
+                opened_layers.append(int(block_id))
+            if expanded and not opened:
+                expanded_layers.append(int(block_id))
+            if plan.fallback_action is not None:
+                fallback_layers.append(int(block_id))
+            applied = applied_plans.get(int(block_id), {})
+            layer_outcomes[int(block_id)] = {
+                "requested_action": str(plan.requested_action),
+                "materialized_action": str(plan.action),
+                "applied_action": str(applied.get("action", plan.action)),
+                "opened": opened,
+                "expanded": expanded and not opened,
+                "rank_delta": int(plan.rank_delta),
+                "fallback_action": None if plan.fallback_action is None else str(plan.fallback_action),
+                "candidate_count": len(plan.candidate_slots),
+                "shared_only": bool(plan.shared_only),
+            }
+        growth_layers.sort()
+        opened_layers.sort()
+        expanded_layers.sort()
+        fallback_layers.sort()
+        return {
+            "task_number": int(task_number),
+            "open_ranking": open_ranking,
+            "expand_ranking": expand_ranking,
+            "open_winner": None if not open_ranking else int(open_ranking[0]["block_id"]),
+            "expand_winner": None if not expand_ranking else int(expand_ranking[0]["block_id"]),
+            "growth_layers": growth_layers,
+            "opened_layers": opened_layers,
+            "expanded_layers": expanded_layers,
+            "fallback_layers": fallback_layers,
+            "layer6_open_rank": self._ranking_position(open_ranking, 6),
+            "layer6_expand_rank": self._ranking_position(expand_ranking, 6),
+            "layer_outcomes": layer_outcomes,
+        }
+
+    @staticmethod
+    def _growth_winner_distribution(task_summaries: List[Dict[str, object]]) -> Dict[str, object]:
+        open_winners: Dict[int, int] = {}
+        expand_winners: Dict[int, int] = {}
+        actual_growth_counts: Dict[int, int] = {}
+        zero_growth_tasks: List[int] = []
+        for summary in task_summaries:
+            task_number = int(summary.get("task_number", 0))
+            open_winner = summary.get("open_winner")
+            if open_winner is not None:
+                block_id = int(open_winner)
+                open_winners[block_id] = open_winners.get(block_id, 0) + 1
+            expand_winner = summary.get("expand_winner")
+            if expand_winner is not None:
+                block_id = int(expand_winner)
+                expand_winners[block_id] = expand_winners.get(block_id, 0) + 1
+            growth_layers = [int(block_id) for block_id in summary.get("growth_layers", [])]
+            if not growth_layers:
+                zero_growth_tasks.append(task_number)
+            for block_id in growth_layers:
+                actual_growth_counts[block_id] = actual_growth_counts.get(block_id, 0) + 1
+        return {
+            "open_winners": open_winners,
+            "expand_winners": expand_winners,
+            "actual_growth_counts": actual_growth_counts,
+            "zero_growth_tasks": zero_growth_tasks,
+            "layer6_open_wins": int(open_winners.get(6, 0)),
+            "layer6_expand_wins": int(expand_winners.get(6, 0)),
+            "layer6_growth_tasks": int(actual_growth_counts.get(6, 0)),
+        }
+
+    @staticmethod
+    def _new_structure_route_accumulator() -> Dict[int, Dict[str, object]]:
+        return {}
+
+    @staticmethod
+    def _structure_route_layer_accumulator(
+        accumulator: Dict[int, Dict[str, object]],
+        block_id: int,
+    ) -> Dict[str, object]:
+        return accumulator.setdefault(
+            int(block_id),
+            {
+                "batches": 0,
+                "empty_candidate_batches": 0,
+                "candidate_count_sum": 0.0,
+                "selected_count_sum": 0.0,
+                "nonzero_usage_slot_count_sum": 0.0,
+                "usage_top1_share_sum": 0.0,
+                "usage_entropy_sum": 0.0,
+                "usage_mass_by_slot": {},
+            },
+        )
+
+    def _accumulate_planner_structure_route_usage(
+        self,
+        context: Dict[str, Any],
+        route_info: Dict[int, Dict[str, object]],
+    ) -> None:
+        if not self._planner_audit_enabled():
+            return
+        accumulator = context.setdefault(
+            "planner_structure_route_accumulator",
+            self._new_structure_route_accumulator(),
+        )
+        for block_id, layer_state in route_info.items():
+            layer_stats = self._structure_route_layer_accumulator(accumulator, int(block_id))
+            candidate_slots = self._int_list(layer_state.get("candidate_slots", []))
+            selected_slots = self._int_list(layer_state.get("selected_slots", []))
+            distribution = layer_state.get("routing_distribution")
+            usage_vector = layer_state.get("usage_vector")
+            if usage_vector is None and isinstance(distribution, torch.Tensor) and distribution.numel() > 0:
+                usage_vector = distribution.detach().mean(dim=0)
+            layer_stats["batches"] += 1
+            layer_stats["candidate_count_sum"] += float(len(candidate_slots))
+            layer_stats["selected_count_sum"] += float(len(selected_slots))
+            if not candidate_slots:
+                layer_stats["empty_candidate_batches"] += 1
+                continue
+            if isinstance(usage_vector, torch.Tensor) and usage_vector.numel() > 0:
+                detached_usage = usage_vector.detach().float().reshape(-1).cpu()
+                total_mass = float(detached_usage.sum().item())
+                active_count = int((detached_usage > 1e-8).sum().item())
+                if total_mass > 1e-12:
+                    normalized_usage = detached_usage / total_mass
+                    top_share = float(normalized_usage.max().item())
+                    entropy = float(
+                        -(normalized_usage * normalized_usage.clamp_min(1e-8).log()).sum().item()
+                    )
+                else:
+                    top_share = 0.0
+                    entropy = 0.0
+                layer_stats["nonzero_usage_slot_count_sum"] += float(active_count)
+                layer_stats["usage_top1_share_sum"] += top_share
+                layer_stats["usage_entropy_sum"] += entropy
+                usage_mass_by_slot = layer_stats.setdefault("usage_mass_by_slot", {})
+                for slot_id, slot_mass in zip(candidate_slots, detached_usage.tolist()):
+                    usage_mass_by_slot[int(slot_id)] = usage_mass_by_slot.get(int(slot_id), 0.0) + float(slot_mass)
+
+    @staticmethod
+    def _route_usage_concentration_summary(
+        route_stats: Dict[str, object],
+        *,
+        lifecycle_summary: Dict[str, object] | None = None,
+    ) -> Dict[str, object]:
+        batches = max(int(route_stats.get("batches", 0)), 1)
+        usage_mass_by_slot = {
+            int(slot_id): float(value)
+            for slot_id, value in route_stats.get("usage_mass_by_slot", {}).items()
+        }
+        usage_total = sum(usage_mass_by_slot.values())
+        usage_top1_share = 0.0
+        usage_entropy = 0.0
+        if usage_total > 1e-12:
+            normalized_usage = torch.tensor(
+                [value / usage_total for _, value in sorted(usage_mass_by_slot.items())],
+                dtype=torch.float32,
+            )
+            usage_top1_share = float(normalized_usage.max().item())
+            usage_entropy = float(
+                -(normalized_usage * normalized_usage.clamp_min(1e-8).log()).sum().item()
+            )
+        cumulative_usage_by_slot = {}
+        usage_ema_by_slot = {}
+        profile_candidate_count = 0
+        profile_shared_only = False
+        if lifecycle_summary:
+            cumulative_usage_by_slot = {
+                int(slot_id): float(value)
+                for slot_id, value in lifecycle_summary.get("cumulative_usage_by_slot", {}).items()
+            }
+            usage_ema_by_slot = {
+                int(slot_id): float(value)
+                for slot_id, value in lifecycle_summary.get("usage_ema_by_slot", {}).items()
+            }
+            profile_candidate_count = len(lifecycle_summary.get("candidate_slot_ids", []))
+            profile_shared_only = bool(lifecycle_summary.get("shared_only", False))
+
+        def _top_share(values: Dict[int, float]) -> float:
+            total = sum(values.values())
+            if total <= 1e-12:
+                return 0.0
+            return float(max(values.values()) / total)
+
+        train_candidate_count_mean = float(route_stats.get("candidate_count_sum", 0.0)) / batches
+        return {
+            "train_candidate_count_mean": train_candidate_count_mean,
+            "train_selected_count_mean": float(route_stats.get("selected_count_sum", 0.0)) / batches,
+            "train_nonzero_usage_slot_count_mean": float(route_stats.get("nonzero_usage_slot_count_sum", 0.0)) / batches,
+            "empty_candidate_fraction": float(route_stats.get("empty_candidate_batches", 0)) / batches,
+            "usage_top1_share_mean": float(route_stats.get("usage_top1_share_sum", 0.0)) / batches,
+            "usage_entropy_mean": float(route_stats.get("usage_entropy_sum", 0.0)) / batches,
+            "aggregated_usage_top1_share": usage_top1_share,
+            "aggregated_usage_entropy": usage_entropy,
+            "usage_nonzero_slot_count": int(sum(1 for value in usage_mass_by_slot.values() if value > 1e-8)),
+            "usage_ema_top1_share": _top_share(usage_ema_by_slot),
+            "cumulative_usage_top1_share": _top_share(cumulative_usage_by_slot),
+            "profile_candidate_count": int(profile_candidate_count),
+            "profile_shared_only": bool(profile_shared_only),
+            "candidate_but_zero_usage": bool(train_candidate_count_mean > 0.0 and usage_total <= 1e-12),
+        }
+
+    @staticmethod
+    def _profile_contraction_diff(
+        pre_summary: Dict[str, object],
+        post_summary: Dict[str, object],
+    ) -> Dict[str, object]:
+        pre_live = len(pre_summary.get("live_slot_ids", []))
+        post_live = len(post_summary.get("live_slot_ids", []))
+        pre_retained = len(pre_summary.get("retained_slot_ids", []))
+        post_retained = len(post_summary.get("retained_slot_ids", []))
+        pre_candidates = len(pre_summary.get("candidate_slot_ids", []))
+        post_candidates = len(post_summary.get("candidate_slot_ids", []))
+        pre_frozen = len(pre_summary.get("frozen_slot_ids", []))
+        post_frozen = len(post_summary.get("frozen_slot_ids", []))
+        pre_pruned = len(pre_summary.get("pruned_slot_ids", []))
+        post_pruned = len(post_summary.get("pruned_slot_ids", []))
+        pre_shared_only = bool(pre_summary.get("shared_only", False))
+        post_shared_only = bool(post_summary.get("shared_only", False))
+        return {
+            "live_delta": int(post_live - pre_live),
+            "retained_delta": int(post_retained - pre_retained),
+            "candidate_delta": int(post_candidates - pre_candidates),
+            "frozen_delta": int(post_frozen - pre_frozen),
+            "pruned_delta": int(post_pruned - pre_pruned),
+            "shared_only_changed": bool(pre_shared_only != post_shared_only),
+            "contracted": bool(
+                post_live < pre_live
+                or post_retained < pre_retained
+                or post_candidates < pre_candidates
+                or (not pre_shared_only and post_shared_only)
+            ),
+        }
+
+    @staticmethod
+    def _aggregate_layer_lifecycle_history(entries: List[Dict[str, object]]) -> Dict[str, object]:
+        if not entries:
+            return {
+                "tasks": [],
+                "post_live_counts": [],
+                "post_retained_counts": [],
+                "post_shared_only_flags": [],
+                "opened_tasks": [],
+                "expanded_tasks": [],
+                "grew_tasks": [],
+                "never_grew": True,
+                "ever_multi_slot": False,
+                "opened_then_shared_only": False,
+                "collapsed_after_growth_tasks": [],
+            }
+        ordered_entries = sorted(entries, key=lambda item: int(item.get("task_number", 0)))
+        tasks = [int(entry["task_number"]) for entry in ordered_entries]
+        post_live_counts = [int(entry.get("post_live_count", 0)) for entry in ordered_entries]
+        post_retained_counts = [int(entry.get("post_retained_count", 0)) for entry in ordered_entries]
+        post_shared_only_flags = [bool(entry.get("post_shared_only", False)) for entry in ordered_entries]
+        opened_tasks = [int(entry["task_number"]) for entry in ordered_entries if bool(entry.get("opened", False))]
+        expanded_tasks = [int(entry["task_number"]) for entry in ordered_entries if bool(entry.get("expanded", False))]
+        grew_tasks = [int(entry["task_number"]) for entry in ordered_entries if bool(entry.get("opened", False) or entry.get("expanded", False))]
+        collapsed_after_growth_tasks = [
+            int(entry["task_number"])
+            for entry in ordered_entries
+            if bool(entry.get("opened", False) or entry.get("expanded", False))
+            and bool(entry.get("post_shared_only", False))
+        ]
+        ever_multi_slot = any(
+            int(entry.get("pre_live_count", 0)) > 1 or int(entry.get("post_live_count", 0)) > 1
+            for entry in ordered_entries
+        )
+        final_post_shared_only = bool(ordered_entries[-1].get("post_shared_only", False))
+        return {
+            "tasks": tasks,
+            "post_live_counts": post_live_counts,
+            "post_retained_counts": post_retained_counts,
+            "post_shared_only_flags": post_shared_only_flags,
+            "opened_tasks": opened_tasks,
+            "expanded_tasks": expanded_tasks,
+            "grew_tasks": grew_tasks,
+            "never_grew": not bool(grew_tasks),
+            "ever_multi_slot": bool(ever_multi_slot),
+            "opened_then_shared_only": bool(grew_tasks and final_post_shared_only),
+            "collapsed_after_growth_tasks": collapsed_after_growth_tasks,
+        }
+
+    @staticmethod
+    def _final_epoch_contribution_ratio(contribution_accumulator: Dict[int, Dict[str, object]], block_id: int) -> float:
+        contribution_stats = contribution_accumulator.get(int(block_id), {})
+        shared_post_count = max(int(contribution_stats.get("shared_post_beta_norm_count", 0)), 1)
+        slot_count = max(int(contribution_stats.get("slot_norm_count", 0)), 1)
+        mean_shared_post = float(contribution_stats.get("shared_post_beta_norm_sum", 0.0)) / shared_post_count
+        mean_slot = float(contribution_stats.get("slot_norm_sum", 0.0)) / slot_count
+        return mean_shared_post / max(mean_slot, 1e-12)
+
+    def _log_stage13_policy_growth_summary(self, context: Dict[str, Any]) -> None:
+        if not self._planner_audit_enabled():
+            return
+        records = context.get("planner_audit_records", {})
+        materialized_plans = context.get("materialized_plans", {})
+        applied_plans = context.get("applied_plans", {})
+        if not records or not materialized_plans or not applied_plans:
+            return
+        summary = self._planner_growth_task_summary(
+            task_number=int(context["task_number"]),
+            records=records,
+            materialized_plans=materialized_plans,
+            applied_plans=applied_plans,
+        )
+        context["planner_growth_task_summary"] = summary
+        self._planner_growth_history.append(summary)
+        open_ranked_layers = [
+            (
+                int(entry["block_id"]),
+                round(float(entry["novelty_margin"]), 4),
+                round(float(entry["conflict_margin"]), 4),
+            )
+            for entry in summary["open_ranking"]
+        ]
+        expand_ranked_layers = [
+            (
+                int(entry["block_id"]),
+                round(float(entry["novelty_margin"]), 4),
+                round(float(entry["conflict_margin"]), 4),
+            )
+            for entry in summary["expand_ranking"]
+        ]
+        self.logger.info(
+            "[PlannerGrowthTask][Task %d] open_ranked_layers=%s expand_ranked_layers=%s growth_layers=%s opened_layers=%s expanded_layers=%s fallback_layers=%s layer6_open_rank=%s layer6_expand_rank=%s",
+            context["task_number"],
+            open_ranked_layers,
+            expand_ranked_layers,
+            summary["growth_layers"],
+            summary["opened_layers"],
+            summary["expanded_layers"],
+            summary["fallback_layers"],
+            "n/a" if summary["layer6_open_rank"] is None else int(summary["layer6_open_rank"]),
+            "n/a" if summary["layer6_expand_rank"] is None else int(summary["layer6_expand_rank"]),
+        )
+        distribution = self._growth_winner_distribution(self._planner_growth_history)
+        self.logger.info(
+            "[PlannerGrowthConcentration][Task %d] open_winners=%s expand_winners=%s actual_growth_counts=%s zero_growth_tasks=%s layer6_open_wins=%d layer6_expand_wins=%d layer6_growth_tasks=%d",
+            context["task_number"],
+            distribution["open_winners"],
+            distribution["expand_winners"],
+            distribution["actual_growth_counts"],
+            distribution["zero_growth_tasks"],
+            int(distribution["layer6_open_wins"]),
+            int(distribution["layer6_expand_wins"]),
+            int(distribution["layer6_growth_tasks"]),
+        )
+
+    def _log_stage13_structural_shared_only_audit(
+        self,
+        context: Dict[str, Any],
+        _usage_stats: Dict[int, Dict[int, float]],
+    ) -> None:
+        if not self._planner_audit_enabled():
+            return
+        lifecycle = context.get("stage5_slot_lifecycle", {})
+        pre_profile = lifecycle.get("PreCHUProfile", {})
+        post_profile = lifecycle.get("PostCHUProfile", {})
+        if not pre_profile or not post_profile:
+            return
+        route_accumulator = context.get("planner_structure_route_accumulator", {})
+        growth_summary = context.get("planner_growth_task_summary", {})
+        contribution_accumulator = context.get("planner_control_contribution_epoch_accumulator", {})
+        shared_only_layers_post: List[int] = []
+        multi_slot_layers_post: List[int] = []
+        contracted_layers: List[int] = []
+        for block_id in self.model.selected_blocks:
+            block_id = int(block_id)
+            pre_summary = pre_profile.get(block_id)
+            post_summary = post_profile.get(block_id)
+            if not isinstance(pre_summary, dict) or not isinstance(post_summary, dict):
+                continue
+            route_summary = self._route_usage_concentration_summary(
+                route_accumulator.get(block_id, {}),
+                lifecycle_summary=post_summary,
+            )
+            profile_diff = self._profile_contraction_diff(pre_summary, post_summary)
+            layer_outcome = growth_summary.get("layer_outcomes", {}).get(block_id, {})
+            layer_entry = {
+                "task_number": int(context["task_number"]),
+                "opened": bool(layer_outcome.get("opened", False)),
+                "expanded": bool(layer_outcome.get("expanded", False)),
+                "pre_live_count": len(pre_summary.get("live_slot_ids", [])),
+                "post_live_count": len(post_summary.get("live_slot_ids", [])),
+                "post_retained_count": len(post_summary.get("retained_slot_ids", [])),
+                "post_shared_only": bool(post_summary.get("shared_only", False)),
+            }
+            self._planner_layer_structure_history.setdefault(block_id, []).append(layer_entry)
+            if bool(post_summary.get("shared_only", False)):
+                shared_only_layers_post.append(block_id)
+            if len(post_summary.get("live_slot_ids", [])) > 1:
+                multi_slot_layers_post.append(block_id)
+            if bool(profile_diff["contracted"]):
+                contracted_layers.append(block_id)
+            self.logger.info(
+                "[PlannerStructureTask][Task %d][Layer %d] requested_action=%s materialized_action=%s opened=%s expanded=%s pre_live=%d post_live=%d pre_retained=%d post_retained=%d pre_shared_only=%s post_shared_only=%s train_candidate_count_mean=%.2f train_selected_count_mean=%.2f train_nonzero_usage_slot_count_mean=%.2f usage_top1_share_mean=%.4f aggregated_usage_top1_share=%.4f usage_ema_top1_share=%.4f cumulative_usage_top1_share=%.4f candidate_but_zero_usage=%s",
+                context["task_number"],
+                block_id,
+                layer_outcome.get("requested_action", "n/a"),
+                layer_outcome.get("materialized_action", "n/a"),
+                bool(layer_outcome.get("opened", False)),
+                bool(layer_outcome.get("expanded", False)),
+                len(pre_summary.get("live_slot_ids", [])),
+                len(post_summary.get("live_slot_ids", [])),
+                len(pre_summary.get("retained_slot_ids", [])),
+                len(post_summary.get("retained_slot_ids", [])),
+                bool(pre_summary.get("shared_only", False)),
+                bool(post_summary.get("shared_only", False)),
+                float(route_summary["train_candidate_count_mean"]),
+                float(route_summary["train_selected_count_mean"]),
+                float(route_summary["train_nonzero_usage_slot_count_mean"]),
+                float(route_summary["usage_top1_share_mean"]),
+                float(route_summary["aggregated_usage_top1_share"]),
+                float(route_summary["usage_ema_top1_share"]),
+                float(route_summary["cumulative_usage_top1_share"]),
+                bool(route_summary["candidate_but_zero_usage"]),
+            )
+            self.logger.info(
+                "[PlannerCHUDiff][Task %d][Layer %d] live_delta=%d retained_delta=%d candidate_delta=%d frozen_delta=%d pruned_delta=%d shared_only_changed=%s contracted=%s",
+                context["task_number"],
+                block_id,
+                int(profile_diff["live_delta"]),
+                int(profile_diff["retained_delta"]),
+                int(profile_diff["candidate_delta"]),
+                int(profile_diff["frozen_delta"]),
+                int(profile_diff["pruned_delta"]),
+                bool(profile_diff["shared_only_changed"]),
+                bool(profile_diff["contracted"]),
+            )
+            history_summary = self._aggregate_layer_lifecycle_history(
+                self._planner_layer_structure_history.get(block_id, [])
+            )
+            self.logger.info(
+                "[PlannerStructureTrajectory][Layer %d] tasks=%s post_live=%s post_retained=%s post_shared_only=%s opened_tasks=%s expanded_tasks=%s never_grew=%s ever_multi_slot=%s opened_then_shared_only=%s collapsed_after_growth_tasks=%s",
+                block_id,
+                history_summary["tasks"],
+                history_summary["post_live_counts"],
+                history_summary["post_retained_counts"],
+                history_summary["post_shared_only_flags"],
+                history_summary["opened_tasks"],
+                history_summary["expanded_tasks"],
+                bool(history_summary["never_grew"]),
+                bool(history_summary["ever_multi_slot"]),
+                bool(history_summary["opened_then_shared_only"]),
+                history_summary["collapsed_after_growth_tasks"],
+            )
+        focus_block_id = 6 if 6 in self.model.selected_blocks else int(self.model.selected_blocks[0])
+        focus_pre = pre_profile.get(focus_block_id, {})
+        focus_post = post_profile.get(focus_block_id, {})
+        focus_route_summary = self._route_usage_concentration_summary(
+            route_accumulator.get(focus_block_id, {}),
+            lifecycle_summary=focus_post,
+        )
+        focus_outcome = growth_summary.get("layer_outcomes", {}).get(focus_block_id, {})
+        focus_contribution_ratio = self._final_epoch_contribution_ratio(contribution_accumulator, focus_block_id)
+        self.logger.info(
+            "[PlannerLayer6Audit][Task %d] policy_open_rank=%s policy_expand_rank=%s opened=%s expanded=%s pre_live=%d post_live=%d pre_shared_only=%s post_shared_only=%s train_candidate_count_mean=%.2f train_selected_count_mean=%.2f usage_ema_top1_share=%.4f cumulative_usage_top1_share=%.4f final_epoch_shared_to_slot_ratio=%.4e profile_candidates_pre=%d profile_candidates_post=%d",
+            context["task_number"],
+            "n/a" if growth_summary.get("layer6_open_rank") is None else int(growth_summary["layer6_open_rank"]),
+            "n/a" if growth_summary.get("layer6_expand_rank") is None else int(growth_summary["layer6_expand_rank"]),
+            bool(focus_outcome.get("opened", False)),
+            bool(focus_outcome.get("expanded", False)),
+            len(focus_pre.get("live_slot_ids", [])),
+            len(focus_post.get("live_slot_ids", [])),
+            bool(focus_pre.get("shared_only", False)),
+            bool(focus_post.get("shared_only", False)),
+            float(focus_route_summary["train_candidate_count_mean"]),
+            float(focus_route_summary["train_selected_count_mean"]),
+            float(focus_route_summary["usage_ema_top1_share"]),
+            float(focus_route_summary["cumulative_usage_top1_share"]),
+            float(focus_contribution_ratio),
+            len(focus_pre.get("candidate_slot_ids", [])),
+            len(focus_post.get("candidate_slot_ids", [])),
+        )
+        self.logger.info(
+            "[PlannerStructuralConcentration][Task %d] shared_only_layers_post=%s multi_slot_layers_post=%s contracted_layers=%s",
+            context["task_number"],
+            sorted(shared_only_layers_post),
+            sorted(multi_slot_layers_post),
+            sorted(contracted_layers),
+        )
+
     def _log_planner_layer_focus(self, context: Dict[str, Any]) -> None:
         if not self._planner_audit_enabled():
             return
@@ -1377,6 +1933,7 @@ class NHLoRATrainer:
             float(policy_representation_summary["pairwise_cosine_max"]),
         )
         self._log_planner_layer_focus(context)
+        self._log_stage13_policy_growth_summary(context)
 
     def _log_hybrid_planner_prepare(self, context: Dict[str, Any]) -> None:
         if not self._hybrid_planner_enabled():
@@ -2042,7 +2599,7 @@ class NHLoRATrainer:
             self.logger.info("[PlannerControlParamDrift][Task 1] stored_post_task1_reference=True")
 
     def _log_stage5_lifecycle_for_profile(self, context: Dict[str, Any], label: str, profile: Dict[int, Dict[str, object]]) -> None:
-        if not self._routing_audit_enabled():
+        if not (self._routing_audit_enabled() or self._planner_audit_enabled()):
             return
         lifecycle = context.setdefault("stage5_slot_lifecycle", {}).setdefault(label, {})
         for block_id in self.model.selected_blocks:
@@ -2947,6 +3504,7 @@ class NHLoRATrainer:
         }
         if self._planner_audit_enabled():
             context["planner_optimizer_summary"] = self._planner_optimizer_membership(optimizer)
+            context["planner_structure_route_accumulator"] = self._new_structure_route_accumulator()
         if self._hybrid_planner_enabled():
             context["planner_policy_optimizer_summary"] = self._planner_policy_optimizer_membership(optimizer)
             context["planner_control_optimizer_summary"] = self._planner_control_optimizer_membership(optimizer)
@@ -3193,6 +3751,7 @@ class NHLoRATrainer:
                 self._record_planner_optimizer_step(context)
                 self._record_planner_control_optimizer_step(context)
                 self._accumulate_usage(usage_accumulator, outputs["route_info"])
+                self._accumulate_planner_structure_route_usage(context, outputs["route_info"])
                 self._update_routing_debug(context, outputs["route_info"])
                 if outputs["route_info"]:
                     self.last_train_state["router_seen"] = True
@@ -3309,6 +3868,7 @@ class NHLoRATrainer:
             label="PostCHUProfile",
             profile=self.inference_profile,
         )
+        self._log_stage13_structural_shared_only_audit(context, usage_stats)
         self._log_stage5_train_eval_comparison(context)
         self._log_planner_parameter_drift(context)
         self._log_planner_control_parameter_drift(context)

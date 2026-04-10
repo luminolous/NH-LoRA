@@ -136,6 +136,14 @@ The design paper is the primary source of truth. When paper detail was ambiguous
   remains hybrid-only, keeps `planner_control_delta_logit_scale=2.0` unchanged
   for isolation, and does not retune thresholds, redesign CHU/router/classifier
   behavior, alter Stage 5 inference-profile semantics, or enable soft-rank.
+- Structural shared-only concentration audit note: Stage 13 keeps the same
+  `training.planner_audit_logging` flag and extends it with diagnostics for the
+  post-Stage-12 structural bottleneck. These logs summarize policy-side
+  open/expand rankings per task, cross-layer growth winner concentration,
+  per-layer structure lifecycle over tasks, route/usage concentration, and
+  Pre-CHU vs Post-CHU contraction. They are observational only and do not patch
+  residual gating, thresholds, CHU behavior, router behavior, classifier
+  behavior, or inference semantics.
 
 ### CHU
 

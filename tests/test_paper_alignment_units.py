@@ -1808,6 +1808,15 @@ class PaperAlignmentUnitTests(unittest.TestCase):
         trainer = NHLoRATrainer(config, logger, benchmark=benchmark)
         task_state, warmup_info = trainer._run_warmup_sensing(benchmark.tasks[1])
         raw_planner = trainer._compute_raw_planner(task_state)
+        materialized_plans = trainer._materialize_structure(task_state, raw_planner, task_id=2)
+        applied_plans = {
+            int(block_id): {
+                "action": plan.action,
+                "requested_action": plan.requested_action,
+                "shared_only": bool(plan.shared_only),
+            }
+            for block_id, plan in materialized_plans.items()
+        }
         optimizer = trainer._build_optimizer()
         before_embedding = task_state.embedding.detach().clone()
         before_signals = {
@@ -1822,6 +1831,8 @@ class PaperAlignmentUnitTests(unittest.TestCase):
             "task_number": 2,
             "task_state": task_state,
             "raw_planner": raw_planner,
+            "materialized_plans": materialized_plans,
+            "applied_plans": applied_plans,
             "optimizer": optimizer,
             "warmup_info": warmup_info,
         }
@@ -1844,6 +1855,8 @@ class PaperAlignmentUnitTests(unittest.TestCase):
         self.assertIn("[PlannerTrainPath][Task 2] in_optimizer=True", joined_messages)
         self.assertIn("[PlannerAudit][Task 2][Layer 1]", joined_messages)
         self.assertIn("[PlannerTrajectory][Layer 1]", joined_messages)
+        self.assertIn("[PlannerGrowthTask][Task 2]", joined_messages)
+        self.assertIn("[PlannerGrowthConcentration][Task 2]", joined_messages)
 
     def test_planner_audit_prepare_is_silent_when_disabled(self):
         repo_root = Path(__file__).resolve().parents[1]
@@ -1994,6 +2007,225 @@ class PaperAlignmentUnitTests(unittest.TestCase):
             NHLoRATrainer._paired_series_correlation([1.0, 2.0, 3.0], [2.0, 4.0, 6.0]),
             0.99,
         )
+
+    def test_stage13_growth_ranking_and_task_summary_helpers(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "stage13_growth_summary_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        trainer = NHLoRATrainer(config, configure_logger(level=logging.WARNING), benchmark=benchmark)
+
+        records = {
+            1: {
+                "action": "open_new_slot",
+                "novelty_margin": 0.20,
+                "conflict_margin": 0.70,
+                "shared_gate": 0.40,
+                "rank_budget": 2,
+            },
+            2: {
+                "action": "open_new_slot",
+                "novelty_margin": 0.15,
+                "conflict_margin": 0.30,
+                "shared_gate": 0.45,
+                "rank_budget": 2,
+            },
+            3: {
+                "action": "expand_rank_existing_slot",
+                "novelty_margin": 0.50,
+                "conflict_margin": -0.10,
+                "shared_gate": 0.60,
+                "rank_budget": 3,
+            },
+            4: {
+                "action": "expand_rank_existing_slot",
+                "novelty_margin": 0.25,
+                "conflict_margin": -0.20,
+                "shared_gate": 0.55,
+                "rank_budget": 2,
+            },
+        }
+        materialized_plans = {
+            1: MaterializedLayerPlan(
+                requested_action="open_new_slot",
+                action="open_new_slot",
+                selected_slot=None,
+                target_rank=None,
+                rank_delta=0,
+                create_new_slot=True,
+                new_slot_rank=2,
+            ),
+            2: MaterializedLayerPlan(
+                requested_action="open_new_slot",
+                action="expand_rank_existing_slot",
+                selected_slot=0,
+                target_rank=3,
+                rank_delta=1,
+                create_new_slot=False,
+                new_slot_rank=None,
+                fallback_action="expand_rank_existing_slot",
+            ),
+            3: MaterializedLayerPlan(
+                requested_action="expand_rank_existing_slot",
+                action="expand_rank_existing_slot",
+                selected_slot=0,
+                target_rank=4,
+                rank_delta=2,
+                create_new_slot=False,
+                new_slot_rank=None,
+            ),
+            4: MaterializedLayerPlan(
+                requested_action="expand_rank_existing_slot",
+                action="expand_rank_existing_slot",
+                selected_slot=1,
+                target_rank=2,
+                rank_delta=0,
+                create_new_slot=False,
+                new_slot_rank=None,
+            ),
+        }
+        applied_plans = {
+            block_id: {"action": plan.action, "shared_only": False}
+            for block_id, plan in materialized_plans.items()
+        }
+
+        open_ranking = NHLoRATrainer._planner_candidate_ranking(records, action="open_new_slot")
+        expand_ranking = NHLoRATrainer._planner_candidate_ranking(records, action="expand_rank_existing_slot")
+        summary = trainer._planner_growth_task_summary(
+            task_number=4,
+            records=records,
+            materialized_plans=materialized_plans,
+            applied_plans=applied_plans,
+        )
+
+        self.assertEqual([entry["block_id"] for entry in open_ranking], [1, 2])
+        self.assertEqual([entry["block_id"] for entry in expand_ranking], [3, 4])
+        self.assertEqual(summary["open_winner"], 1)
+        self.assertEqual(summary["expand_winner"], 3)
+        self.assertEqual(summary["growth_layers"], [1, 2, 3])
+        self.assertEqual(summary["opened_layers"], [1])
+        self.assertEqual(summary["expanded_layers"], [2, 3])
+        self.assertEqual(summary["fallback_layers"], [2])
+        distribution = NHLoRATrainer._growth_winner_distribution([summary])
+        self.assertEqual(distribution["open_winners"], {1: 1})
+        self.assertEqual(distribution["expand_winners"], {3: 1})
+        self.assertEqual(distribution["actual_growth_counts"], {1: 1, 2: 1, 3: 1})
+        self.assertEqual(distribution["zero_growth_tasks"], [])
+
+    def test_stage13_route_usage_concentration_summary_tracks_candidate_and_usage_collapse(self):
+        route_stats = {
+            "batches": 2,
+            "empty_candidate_batches": 0,
+            "candidate_count_sum": 4.0,
+            "selected_count_sum": 3.0,
+            "nonzero_usage_slot_count_sum": 3.0,
+            "usage_top1_share_sum": 1.5,
+            "usage_entropy_sum": 0.7,
+            "usage_mass_by_slot": {0: 1.5, 1: 0.5},
+        }
+        lifecycle_summary = {
+            "candidate_slot_ids": [0, 1],
+            "shared_only": False,
+            "usage_ema_by_slot": {0: 0.8, 1: 0.2},
+            "cumulative_usage_by_slot": {0: 2.0, 1: 1.0},
+        }
+
+        summary = NHLoRATrainer._route_usage_concentration_summary(
+            route_stats,
+            lifecycle_summary=lifecycle_summary,
+        )
+
+        self.assertAlmostEqual(summary["train_candidate_count_mean"], 2.0, places=6)
+        self.assertAlmostEqual(summary["train_selected_count_mean"], 1.5, places=6)
+        self.assertAlmostEqual(summary["usage_top1_share_mean"], 0.75, places=6)
+        self.assertAlmostEqual(summary["aggregated_usage_top1_share"], 0.75, places=6)
+        self.assertAlmostEqual(summary["usage_ema_top1_share"], 0.8, places=6)
+        self.assertAlmostEqual(summary["cumulative_usage_top1_share"], 2.0 / 3.0, places=6)
+        self.assertFalse(summary["candidate_but_zero_usage"])
+        self.assertEqual(summary["profile_candidate_count"], 2)
+        self.assertFalse(summary["profile_shared_only"])
+
+    def test_stage13_profile_contraction_diff_and_lifecycle_aggregation_helpers(self):
+        pre_summary = {
+            "live_slot_ids": [0, 1],
+            "retained_slot_ids": [0, 1],
+            "candidate_slot_ids": [0, 1],
+            "frozen_slot_ids": [],
+            "pruned_slot_ids": [],
+            "shared_only": False,
+        }
+        post_summary = {
+            "live_slot_ids": [0],
+            "retained_slot_ids": [0],
+            "candidate_slot_ids": [],
+            "frozen_slot_ids": [0],
+            "pruned_slot_ids": [1],
+            "shared_only": True,
+        }
+
+        diff = NHLoRATrainer._profile_contraction_diff(pre_summary, post_summary)
+        self.assertEqual(diff["live_delta"], -1)
+        self.assertEqual(diff["retained_delta"], -1)
+        self.assertEqual(diff["candidate_delta"], -2)
+        self.assertEqual(diff["frozen_delta"], 1)
+        self.assertEqual(diff["pruned_delta"], 1)
+        self.assertTrue(diff["shared_only_changed"])
+        self.assertTrue(diff["contracted"])
+
+        lifecycle_history = NHLoRATrainer._aggregate_layer_lifecycle_history(
+            [
+                {
+                    "task_number": 1,
+                    "opened": True,
+                    "expanded": False,
+                    "pre_live_count": 1,
+                    "post_live_count": 2,
+                    "post_retained_count": 2,
+                    "post_shared_only": False,
+                },
+                {
+                    "task_number": 2,
+                    "opened": False,
+                    "expanded": True,
+                    "pre_live_count": 2,
+                    "post_live_count": 1,
+                    "post_retained_count": 1,
+                    "post_shared_only": True,
+                },
+            ]
+        )
+        self.assertEqual(lifecycle_history["opened_tasks"], [1])
+        self.assertEqual(lifecycle_history["expanded_tasks"], [2])
+        self.assertEqual(lifecycle_history["grew_tasks"], [1, 2])
+        self.assertTrue(lifecycle_history["ever_multi_slot"])
+        self.assertTrue(lifecycle_history["opened_then_shared_only"])
+        self.assertEqual(lifecycle_history["collapsed_after_growth_tasks"], [2])
+
+    def test_stage13_structural_audit_is_silent_when_disabled(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "stage13_audit_disabled_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        config["training"]["planner_audit_logging"] = False
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        logger = _ListLogger()
+        trainer = NHLoRATrainer(config, logger, benchmark=benchmark)
+        before_history = deepcopy(trainer._planner_layer_structure_history)
+
+        trainer._log_stage13_structural_shared_only_audit(
+            {
+                "task_number": 1,
+                "stage5_slot_lifecycle": {},
+                "planner_structure_route_accumulator": {},
+                "planner_growth_task_summary": {},
+                "planner_control_contribution_epoch_accumulator": {},
+            },
+            {},
+        )
+
+        self.assertEqual(logger.messages, [])
+        self.assertEqual(before_history, trainer._planner_layer_structure_history)
 
     def test_planner_control_contribution_debug_records_shared_and_slot_activity(self):
         layer = NHLoRALayer(
