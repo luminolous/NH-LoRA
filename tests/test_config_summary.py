@@ -18,8 +18,8 @@ class ConfigAndSummarySmokeTest(unittest.TestCase):
         self.assertEqual(config["training"]["classifier_lr_scale"], 1.0)
         self.assertEqual(config["training"]["freeze_new_classifier_epochs"], 0)
         self.assertEqual(config["training"]["freeze_all_classifier_epochs"], 0)
-        self.assertFalse(config["training"]["planner_audit_logging"])
-        self.assertEqual(config["training"]["planner_mode"], "legacy")
+        self.assertTrue(config["training"]["planner_audit_logging"])
+        self.assertEqual(config["training"]["planner_mode"], "hybrid")
         self.assertEqual(config["training"]["planner_control_recompute"], "per_batch")
         self.assertFalse(config["training"]["planner_policy_trainable"])
         self.assertTrue(config["training"]["planner_control_trainable"])
@@ -80,8 +80,6 @@ class ConfigAndSummarySmokeTest(unittest.TestCase):
         self.assertEqual(imagenet_r_hybrid_config["training"]["planner_mode"], "hybrid")
         self.assertTrue(imagenet_r_hybrid_config["training"]["planner_audit_logging"])
 
-        all_layers_probe = load_config(repo_root / "configs" / "cifar100_hybrid_all_layers.yaml")
-        self.assertEqual(all_layers_probe["model"]["selected_blocks"], list(range(12)))
         baseline = load_config(repo_root / "configs" / "cifar100_hybrid.yaml")
         self.assertEqual(baseline["model"]["selected_blocks"], list(range(12)))
 

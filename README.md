@@ -138,6 +138,15 @@ also log class counts, task counts, per-task class counts, and train/test
 sample counts at seed start so dataset-layout issues are visible before they
 are mistaken for method behavior.
 
+Stage 17 still keeps NH-LoRA method semantics unchanged and extends the
+existing retention/evaluation debug surface with task-boundary retention
+diagnostics for CIFAR-100 full-block runs. These logs decompose forgetting into
+per-old-task accuracy drops, teacher-vs-student old-logit drift, feature-drift
+summaries, old-vs-new classifier calibration, eval-time route/profile
+availability, and Pre-CHU vs Post-CHU forgetting deltas so retention failures
+can be classified without changing planner decisions, residual gating, CHU,
+router behavior, classifier behavior, or loss weights.
+
 ## Bootstrap Task 1
 
 Task 1 is intentionally special:

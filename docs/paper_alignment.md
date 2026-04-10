@@ -157,10 +157,9 @@ The design paper is the primary source of truth. When paper detail was ambiguous
   while updating the benchmark surface. The repository now adds native
   `imagenet_a` support through the same continual ImageFolder contract used by
   `imagenet_r`, removes the `cub200` adapter from the public registry/config
-  surface, and adds explicit probe configs for:
+  surface, and keeps explicit hybrid benchmark configs for:
   - `imagenet_r_hybrid`
   - `imagenet_a_hybrid`
-  - `cifar100_hybrid_all_layers`
   These changes are for benchmark wiring, portability gating, and config
   separation only; they do not retune thresholds, alter planner behavior,
   redesign CHU/router/classifier behavior, or change residual-gate semantics.
@@ -176,6 +175,19 @@ The design paper is the primary source of truth. When paper detail was ambiguous
   are observational and correctness-focused only; they do not retune thresholds,
   alter planner behavior, redesign CHU/router/classifier behavior, or change
   residual-gate semantics.
+- Retention bottleneck audit note: Stage 17 still does not change NH-LoRA
+  method semantics, but it extends the existing retention/evaluation debug path
+  with task-boundary forgetting decomposition. These diagnostics log:
+  - current-task train accuracy vs seen-task evaluation accuracy
+  - per-old-task drop from best-prior and latest-prior accuracy
+  - teacher-vs-student old-logit drift and feature-drift summaries
+  - old-vs-new classifier calibration on seen-task evaluation data
+  - eval-time route/profile availability for old tasks
+  - Pre-CHU vs Post-CHU forgetting deltas
+  - per-layer retention attribution over later tasks
+  These additions are observational only; they do not retune losses, change
+  planner/control semantics, alter residual gating, or redesign CHU/router
+  behavior.
 
 ### CHU
 

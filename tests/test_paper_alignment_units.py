@@ -2754,6 +2754,202 @@ class PaperAlignmentUnitTests(unittest.TestCase):
         self.assertEqual(metrics["parameter_growth_delta"], 32)
         self.assertAlmostEqual(metrics["forgetting"], 0.15, places=6)
         self.assertEqual(metrics["task_wall_time"], 5.0)
+        self.assertIn("weighted_loss_balance", metrics)
+        self.assertIn("forgetting_decomposition", metrics)
+        self.assertAlmostEqual(metrics["weighted_loss_balance"]["weighted_losses"]["cls"], 1.0, places=6)
+        self.assertEqual(len(metrics["forgetting_decomposition"]["tasks"]), 1)
+
+    def test_stage17_weighted_loss_balance_summary_helper(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "stage17_loss_balance_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        trainer = NHLoRATrainer(config, configure_logger(level=logging.WARNING), benchmark=benchmark)
+
+        summary = trainer._weighted_loss_balance_summary(
+            {
+                "cls": 2.0,
+                "kd": 1.0,
+                "feat": 0.5,
+                "orth": 0.1,
+                "rank": 0.2,
+                "grow": 0.3,
+                "route": 0.4,
+            }
+        )
+
+        self.assertAlmostEqual(summary["weighted_losses"]["cls"], 2.0, places=6)
+        self.assertAlmostEqual(summary["weighted_losses"]["kd"], 0.5, places=6)
+        self.assertAlmostEqual(summary["weighted_losses"]["feat"], 0.25, places=6)
+        self.assertAlmostEqual(summary["retention_to_cls_ratio"], 0.375, places=6)
+        self.assertGreater(summary["weighted_shares"]["cls"], summary["weighted_shares"]["kd"])
+
+    def test_stage17_forgetting_decomposition_helper(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "stage17_forgetting_decomp_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        trainer = NHLoRATrainer(config, configure_logger(level=logging.WARNING), benchmark=benchmark)
+        trainer.accuracy_matrix = [[0.8], [0.75, 0.6]]
+
+        summary = trainer._forgetting_decomposition([0.7, 0.5, 0.4])
+
+        self.assertEqual(len(summary["tasks"]), 2)
+        self.assertAlmostEqual(summary["tasks"][0]["drop_from_best"], 0.1, places=6)
+        self.assertAlmostEqual(summary["tasks"][0]["drop_from_latest"], 0.05, places=6)
+        self.assertAlmostEqual(summary["tasks"][1]["drop_from_best"], 0.1, places=6)
+        self.assertAlmostEqual(summary["drop_from_best_summary"]["mean"], 0.1, places=6)
+        self.assertAlmostEqual(summary["drop_from_latest_summary"]["mean"], 0.075, places=6)
+
+    def test_stage17_classifier_calibration_summary_helper(self):
+        old_logits = torch.tensor([[2.0, 1.0], [1.0, 0.0]])
+        new_logits = torch.tensor([[0.5, 0.4], [1.5, 1.4]])
+        old_weights = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+        new_weights = torch.tensor([[0.1, 0.0], [0.0, 0.1]])
+        teacher_old_logits = torch.tensor([[3.0, 1.0], [2.0, 0.0]])
+
+        summary = NHLoRATrainer._classifier_calibration_summary(
+            old_logits=old_logits,
+            new_logits=new_logits,
+            old_classifier_weights=old_weights,
+            new_classifier_weights=new_weights,
+            teacher_old_logits=teacher_old_logits,
+        )
+
+        self.assertGreater(summary["old_logit_norm_mean"], summary["new_logit_norm_mean"])
+        self.assertAlmostEqual(summary["new_wins_ratio"], 0.5, places=6)
+        self.assertAlmostEqual(summary["old_weight_norm_mean"], 1.0, places=6)
+        self.assertAlmostEqual(summary["new_weight_norm_mean"], 0.1, places=6)
+        self.assertGreater(summary["old_logit_compression_ratio"], 0.0)
+
+    def test_stage17_route_profile_retention_summary_helper(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "stage17_route_retention_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        trainer = NHLoRATrainer(config, configure_logger(level=logging.WARNING), benchmark=benchmark)
+
+        route_infos = [
+            {
+                1: {
+                    "candidate_slots": [10, 11],
+                    "shared_only": False,
+                    "routing_distribution": torch.tensor([[0.7, 0.3], [0.6, 0.4]]),
+                },
+                2: {
+                    "candidate_slots": [],
+                    "shared_only": True,
+                    "routing_distribution": torch.zeros(2, 0),
+                },
+            },
+            {
+                1: {
+                    "candidate_slots": [10],
+                    "shared_only": False,
+                    "routing_distribution": torch.tensor([[1.0], [1.0]]),
+                },
+                2: {
+                    "candidate_slots": [20],
+                    "shared_only": False,
+                    "routing_distribution": torch.tensor([[1.0], [1.0]]),
+                },
+            },
+        ]
+
+        summary = trainer._route_profile_retention_summary(route_infos, selected_blocks=[1, 2])
+
+        self.assertEqual(summary["batch_count"], 2)
+        self.assertAlmostEqual(summary["shared_only_layer_count_mean"], 0.5, places=6)
+        self.assertAlmostEqual(summary["multi_slot_available_layer_count_mean"], 0.5, places=6)
+        self.assertAlmostEqual(summary["candidate_slot_count_mean"], 1.0, places=6)
+        self.assertAlmostEqual(summary["per_layer"][1]["multi_slot_available_frequency"], 0.5, places=6)
+        self.assertAlmostEqual(summary["per_layer"][2]["shared_only_frequency"], 0.5, places=6)
+
+    def test_stage17_retention_pre_post_diff_helper(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "stage17_pre_post_diff_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        trainer = NHLoRATrainer(config, configure_logger(level=logging.WARNING), benchmark=benchmark)
+
+        pre_eval = {
+            "retention_audit": {
+                "task_summaries": [
+                    {
+                        "task_number": 1,
+                        "accuracy": 0.60,
+                        "old_logit_mean_abs_diff": 0.20,
+                        "feature_mean_abs_diff": 0.30,
+                        "route_summary": {
+                            "shared_only_layer_count_mean": 2.0,
+                            "multi_slot_available_layer_count_mean": 1.0,
+                        },
+                    }
+                ]
+            }
+        }
+        post_eval = {
+            "retention_audit": {
+                "task_summaries": [
+                    {
+                        "task_number": 1,
+                        "accuracy": 0.55,
+                        "old_logit_mean_abs_diff": 0.25,
+                        "feature_mean_abs_diff": 0.40,
+                        "route_summary": {
+                            "shared_only_layer_count_mean": 3.0,
+                            "multi_slot_available_layer_count_mean": 0.0,
+                        },
+                    }
+                ]
+            }
+        }
+
+        summary = trainer._retention_pre_post_diff(pre_eval, post_eval)
+
+        self.assertEqual(len(summary["tasks"]), 1)
+        self.assertAlmostEqual(summary["tasks"][0]["accuracy_delta"], -0.05, places=6)
+        self.assertAlmostEqual(summary["tasks"][0]["old_logit_mean_abs_diff_delta"], 0.05, places=6)
+        self.assertAlmostEqual(summary["tasks"][0]["feature_mean_abs_diff_delta"], 0.10, places=6)
+        self.assertAlmostEqual(summary["tasks"][0]["shared_only_layer_count_mean_delta"], 1.0, places=6)
+        self.assertAlmostEqual(summary["tasks"][0]["multi_slot_available_layer_count_mean_delta"], -1.0, places=6)
+
+    def test_stage17_retention_audit_respects_retention_debug_flag(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "stage17_retention_disabled_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        config["training"]["retention_debug_logging"] = False
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        logger = _ListLogger()
+        trainer = NHLoRATrainer(config, logger, benchmark=benchmark)
+        history_before = deepcopy(trainer._retention_layer_audit_history)
+
+        trainer._log_retention_boundary_audit(
+            {"task_number": 2, "stage5_slot_lifecycle": {}},
+            epoch_history=[
+                {
+                    "train_accuracy": 0.9,
+                    "loss_total": 1.0,
+                    "loss_cls": 0.8,
+                    "loss_kd": 0.1,
+                    "loss_feat": 0.05,
+                    "loss_orth": 0.01,
+                    "loss_rank": 0.01,
+                    "loss_grow": 0.01,
+                    "loss_route": 0.02,
+                }
+            ],
+            pre_eval={"per_task_acc": [0.7, 0.8], "avg_acc": 0.75, "retention_audit": {"task_summaries": []}},
+            post_eval={"per_task_acc": [0.65, 0.85], "avg_acc": 0.75, "retention_audit": {"task_summaries": []}},
+        )
+
+        self.assertEqual(logger.messages, [])
+        self.assertEqual(trainer._retention_layer_audit_history, history_before)
 
     def test_logger_can_disable_file_handler_for_tee_mode(self):
         repo_root = Path(__file__).resolve().parents[1]

@@ -33,7 +33,6 @@ CIFAR-100 remains the lightweight debug benchmark. `imagenet_r` is the first non
 - `configs/imagenet_a.yaml`
 - `configs/imagenet_a_hybrid.yaml`
 - `configs/imagenet_r_hybrid.yaml`
-- `configs/cifar100_hybrid_all_layers.yaml`
 - `scripts/run_imagenet_a.sh`
 
 ### Removed
@@ -74,11 +73,10 @@ No external framework-specific data-manager design was copied into NH-LoRA.
 
 Stage 15 keeps `selected_blocks = [6, 7, 8, 9, 10, 11]` as the first portability baseline so benchmark-switch results are not confounded by a layer-scope change.
 
-The separate config probe for the all-layer hypothesis is prepared via:
-
-- `configs/cifar100_hybrid_all_layers.yaml`
-
-This is intentionally treated as a config/performance hypothesis, not as a bug fix.
+The all-layer hypothesis is intentionally treated as a config/performance
+question, not as a bug fix. In the later Stage 16 repo state, full-block
+`[0..11]` is promoted directly through `configs/base.yaml` instead of being
+maintained as a separate CIFAR-only probe config.
 
 ## Validation In This Pass
 
@@ -92,7 +90,7 @@ New lightweight checks added in this pass cover:
 - `imagenet_a` registry/config resolution
 - `cub200` registry removal
 - `imagenet_a` ImageFolder task construction
-- the explicit all-layer CIFAR probe config
+- the benchmark-transition registry/config surface without method changes
 
 ## Checkpoint B Commands
 
@@ -107,7 +105,7 @@ python -m src.engine.train --config configs/imagenet_r_hybrid.yaml --seed 1 --be
 Run only after B1 is clean:
 
 ```bash
-python -m src.engine.train --config configs/cifar100_hybrid_all_layers.yaml --seed 1 --benchmark cifar100 --output-root outputs
+python -m src.engine.train --config configs/cifar100_hybrid.yaml --seed 1 --benchmark cifar100 --output-root outputs
 ```
 
 ### ImageNet-A early sanity probe

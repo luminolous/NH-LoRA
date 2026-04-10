@@ -138,6 +138,9 @@ class NHLoRATrainer:
         self._planner_realization_history: Dict[int, List[Dict[str, Any]]] = {
             int(block_id): [] for block_id in self.model.selected_blocks
         }
+        self._retention_layer_audit_history: Dict[int, List[Dict[str, Any]]] = {
+            int(block_id): [] for block_id in self.model.selected_blocks
+        }
 
     def _resolve_device(self, requested_device: str) -> torch.device:
         if requested_device == "cuda" and not torch.cuda.is_available():
@@ -563,6 +566,309 @@ class NHLoRATrainer:
             else:
                 normalized[key] = float(value)
         return normalized
+
+    def _retention_audit_enabled(self) -> bool:
+        return bool(self.config["training"].get("retention_debug_logging", True))
+
+    def _loss_component_weights(self) -> Dict[str, float]:
+        loss_cfg = self.config["loss"]
+        return {
+            "cls": 1.0,
+            "kd": float(loss_cfg.get("lambda_kd", 0.0)),
+            "feat": float(loss_cfg.get("lambda_feat", 0.0)),
+            "orth": float(loss_cfg.get("lambda_orth", 0.0)),
+            "rank": float(loss_cfg.get("lambda_rank", 0.0)),
+            "grow": float(loss_cfg.get("lambda_grow", 0.0)),
+            "route": float(loss_cfg.get("lambda_route", 0.0)),
+        }
+
+    def _weighted_loss_balance_summary(self, loss_values: Dict[str, Any] | None = None) -> Dict[str, Any]:
+        normalized = self._normalize_loss_dict(loss_values)
+        weights = self._loss_component_weights()
+        weighted = {
+            key: float(normalized.get(key, 0.0)) * float(weights.get(key, 0.0))
+            for key in weights
+        }
+        weighted_total = float(sum(weighted.values()))
+        weighted_shares = {
+            key: (float(value) / weighted_total if weighted_total > 0.0 else 0.0)
+            for key, value in weighted.items()
+        }
+        retention_weighted = float(weighted["kd"] + weighted["feat"])
+        cls_weighted = float(weighted["cls"])
+        return {
+            "weighted_losses": weighted,
+            "weighted_shares": weighted_shares,
+            "weighted_total": weighted_total,
+            "retention_weighted_total": retention_weighted,
+            "retention_to_cls_ratio": retention_weighted / max(cls_weighted, 1e-8),
+        }
+
+    def _forgetting_decomposition(
+        self,
+        current_row: List[float],
+        prior_rows: List[List[float]] | None = None,
+    ) -> Dict[str, Any]:
+        rows = self.accuracy_matrix if prior_rows is None else prior_rows
+        entries: List[Dict[str, float | int]] = []
+        for task_idx in range(max(len(current_row) - 1, 0)):
+            prior_scores = [float(row[task_idx]) for row in rows if len(row) > task_idx]
+            if not prior_scores:
+                continue
+            current_accuracy = float(current_row[task_idx])
+            best_prior = float(max(prior_scores))
+            latest_prior = float(prior_scores[-1])
+            entries.append(
+                {
+                    "task_number": int(task_idx + 1),
+                    "current_accuracy": current_accuracy,
+                    "best_prior_accuracy": best_prior,
+                    "latest_prior_accuracy": latest_prior,
+                    "drop_from_best": best_prior - current_accuracy,
+                    "drop_from_latest": latest_prior - current_accuracy,
+                }
+            )
+        return {
+            "tasks": entries,
+            "drop_from_best_summary": self._scalar_series_summary(
+                [float(entry["drop_from_best"]) for entry in entries]
+            ),
+            "drop_from_latest_summary": self._scalar_series_summary(
+                [float(entry["drop_from_latest"]) for entry in entries]
+            ),
+        }
+
+    @staticmethod
+    def _feature_diff_summary(
+        student_features: torch.Tensor | None,
+        teacher_features: torch.Tensor | None,
+    ) -> Dict[str, float]:
+        if not isinstance(student_features, torch.Tensor) or not isinstance(teacher_features, torch.Tensor):
+            return {
+                "mean_abs_diff": 0.0,
+                "max_abs_diff": 0.0,
+                "mean_cosine": 0.0,
+                "min_cosine": 0.0,
+            }
+        if student_features.shape != teacher_features.shape or student_features.numel() == 0:
+            return {
+                "mean_abs_diff": 0.0,
+                "max_abs_diff": 0.0,
+                "mean_cosine": 0.0,
+                "min_cosine": 0.0,
+            }
+        student_flat = student_features.detach().float().reshape(student_features.shape[0], -1)
+        teacher_flat = teacher_features.detach().float().reshape(teacher_features.shape[0], -1)
+        diff = (student_flat - teacher_flat).abs()
+        cosine = F.cosine_similarity(student_flat, teacher_flat, dim=-1)
+        return {
+            "mean_abs_diff": float(diff.mean().item()),
+            "max_abs_diff": float(diff.max().item()),
+            "mean_cosine": float(cosine.mean().item()),
+            "min_cosine": float(cosine.min().item()),
+        }
+
+    @staticmethod
+    def _classifier_calibration_summary(
+        old_logits: torch.Tensor,
+        new_logits: torch.Tensor | None,
+        old_classifier_weights: torch.Tensor | None = None,
+        new_classifier_weights: torch.Tensor | None = None,
+        teacher_old_logits: torch.Tensor | None = None,
+    ) -> Dict[str, float]:
+        old_logits = old_logits.detach().float()
+        if old_logits.ndim == 1:
+            old_logits = old_logits.unsqueeze(0)
+        old_logit_norm_mean = float(old_logits.norm(dim=-1).mean().item()) if old_logits.numel() > 0 else 0.0
+        old_max = old_logits.max(dim=-1).values if old_logits.numel() > 0 else old_logits.new_zeros(old_logits.size(0))
+        if isinstance(new_logits, torch.Tensor) and new_logits.numel() > 0:
+            new_logits = new_logits.detach().float()
+            if new_logits.ndim == 1:
+                new_logits = new_logits.unsqueeze(0)
+            new_logit_norm_mean = float(new_logits.norm(dim=-1).mean().item())
+            new_max = new_logits.max(dim=-1).values
+            old_minus_new_mean = float((old_max - new_max).mean().item())
+            new_wins_ratio = float((new_max > old_max).float().mean().item())
+        else:
+            new_logit_norm_mean = 0.0
+            old_minus_new_mean = float(old_max.mean().item()) if old_max.numel() > 0 else 0.0
+            new_wins_ratio = 0.0
+        old_weight_norm_mean = (
+            float(old_classifier_weights.detach().float().norm(dim=-1).mean().item())
+            if isinstance(old_classifier_weights, torch.Tensor) and old_classifier_weights.numel() > 0
+            else 0.0
+        )
+        new_weight_norm_mean = (
+            float(new_classifier_weights.detach().float().norm(dim=-1).mean().item())
+            if isinstance(new_classifier_weights, torch.Tensor) and new_classifier_weights.numel() > 0
+            else 0.0
+        )
+        teacher_old_logit_norm_mean = (
+            float(teacher_old_logits.detach().float().norm(dim=-1).mean().item())
+            if isinstance(teacher_old_logits, torch.Tensor) and teacher_old_logits.numel() > 0
+            else 0.0
+        )
+        old_logit_compression_ratio = (
+            old_logit_norm_mean / max(teacher_old_logit_norm_mean, 1e-8)
+            if teacher_old_logit_norm_mean > 0.0
+            else 0.0
+        )
+        return {
+            "old_logit_norm_mean": old_logit_norm_mean,
+            "new_logit_norm_mean": new_logit_norm_mean,
+            "old_max_mean": float(old_max.mean().item()) if old_max.numel() > 0 else 0.0,
+            "new_max_mean": float(old_max.new_tensor(0.0).item()) if not (isinstance(new_logits, torch.Tensor) and new_logits.numel() > 0) else float(new_logits.max(dim=-1).values.mean().item()),
+            "old_minus_new_mean": old_minus_new_mean,
+            "new_wins_ratio": new_wins_ratio,
+            "old_weight_norm_mean": old_weight_norm_mean,
+            "new_weight_norm_mean": new_weight_norm_mean,
+            "teacher_old_logit_norm_mean": teacher_old_logit_norm_mean,
+            "old_logit_compression_ratio": old_logit_compression_ratio,
+        }
+
+    def _route_profile_retention_summary(
+        self,
+        route_infos: List[Dict[int, Dict[str, object]]],
+        selected_blocks: List[int] | None = None,
+    ) -> Dict[str, Any]:
+        blocks = [int(block_id) for block_id in (selected_blocks or self.model.selected_blocks)]
+        per_layer = {
+            int(block_id): {
+                "batches": 0,
+                "candidate_count_sum": 0.0,
+                "shared_only_count": 0.0,
+                "route_available_count": 0.0,
+                "multi_slot_available_count": 0.0,
+                "usage_top1_share_sum": 0.0,
+            }
+            for block_id in blocks
+        }
+        batch_count = 0
+        shared_only_layer_count_sum = 0.0
+        route_available_layer_count_sum = 0.0
+        multi_slot_available_layer_count_sum = 0.0
+        candidate_slot_count_sum = 0.0
+        usage_top1_share_sum = 0.0
+        usage_top1_share_count = 0
+        for route_info in route_infos:
+            batch_count += 1
+            for block_id in blocks:
+                layer_state = route_info.get(int(block_id), {}) if isinstance(route_info, dict) else {}
+                candidate_slots = self._candidate_slot_ids(layer_state)
+                candidate_count = len(candidate_slots)
+                shared_only = bool(layer_state.get("shared_only", False))
+                route_available = candidate_count > 0 and not shared_only
+                multi_slot_available = candidate_count > 1 and not shared_only
+                shared_only_layer_count_sum += float(shared_only)
+                route_available_layer_count_sum += float(route_available)
+                multi_slot_available_layer_count_sum += float(multi_slot_available)
+                candidate_slot_count_sum += float(candidate_count)
+                distribution = layer_state.get("routing_distribution")
+                top1_share = 0.0
+                if isinstance(distribution, torch.Tensor) and distribution.numel() > 0:
+                    mean_distribution = distribution.detach().float().mean(dim=0)
+                    normalized = mean_distribution / mean_distribution.sum().clamp_min(1e-8)
+                    top1_share = float(normalized.max().item())
+                    usage_top1_share_sum += top1_share
+                    usage_top1_share_count += 1
+                layer_summary = per_layer[int(block_id)]
+                layer_summary["batches"] += 1
+                layer_summary["candidate_count_sum"] += float(candidate_count)
+                layer_summary["shared_only_count"] += float(shared_only)
+                layer_summary["route_available_count"] += float(route_available)
+                layer_summary["multi_slot_available_count"] += float(multi_slot_available)
+                layer_summary["usage_top1_share_sum"] += float(top1_share)
+        denominator = max(batch_count * max(len(blocks), 1), 1)
+        finalized_per_layer: Dict[int, Dict[str, float]] = {}
+        for block_id, layer_summary in per_layer.items():
+            layer_batches = max(int(layer_summary["batches"]), 1)
+            finalized_per_layer[int(block_id)] = {
+                "candidate_count_mean": float(layer_summary["candidate_count_sum"]) / layer_batches,
+                "shared_only_frequency": float(layer_summary["shared_only_count"]) / layer_batches,
+                "route_available_frequency": float(layer_summary["route_available_count"]) / layer_batches,
+                "multi_slot_available_frequency": float(layer_summary["multi_slot_available_count"]) / layer_batches,
+                "usage_top1_share_mean": float(layer_summary["usage_top1_share_sum"]) / layer_batches,
+            }
+        return {
+            "batch_count": int(batch_count),
+            "shared_only_layer_count_mean": shared_only_layer_count_sum / max(batch_count, 1),
+            "route_available_layer_count_mean": route_available_layer_count_sum / max(batch_count, 1),
+            "multi_slot_available_layer_count_mean": multi_slot_available_layer_count_sum / max(batch_count, 1),
+            "candidate_slot_count_mean": candidate_slot_count_sum / denominator,
+            "usage_top1_share_mean": usage_top1_share_sum / max(usage_top1_share_count, 1),
+            "shared_only_layer_frequency": shared_only_layer_count_sum / denominator,
+            "route_available_layer_frequency": route_available_layer_count_sum / denominator,
+            "multi_slot_available_layer_frequency": multi_slot_available_layer_count_sum / denominator,
+            "per_layer": finalized_per_layer,
+        }
+
+    def _retention_pre_post_diff(
+        self,
+        pre_eval: Dict[str, Any] | None,
+        post_eval: Dict[str, Any] | None,
+    ) -> Dict[str, Any]:
+        pre_tasks = {
+            int(task_summary["task_number"]): task_summary
+            for task_summary in (pre_eval or {}).get("retention_audit", {}).get("task_summaries", [])
+        }
+        post_tasks = {
+            int(task_summary["task_number"]): task_summary
+            for task_summary in (post_eval or {}).get("retention_audit", {}).get("task_summaries", [])
+        }
+        deltas: List[Dict[str, float | int]] = []
+        for task_number in sorted(set(pre_tasks).intersection(post_tasks)):
+            pre_task = pre_tasks[task_number]
+            post_task = post_tasks[task_number]
+            pre_route = pre_task.get("route_summary", {})
+            post_route = post_task.get("route_summary", {})
+            deltas.append(
+                {
+                    "task_number": int(task_number),
+                    "accuracy_delta": float(post_task.get("accuracy", 0.0) - pre_task.get("accuracy", 0.0)),
+                    "old_logit_mean_abs_diff_delta": float(
+                        post_task.get("old_logit_mean_abs_diff", 0.0) - pre_task.get("old_logit_mean_abs_diff", 0.0)
+                    ),
+                    "feature_mean_abs_diff_delta": float(
+                        post_task.get("feature_mean_abs_diff", 0.0) - pre_task.get("feature_mean_abs_diff", 0.0)
+                    ),
+                    "shared_only_layer_count_mean_delta": float(
+                        post_route.get("shared_only_layer_count_mean", 0.0)
+                        - pre_route.get("shared_only_layer_count_mean", 0.0)
+                    ),
+                    "multi_slot_available_layer_count_mean_delta": float(
+                        post_route.get("multi_slot_available_layer_count_mean", 0.0)
+                        - pre_route.get("multi_slot_available_layer_count_mean", 0.0)
+                    ),
+                }
+            )
+        return {
+            "tasks": deltas,
+            "accuracy_delta_summary": self._scalar_series_summary(
+                [float(entry["accuracy_delta"]) for entry in deltas]
+            ),
+            "old_logit_delta_summary": self._scalar_series_summary(
+                [float(entry["old_logit_mean_abs_diff_delta"]) for entry in deltas]
+            ),
+            "feature_delta_summary": self._scalar_series_summary(
+                [float(entry["feature_mean_abs_diff_delta"]) for entry in deltas]
+            ),
+        }
+
+    def _profile_layer_count_summary(self, profile: Dict[int, Dict[str, object]] | None) -> Dict[str, int]:
+        if not isinstance(profile, dict):
+            return {"shared_only_layers": 0, "multi_slot_layers": 0}
+        shared_only_layers = 0
+        multi_slot_layers = 0
+        for block_id in self.model.selected_blocks:
+            layer_profile = profile.get(int(block_id), {})
+            if bool(layer_profile.get("shared_only", False)):
+                shared_only_layers += 1
+            if len(self._candidate_slot_ids(layer_profile)) > 1:
+                multi_slot_layers += 1
+        return {
+            "shared_only_layers": int(shared_only_layers),
+            "multi_slot_layers": int(multi_slot_layers),
+        }
 
     def _summarize_epoch_stats(
         self,
@@ -3766,6 +4072,306 @@ class NHLoRATrainer:
                 float(diff.max().item()),
             )
 
+    def _evaluate_task_retention_summary(
+        self,
+        *,
+        current_task_index: int,
+        eval_task_id: int,
+        accuracy: float,
+        sample_count: int,
+        route_infos: List[Dict[int, Dict[str, object]]],
+        teacher_old_logits: List[torch.Tensor],
+        student_old_logits: List[torch.Tensor],
+        student_new_logits: List[torch.Tensor],
+        feature_diff_values: List[Dict[str, float]],
+        layer_feature_summaries: Dict[int, List[Dict[str, float]]],
+        old_num_classes: int,
+    ) -> Dict[str, Any]:
+        task_number = int(eval_task_id) + 1
+        route_summary = self._route_profile_retention_summary(route_infos)
+        old_logit_mean_abs_diff = 0.0
+        old_logit_max_abs_diff = 0.0
+        calibration = {
+            "old_logit_norm_mean": 0.0,
+            "new_logit_norm_mean": 0.0,
+            "old_max_mean": 0.0,
+            "new_max_mean": 0.0,
+            "old_minus_new_mean": 0.0,
+            "new_wins_ratio": 0.0,
+            "old_weight_norm_mean": 0.0,
+            "new_weight_norm_mean": 0.0,
+            "teacher_old_logit_norm_mean": 0.0,
+            "old_logit_compression_ratio": 0.0,
+        }
+        if old_num_classes > 0 and teacher_old_logits and student_old_logits:
+            teacher_logits = torch.cat(teacher_old_logits, dim=0)
+            student_logits = torch.cat(student_old_logits, dim=0)
+            new_logits = torch.cat(student_new_logits, dim=0) if student_new_logits else None
+            diff = (student_logits - teacher_logits).abs()
+            old_logit_mean_abs_diff = float(diff.mean().item())
+            old_logit_max_abs_diff = float(diff.max().item())
+            classifier_weights = self.model.classifier.weight.detach()
+            calibration = self._classifier_calibration_summary(
+                old_logits=student_logits,
+                new_logits=new_logits,
+                old_classifier_weights=classifier_weights[:old_num_classes],
+                new_classifier_weights=classifier_weights[old_num_classes:],
+                teacher_old_logits=teacher_logits,
+            )
+        feature_summary = {
+            "mean_abs_diff": 0.0,
+            "max_abs_diff": 0.0,
+            "mean_cosine": 0.0,
+            "min_cosine": 0.0,
+        }
+        if feature_diff_values:
+            for key in feature_summary:
+                feature_summary[key] = float(
+                    sum(float(item[key]) for item in feature_diff_values) / len(feature_diff_values)
+                )
+        per_layer_feature_summary: Dict[int, Dict[str, float]] = {}
+        for block_id, values in layer_feature_summaries.items():
+            if not values:
+                continue
+            per_layer_feature_summary[int(block_id)] = {
+                "mean_abs_diff": float(sum(float(item["mean_abs_diff"]) for item in values) / len(values)),
+                "max_abs_diff": float(max(float(item["max_abs_diff"]) for item in values)),
+                "mean_cosine": float(sum(float(item["mean_cosine"]) for item in values) / len(values)),
+                "min_cosine": float(min(float(item["min_cosine"]) for item in values)),
+            }
+        return {
+            "task_number": task_number,
+            "accuracy": float(accuracy),
+            "sample_count": int(sample_count),
+            "is_old_task": bool(old_num_classes > 0 and eval_task_id < int(current_task_index)),
+            "old_logit_mean_abs_diff": old_logit_mean_abs_diff,
+            "old_logit_max_abs_diff": old_logit_max_abs_diff,
+            "feature_mean_abs_diff": float(feature_summary["mean_abs_diff"]),
+            "feature_max_abs_diff": float(feature_summary["max_abs_diff"]),
+            "feature_mean_cosine": float(feature_summary["mean_cosine"]),
+            "feature_min_cosine": float(feature_summary["min_cosine"]),
+            "classifier_calibration": calibration,
+            "route_summary": route_summary,
+            "layer_feature_summary": per_layer_feature_summary,
+        }
+
+    def _record_retention_layer_history(
+        self,
+        *,
+        task_number: int,
+        task_summaries: List[Dict[str, Any]],
+    ) -> None:
+        old_task_summaries = [summary for summary in task_summaries if bool(summary.get("is_old_task", False))]
+        if not old_task_summaries:
+            return
+        for block_id in self.model.selected_blocks:
+            block_id = int(block_id)
+            layer_entries = [
+                task_summary["layer_feature_summary"][block_id]
+                for task_summary in old_task_summaries
+                if block_id in task_summary.get("layer_feature_summary", {})
+            ]
+            route_entries = [
+                task_summary.get("route_summary", {}).get("per_layer", {}).get(block_id, {})
+                for task_summary in old_task_summaries
+                if block_id in task_summary.get("route_summary", {}).get("per_layer", {})
+            ]
+            if not layer_entries and not route_entries:
+                continue
+            self._retention_layer_audit_history.setdefault(block_id, []).append(
+                {
+                    "task_number": int(task_number),
+                    "feature_mean_abs_diff": float(
+                        sum(float(entry.get("mean_abs_diff", 0.0)) for entry in layer_entries) / max(len(layer_entries), 1)
+                    ),
+                    "feature_mean_cosine": float(
+                        sum(float(entry.get("mean_cosine", 0.0)) for entry in layer_entries) / max(len(layer_entries), 1)
+                    ),
+                    "route_available_frequency": float(
+                        sum(float(entry.get("route_available_frequency", 0.0)) for entry in route_entries)
+                        / max(len(route_entries), 1)
+                    ),
+                    "shared_only_frequency": float(
+                        sum(float(entry.get("shared_only_frequency", 0.0)) for entry in route_entries)
+                        / max(len(route_entries), 1)
+                    ),
+                    "multi_slot_available_frequency": float(
+                        sum(float(entry.get("multi_slot_available_frequency", 0.0)) for entry in route_entries)
+                        / max(len(route_entries), 1)
+                    ),
+                    "old_task_accuracy_mean": float(
+                        sum(float(task_summary.get("accuracy", 0.0)) for task_summary in old_task_summaries)
+                        / len(old_task_summaries)
+                    ),
+                }
+            )
+
+    def _log_retention_boundary_audit(
+        self,
+        context: Dict[str, Any],
+        *,
+        epoch_history: List[Dict[str, Any]],
+        pre_eval: Dict[str, Any] | None,
+        post_eval: Dict[str, Any],
+    ) -> None:
+        if not self._retention_audit_enabled() or int(context.get("task_number", 1)) <= 1:
+            return
+        current_row = list(post_eval.get("per_task_acc", []))
+        current_train_accuracy = float(epoch_history[-1]["train_accuracy"]) if epoch_history else 0.0
+        mean_losses = self._normalize_loss_dict(
+            {
+                "total": sum(float(epoch["loss_total"]) for epoch in epoch_history) / max(len(epoch_history), 1),
+                "cls": sum(float(epoch["loss_cls"]) for epoch in epoch_history) / max(len(epoch_history), 1),
+                "kd": sum(float(epoch["loss_kd"]) for epoch in epoch_history) / max(len(epoch_history), 1),
+                "feat": sum(float(epoch["loss_feat"]) for epoch in epoch_history) / max(len(epoch_history), 1),
+                "orth": sum(float(epoch["loss_orth"]) for epoch in epoch_history) / max(len(epoch_history), 1),
+                "rank": sum(float(epoch["loss_rank"]) for epoch in epoch_history) / max(len(epoch_history), 1),
+                "grow": sum(float(epoch["loss_grow"]) for epoch in epoch_history) / max(len(epoch_history), 1),
+                "route": sum(float(epoch["loss_route"]) for epoch in epoch_history) / max(len(epoch_history), 1),
+            }
+        )
+        weighted_balance = self._weighted_loss_balance_summary(mean_losses)
+        forgetting = self._compute_forgetting(current_row)
+        decomposition = self._forgetting_decomposition(current_row)
+        current_eval_accuracy = self._current_last_task_accuracy(current_row)
+        old_task_accuracies = [float(value) for value in current_row[:-1]]
+        old_task_mean_accuracy = float(sum(old_task_accuracies) / len(old_task_accuracies)) if old_task_accuracies else 0.0
+        self.logger.info(
+            "[RetentionAudit][Task %d] current_train_acc=%.4f current_eval_acc=%.4f seen_eval_avg_acc=%.4f old_task_avg_acc=%.4f forgetting=%.4f weighted_cls=%.4e weighted_kd=%.4e weighted_feat=%.4e weighted_orth=%.4e weighted_rank=%.4e weighted_grow=%.4e weighted_route=%.4e retention_to_cls_ratio=%.4f cls_share=%.4f kd_share=%.4f feat_share=%.4f",
+            context["task_number"],
+            current_train_accuracy,
+            current_eval_accuracy,
+            float(post_eval.get("avg_acc", 0.0)),
+            old_task_mean_accuracy,
+            forgetting,
+            float(weighted_balance["weighted_losses"]["cls"]),
+            float(weighted_balance["weighted_losses"]["kd"]),
+            float(weighted_balance["weighted_losses"]["feat"]),
+            float(weighted_balance["weighted_losses"]["orth"]),
+            float(weighted_balance["weighted_losses"]["rank"]),
+            float(weighted_balance["weighted_losses"]["grow"]),
+            float(weighted_balance["weighted_losses"]["route"]),
+            float(weighted_balance["retention_to_cls_ratio"]),
+            float(weighted_balance["weighted_shares"]["cls"]),
+            float(weighted_balance["weighted_shares"]["kd"]),
+            float(weighted_balance["weighted_shares"]["feat"]),
+        )
+        decomposition_by_task = {
+            int(entry["task_number"]): entry
+            for entry in decomposition.get("tasks", [])
+        }
+        pre_post_diff = self._retention_pre_post_diff(pre_eval, post_eval)
+        pre_post_by_task = {
+            int(entry["task_number"]): entry
+            for entry in pre_post_diff.get("tasks", [])
+        }
+        pre_tasks = {
+            int(task_summary["task_number"]): task_summary
+            for task_summary in (pre_eval or {}).get("retention_audit", {}).get("task_summaries", [])
+        }
+        post_tasks = post_eval.get("retention_audit", {}).get("task_summaries", [])
+        for task_summary in post_tasks:
+            task_number = int(task_summary["task_number"])
+            if task_number >= int(context["task_number"]):
+                continue
+            decomposition_entry = decomposition_by_task.get(task_number, {})
+            calibration = task_summary.get("classifier_calibration", {})
+            route_summary = task_summary.get("route_summary", {})
+            delta_entry = pre_post_by_task.get(task_number, {})
+            self.logger.info(
+                "[RetentionOldTask][Task %d][SeenTask %d] acc=%.4f best_prior_acc=%.4f latest_prior_acc=%.4f drop_from_best=%.4f drop_from_latest=%.4f old_logit_mean_abs_diff=%.4e old_logit_max_abs_diff=%.4e feature_mean_abs_diff=%.4e feature_mean_cosine=%.4f",
+                context["task_number"],
+                task_number,
+                float(task_summary.get("accuracy", 0.0)),
+                float(decomposition_entry.get("best_prior_accuracy", 0.0)),
+                float(decomposition_entry.get("latest_prior_accuracy", 0.0)),
+                float(decomposition_entry.get("drop_from_best", 0.0)),
+                float(decomposition_entry.get("drop_from_latest", 0.0)),
+                float(task_summary.get("old_logit_mean_abs_diff", 0.0)),
+                float(task_summary.get("old_logit_max_abs_diff", 0.0)),
+                float(task_summary.get("feature_mean_abs_diff", 0.0)),
+                float(task_summary.get("feature_mean_cosine", 0.0)),
+            )
+            self.logger.info(
+                "[RetentionCalibration][Task %d][SeenTask %d] old_logit_norm_mean=%.4e new_logit_norm_mean=%.4e old_max_mean=%.4e new_max_mean=%.4e old_minus_new_mean=%.4e new_wins_ratio=%.4f old_weight_norm_mean=%.4e new_weight_norm_mean=%.4e old_logit_compression_ratio=%.4f classifier_drift_mean_abs=%.4e",
+                context["task_number"],
+                task_number,
+                float(calibration.get("old_logit_norm_mean", 0.0)),
+                float(calibration.get("new_logit_norm_mean", 0.0)),
+                float(calibration.get("old_max_mean", 0.0)),
+                float(calibration.get("new_max_mean", 0.0)),
+                float(calibration.get("old_minus_new_mean", 0.0)),
+                float(calibration.get("new_wins_ratio", 0.0)),
+                float(calibration.get("old_weight_norm_mean", 0.0)),
+                float(calibration.get("new_weight_norm_mean", 0.0)),
+                float(calibration.get("old_logit_compression_ratio", 0.0)),
+                float(self._classifier_drift_stats(context).get("mean_abs", 0.0) if self._classifier_drift_stats(context) else 0.0),
+            )
+            self.logger.info(
+                "[RetentionRoute][Task %d][SeenTask %d] shared_only_layer_count_mean=%.4f route_available_layer_count_mean=%.4f multi_slot_available_layer_count_mean=%.4f candidate_slot_count_mean=%.4f retained_usage_top1_share_mean=%.4f shared_only_layer_frequency=%.4f route_available_layer_frequency=%.4f multi_slot_available_layer_frequency=%.4f",
+                context["task_number"],
+                task_number,
+                float(route_summary.get("shared_only_layer_count_mean", 0.0)),
+                float(route_summary.get("route_available_layer_count_mean", 0.0)),
+                float(route_summary.get("multi_slot_available_layer_count_mean", 0.0)),
+                float(route_summary.get("candidate_slot_count_mean", 0.0)),
+                float(route_summary.get("usage_top1_share_mean", 0.0)),
+                float(route_summary.get("shared_only_layer_frequency", 0.0)),
+                float(route_summary.get("route_available_layer_frequency", 0.0)),
+                float(route_summary.get("multi_slot_available_layer_frequency", 0.0)),
+            )
+            self.logger.info(
+                "[RetentionCHUDiff][Task %d][SeenTask %d] pre_acc=%.4f post_acc=%.4f acc_delta=%.4e pre_old_logit_mean_abs_diff=%.4e post_old_logit_mean_abs_diff=%.4e old_logit_diff_delta=%.4e feature_diff_delta=%.4e shared_only_layer_count_mean_delta=%.4e multi_slot_available_layer_count_mean_delta=%.4e",
+                context["task_number"],
+                task_number,
+                float(pre_tasks.get(task_number, {}).get("accuracy", 0.0)),
+                float(task_summary.get("accuracy", 0.0)),
+                float(delta_entry.get("accuracy_delta", 0.0)),
+                float(pre_tasks.get(task_number, {}).get("old_logit_mean_abs_diff", 0.0)),
+                float(task_summary.get("old_logit_mean_abs_diff", 0.0)),
+                float(delta_entry.get("old_logit_mean_abs_diff_delta", 0.0)),
+                float(delta_entry.get("feature_mean_abs_diff_delta", 0.0)),
+                float(delta_entry.get("shared_only_layer_count_mean_delta", 0.0)),
+                float(delta_entry.get("multi_slot_available_layer_count_mean_delta", 0.0)),
+            )
+        pre_profile_summary = self._profile_layer_count_summary(
+            context.get("stage5_slot_lifecycle", {}).get("PreCHUProfile", {})
+        )
+        post_profile_summary = self._profile_layer_count_summary(
+            context.get("stage5_slot_lifecycle", {}).get("PostCHUProfile", {})
+        )
+        self.logger.info(
+            "[RetentionCHUSummary][Task %d] pre_shared_only_layers=%d post_shared_only_layers=%d pre_multi_slot_layers=%d post_multi_slot_layers=%d old_task_acc_delta_mean=%.4e old_logit_delta_mean=%.4e feature_delta_mean=%.4e",
+            context["task_number"],
+            int(pre_profile_summary["shared_only_layers"]),
+            int(post_profile_summary["shared_only_layers"]),
+            int(pre_profile_summary["multi_slot_layers"]),
+            int(post_profile_summary["multi_slot_layers"]),
+            float(pre_post_diff["accuracy_delta_summary"]["mean"]),
+            float(pre_post_diff["old_logit_delta_summary"]["mean"]),
+            float(pre_post_diff["feature_delta_summary"]["mean"]),
+        )
+        self._record_retention_layer_history(
+            task_number=int(context["task_number"]),
+            task_summaries=post_tasks,
+        )
+        for block_id in self.model.selected_blocks:
+            history = self._retention_layer_audit_history.get(int(block_id), [])
+            if not history:
+                continue
+            self.logger.info(
+                "[RetentionLayerAttribution][Task %d][Layer %d] feature_mean_abs_diff=%.4e feature_mean_cosine=%.4f route_available_frequency=%.4f shared_only_frequency=%.4f multi_slot_available_frequency=%.4f old_task_accuracy_mean=%.4f observations=%d",
+                context["task_number"],
+                int(block_id),
+                float(sum(float(entry["feature_mean_abs_diff"]) for entry in history) / len(history)),
+                float(sum(float(entry["feature_mean_cosine"]) for entry in history) / len(history)),
+                float(sum(float(entry["route_available_frequency"]) for entry in history) / len(history)),
+                float(sum(float(entry["shared_only_frequency"]) for entry in history) / len(history)),
+                float(sum(float(entry["multi_slot_available_frequency"]) for entry in history) / len(history)),
+                float(sum(float(entry["old_task_accuracy_mean"]) for entry in history) / len(history)),
+                len(history),
+            )
+
     def _update_retention_debug(
         self,
         context: Dict[str, Any],
@@ -3820,6 +4426,8 @@ class NHLoRATrainer:
                 "route": sum(float(epoch["loss_route"]) for epoch in epoch_history) / max(len(epoch_history), 1),
             }
         )
+        weighted_loss_balance = self._weighted_loss_balance_summary(mean_losses)
+        forgetting_decomposition = self._forgetting_decomposition(current_row)
         return {
             "task_id": int(context["task_number"]),
             "avg_acc": float(eval_metrics["avg_acc"]),
@@ -3849,6 +4457,9 @@ class NHLoRATrainer:
             "mean_loss_rank": mean_losses["rank"],
             "mean_loss_grow": mean_losses["grow"],
             "mean_loss_route": mean_losses["route"],
+            "weighted_loss_balance": weighted_loss_balance,
+            "forgetting_decomposition": forgetting_decomposition,
+            "current_train_accuracy": float(epoch_history[-1].get("train_accuracy", 0.0)) if epoch_history else 0.0,
             "epoch_history": epoch_history,
         }
 
@@ -4449,16 +5060,25 @@ class NHLoRATrainer:
                 profile=self.model.build_inference_profile(),
             )
 
+        retention_eval_audit = self._retention_audit_enabled() and int(context["task_number"]) > 1
         debug_eval = bool(self.config["training"].get("debug_eval_around_consolidation", False))
-        if debug_eval:
+        pre_metrics = None
+        if debug_eval or retention_eval_audit:
             pre_profile = self.model.build_inference_profile()
-            pre_metrics = self._evaluate_up_to(task_index, planner_out=pre_profile)
-            self.logger.info(
-                "[Debug][Task %d] pre-consolidation avg_acc=%.4f per_task_acc=%s",
-                context["task_number"],
-                pre_metrics["avg_acc"],
-                self._format_per_task_acc(pre_metrics["per_task_acc"]),
+            pre_metrics = self._evaluate_up_to(
+                task_index,
+                planner_out=pre_profile,
+                teacher_model=context.get("teacher_model") if retention_eval_audit else None,
+                teacher_profile=context.get("teacher_profile") if retention_eval_audit else None,
+                collect_retention_audit=retention_eval_audit,
             )
+            if debug_eval:
+                self.logger.info(
+                    "[Debug][Task %d] pre-consolidation avg_acc=%.4f per_task_acc=%s",
+                    context["task_number"],
+                    pre_metrics["avg_acc"],
+                    self._format_per_task_acc(pre_metrics["per_task_acc"]),
+                )
 
         chu_report = self._run_consolidation(context, usage_stats)
         self.last_train_state["chu_calls_per_task"].append(1)
@@ -4480,7 +5100,12 @@ class NHLoRATrainer:
         self._append_history(context, usage_stats)
         self.last_train_state["history_sizes"].append(len(self.history_bank.entries))
 
-        eval_metrics = self._evaluate_up_to(task_index)
+        eval_metrics = self._evaluate_up_to(
+            task_index,
+            teacher_model=context.get("teacher_model"),
+            teacher_profile=context.get("teacher_profile"),
+            collect_retention_audit=retention_eval_audit,
+        )
         if debug_eval:
             self.logger.info(
                 "[Debug][Task %d] post-consolidation avg_acc=%.4f per_task_acc=%s",
@@ -4488,6 +5113,12 @@ class NHLoRATrainer:
                 eval_metrics["avg_acc"],
                 self._format_per_task_acc(eval_metrics["per_task_acc"]),
             )
+        self._log_retention_boundary_audit(
+            context,
+            epoch_history=epoch_history,
+            pre_eval=pre_metrics,
+            post_eval=eval_metrics,
+        )
         inference_overhead = self._estimate_inference_overhead(task_index)
         return self._summarize_task_metrics(
             context=context,
@@ -4547,25 +5178,98 @@ class NHLoRATrainer:
         )
         self.history_bank.append(entry)
 
-    def _evaluate_up_to(self, task_index: int, planner_out: Dict[int, Dict[str, object]] | None = None) -> Dict[str, Any]:
+    def _evaluate_up_to(
+        self,
+        task_index: int,
+        planner_out: Dict[int, Dict[str, object]] | None = None,
+        *,
+        teacher_model=None,
+        teacher_profile: Dict[int, Dict[str, object]] | None = None,
+        collect_retention_audit: bool = False,
+    ) -> Dict[str, Any]:
         self.model.eval()
         per_task_acc = []
         eval_profile = self.inference_profile if planner_out is None else planner_out
+        retention_task_summaries: List[Dict[str, Any]] = []
+        old_num_classes = int(teacher_model.classifier.num_classes) if teacher_model is not None else 0
+        if teacher_model is not None:
+            teacher_model.eval()
         with torch.no_grad():
             for eval_task_id in range(task_index + 1):
                 _, test_dataset = self.benchmark.build_task_datasets(eval_task_id)
                 loader = self._build_eval_loader(test_dataset)
                 correct = 0
                 total = 0
+                route_infos: List[Dict[int, Dict[str, object]]] = []
+                teacher_old_logits: List[torch.Tensor] = []
+                student_old_logits: List[torch.Tensor] = []
+                student_new_logits: List[torch.Tensor] = []
+                feature_diff_values: List[Dict[str, float]] = []
+                layer_feature_summaries: Dict[int, List[Dict[str, float]]] = {
+                    int(block_id): [] for block_id in self.model.selected_blocks
+                }
                 for batch in loader:
                     images, labels = self._prepare_images_labels(batch)
                     outputs = self.model.forward_with_state(images, task_state=None, planner_out=eval_profile)
                     predictions = outputs["logits"].argmax(dim=-1)
                     correct += int((predictions == labels).sum().item())
                     total += int(labels.numel())
+                    if collect_retention_audit:
+                        route_infos.append(outputs["route_info"])
+                        if teacher_model is not None and teacher_profile is not None and old_num_classes > 0:
+                            teacher_outputs = teacher_model.forward_with_state(
+                                images,
+                                task_state=None,
+                                planner_out=teacher_profile,
+                            )
+                            teacher_old_logits.append(teacher_outputs["logits"].detach().cpu())
+                            student_old_logits.append(outputs["logits"][:, :old_num_classes].detach().cpu())
+                            if outputs["logits"].size(-1) > old_num_classes:
+                                student_new_logits.append(outputs["logits"][:, old_num_classes:].detach().cpu())
+                            feature_diff_values.append(
+                                self._feature_diff_summary(
+                                    outputs["features"],
+                                    teacher_outputs["features"],
+                                )
+                            )
+                            for block_id in self.model.selected_blocks:
+                                student_layer_feature = outputs["layer_features"].get(int(block_id))
+                                teacher_layer_feature = teacher_outputs["layer_features"].get(int(block_id))
+                                if student_layer_feature is None or teacher_layer_feature is None:
+                                    continue
+                                layer_feature_summaries[int(block_id)].append(
+                                    self._feature_diff_summary(
+                                        student_layer_feature,
+                                        teacher_layer_feature,
+                                    )
+                                )
                 per_task_acc.append(correct / max(total, 1))
+                if collect_retention_audit:
+                    retention_task_summaries.append(
+                        self._evaluate_task_retention_summary(
+                            current_task_index=int(task_index),
+                            eval_task_id=eval_task_id,
+                            accuracy=per_task_acc[-1],
+                            sample_count=total,
+                            route_infos=route_infos,
+                            teacher_old_logits=teacher_old_logits,
+                            student_old_logits=student_old_logits,
+                            student_new_logits=student_new_logits,
+                            feature_diff_values=feature_diff_values,
+                            layer_feature_summaries=layer_feature_summaries,
+                            old_num_classes=old_num_classes,
+                        )
+                    )
         avg_acc = sum(per_task_acc) / max(len(per_task_acc), 1)
-        return {"per_task_acc": per_task_acc, "avg_acc": avg_acc}
+        return {
+            "per_task_acc": per_task_acc,
+            "avg_acc": avg_acc,
+            "retention_audit": {
+                "task_summaries": retention_task_summaries,
+            }
+            if collect_retention_audit
+            else {},
+        }
 
     def _estimate_parameter_growth(self) -> int:
         total = 0
