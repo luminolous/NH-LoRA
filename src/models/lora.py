@@ -67,8 +67,13 @@ class ProjectionBank(nn.Module):
         self.slot_b.append(slot_b)
         return len(self.slot_a) - 1
 
-    def shared_delta(self, hidden_states: torch.Tensor, shared_gate: float) -> torch.Tensor:
+    def shared_delta(self, hidden_states: torch.Tensor, shared_gate: float | torch.Tensor) -> torch.Tensor:
         delta = F.linear(F.linear(hidden_states, self.shared_a), self.shared_b)
+        if isinstance(shared_gate, torch.Tensor):
+            gate = shared_gate.to(device=delta.device, dtype=delta.dtype)
+            while gate.dim() < delta.dim():
+                gate = gate.unsqueeze(-1)
+            return delta * gate
         return delta * float(shared_gate)
 
     def slot_delta(self, hidden_states: torch.Tensor, slot_id: int, rank: int) -> torch.Tensor:
@@ -409,18 +414,121 @@ class NHLoRALayer(nn.Module):
     def _point_output_dim(self, point_name: str) -> int:
         return self.embed_dim * 4 if point_name == "mlp_fc1" else self.embed_dim
 
+    def _record_delta_debug(
+        self,
+        kind: str,
+        point_name: str,
+        delta: torch.Tensor,
+        planner_cfg: Dict[str, object],
+    ) -> None:
+        accumulator = planner_cfg.get("_debug_delta_stats")
+        if not isinstance(accumulator, dict):
+            return
+        block_id = int(planner_cfg.get("_debug_block_id", -1))
+        block_entry = accumulator.setdefault(block_id, {})
+        point_entry = block_entry.setdefault(point_name, {})
+        stats = point_entry.setdefault(
+            kind,
+            {
+                "calls": 0,
+                "norm_sum": 0.0,
+                "mean_abs_sum": 0.0,
+                "max_abs": 0.0,
+            },
+        )
+        detached = delta.detach()
+        stats["calls"] += 1
+        stats["norm_sum"] += float(detached.norm().item())
+        stats["mean_abs_sum"] += float(detached.abs().mean().item()) if detached.numel() else 0.0
+        stats["max_abs"] = max(float(stats["max_abs"]), float(detached.abs().max().item()) if detached.numel() else 0.0)
+
+    def _record_control_contribution_debug(
+        self,
+        planner_cfg: Dict[str, object],
+        *,
+        shared_pre_beta_norm: float | None = None,
+        shared_post_beta_norm: float | None = None,
+        slot_norm: float | None = None,
+        slot_structurally_available: bool | None = None,
+        slot_nontrivial: bool | None = None,
+        beta_value: float | None = None,
+    ) -> None:
+        accumulator = planner_cfg.get("_planner_control_contribution_accumulator")
+        if not isinstance(accumulator, dict):
+            return
+        block_id = int(planner_cfg.get("_debug_block_id", -1))
+        block_entry = accumulator.setdefault(
+            block_id,
+            {
+                "shared_pre_beta_norm_sum": 0.0,
+                "shared_pre_beta_norm_count": 0,
+                "shared_post_beta_norm_sum": 0.0,
+                "shared_post_beta_norm_count": 0,
+                "slot_norm_sum": 0.0,
+                "slot_norm_count": 0,
+                "slot_structurally_available_calls": 0,
+                "slot_nontrivial_calls": 0,
+                "slot_zero_contribution_calls": 0,
+                "beta_gt_099_with_structural_slot_calls": 0,
+                "beta_gt_0999_with_structural_slot_calls": 0,
+            },
+        )
+        if shared_pre_beta_norm is not None:
+            block_entry["shared_pre_beta_norm_sum"] += float(shared_pre_beta_norm)
+            block_entry["shared_pre_beta_norm_count"] += 1
+        if shared_post_beta_norm is not None:
+            block_entry["shared_post_beta_norm_sum"] += float(shared_post_beta_norm)
+            block_entry["shared_post_beta_norm_count"] += 1
+        if slot_norm is not None:
+            block_entry["slot_norm_sum"] += float(slot_norm)
+            block_entry["slot_norm_count"] += 1
+        if slot_structurally_available:
+            block_entry["slot_structurally_available_calls"] += 1
+            if slot_nontrivial:
+                block_entry["slot_nontrivial_calls"] += 1
+            else:
+                block_entry["slot_zero_contribution_calls"] += 1
+            if beta_value is not None and float(beta_value) > 0.99:
+                block_entry["beta_gt_099_with_structural_slot_calls"] += 1
+            if beta_value is not None and float(beta_value) > 0.999:
+                block_entry["beta_gt_0999_with_structural_slot_calls"] += 1
+
     def _shared_delta(self, point_name: str, hidden_states: torch.Tensor, planner_cfg: Dict[str, object]) -> torch.Tensor:
         if point_name not in self.selected_points:
             return hidden_states.new_zeros(*hidden_states.shape[:-1], self._point_output_dim(point_name))
         bank = self.point_banks[sanitize_key(point_name)]
-        return bank.shared_delta(hidden_states, shared_gate=float(planner_cfg.get("shared_gate", 1.0)))
+        shared_gate = planner_cfg.get("shared_gate", 1.0)
+        delta = bank.shared_delta(hidden_states, shared_gate=shared_gate)
+        self._record_delta_debug("shared", point_name, delta, planner_cfg)
+        beta_value = float(shared_gate.detach().mean().item()) if isinstance(shared_gate, torch.Tensor) else float(shared_gate)
+        with torch.no_grad():
+            detached_hidden = hidden_states.detach()
+            pre_beta_delta = F.linear(F.linear(detached_hidden, bank.shared_a.detach()), bank.shared_b.detach())
+        self._record_control_contribution_debug(
+            planner_cfg,
+            shared_pre_beta_norm=float(pre_beta_delta.norm().item()),
+            shared_post_beta_norm=float(delta.detach().norm().item()),
+            beta_value=beta_value,
+        )
+        return delta
 
     def _slot_delta(self, point_name: str, hidden_states: torch.Tensor, route_state: Dict[str, object], planner_cfg: Dict[str, object]) -> torch.Tensor:
         if point_name not in self.selected_points:
             return hidden_states.new_zeros(*hidden_states.shape[:-1], self._point_output_dim(point_name))
         candidate_slots = route_state.get("candidate_slots", [])
+        shared_gate = planner_cfg.get("shared_gate", 1.0)
+        beta_value = float(shared_gate.detach().mean().item()) if isinstance(shared_gate, torch.Tensor) else float(shared_gate)
         if not candidate_slots:
-            return hidden_states.new_zeros(*hidden_states.shape[:-1], self._point_output_dim(point_name))
+            delta = hidden_states.new_zeros(*hidden_states.shape[:-1], self._point_output_dim(point_name))
+            self._record_delta_debug("slot", point_name, delta, planner_cfg)
+            self._record_control_contribution_debug(
+                planner_cfg,
+                slot_norm=0.0,
+                slot_structurally_available=False,
+                slot_nontrivial=False,
+                beta_value=beta_value,
+            )
+            return delta
         bank = self.point_banks[sanitize_key(point_name)]
         rank_cfg = planner_cfg.get("rank_cfg", {})
         weights = route_state.get("routing_weights")
@@ -429,7 +537,17 @@ class NHLoRALayer(nn.Module):
         if weights is None or topk_indices is None:
             slot_id = candidate_slots[0]
             rank = int(rank_cfg.get(slot_id, self.slot_metadata[slot_id].rank))
-            return bank.slot_delta(hidden_states, slot_id, rank)
+            delta = bank.slot_delta(hidden_states, slot_id, rank)
+            self._record_delta_debug("slot", point_name, delta, planner_cfg)
+            slot_norm = float(delta.detach().norm().item())
+            self._record_control_contribution_debug(
+                planner_cfg,
+                slot_norm=slot_norm,
+                slot_structurally_available=True,
+                slot_nontrivial=slot_norm > 1e-12,
+                beta_value=beta_value,
+            )
+            return delta
         for batch_index in range(hidden_states.size(0)):
             batch_hidden = hidden_states[batch_index : batch_index + 1]
             for col, candidate_index in enumerate(topk_indices[batch_index].tolist()):
@@ -438,6 +556,15 @@ class NHLoRALayer(nn.Module):
                 slot_delta = bank.slot_delta(batch_hidden, slot_id, rank)
                 delta[batch_index : batch_index + 1] += slot_delta * weights[batch_index, col]
                 self.slot_metadata[slot_id].last_usage = float(weights[batch_index, col].detach().item())
+        self._record_delta_debug("slot", point_name, delta, planner_cfg)
+        slot_norm = float(delta.detach().norm().item())
+        self._record_control_contribution_debug(
+            planner_cfg,
+            slot_norm=slot_norm,
+            slot_structurally_available=True,
+            slot_nontrivial=slot_norm > 1e-12,
+            beta_value=beta_value,
+        )
         return delta
 
     def apply_to_qkv(self, hidden_states: torch.Tensor, base_qkv: torch.Tensor, route_state: Dict[str, object], planner_cfg: Dict[str, object]) -> torch.Tensor:

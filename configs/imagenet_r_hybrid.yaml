@@ -1,0 +1,15 @@
+_base_: imagenet_r.yaml
+
+training:
+  batch_size: 64
+  epochs_per_task: 20
+  lr: 0.0008
+  planner_mode: hybrid
+  planner_audit_logging: true
+  planner_control_delta_logit_scale: 2.0
+
+runtime:
+  num_workers: 8
+
+warmup:
+  num_batches: 5

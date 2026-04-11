@@ -29,7 +29,7 @@ model:
   local_smoke_backbone_name: toy_vit_tiny
   local_smoke_backbone_source: internal
   freeze_backbone: true
-  selected_blocks: [6, 7, 8, 9, 10, 11]
+  selected_blocks: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
   insertion_points: [q_proj, v_proj]
   feature_dim: 768
 
@@ -92,8 +92,8 @@ training:
   sgd_nesterov: false
   lr: 5e-4
   weight_decay: 0.0005
-  epochs_per_task: 30
-  batch_size: 64
+  epochs_per_task: 15
+  batch_size: 36
   grad_clip_norm: 5.0
   use_scheduler: true
   scheduler: cosine
@@ -102,8 +102,31 @@ training:
   retention_debug_logging: true
   retention_feature_diff_logging: false
   retention_feature_diff_max_epochs: 3
-  routing_debug_logging: false
+  routing_debug_logging: true
   routing_debug_max_epochs: 3
+  planner_audit_logging: true
+  planner_mode: legacy
+  planner_control_recompute: per_batch
+  planner_policy_trainable: false
+  planner_control_trainable: true
+  planner_use_learned_shared_gate: true
+  planner_control_delta_logit_scale: 2.0
+  planner_soft_rank_training: false
+  planner_soft_rank_temperature: 0.5
+  planner_hard_rank_eval: true
+  adapter_delta_debug_logging: true
+  adapter_delta_debug_max_epochs: 3
+  final_feature_diff_debug_logging: true
+  final_feature_diff_debug_max_epochs: 3
+  classifier_drift_debug_logging: true
+  classifier_drift_debug_max_epochs: 3
+  grad_norm_debug_logging: true
+  grad_norm_debug_max_epochs: 3
+  logit_margin_debug_logging: true
+  logit_margin_debug_max_epochs: 3
+  classifier_lr_scale: 1.0
+  freeze_new_classifier_epochs: 0
+  freeze_all_classifier_epochs: 0
   freeze_old_classifier_weights: true
 
 loss:

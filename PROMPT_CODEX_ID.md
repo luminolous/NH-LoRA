@@ -31,7 +31,7 @@ Milestone digunakan untuk mengontrol progres, tetapi **target akhir tetap implem
 
 ## Benchmark yang harus didukung
 - CIFAR-100
-- CUB-200-2011
+- ImageNet-A
 - ImageNet-R
 - OmniBenchmark
 
