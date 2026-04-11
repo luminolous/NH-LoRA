@@ -14,6 +14,9 @@ class ConfigAndSummarySmokeTest(unittest.TestCase):
         config = load_config(repo_root / "configs" / "cifar100.yaml")
         self.assertEqual(config["benchmark"]["name"], "cifar100")
         self.assertEqual(config["model"]["backbone_name"], "vit_base_patch16_224_in21k")
+        self.assertEqual(config["training"]["optimizer"], "adamw")
+        self.assertAlmostEqual(float(config["training"]["sgd_momentum"]), 0.9, places=6)
+        self.assertFalse(bool(config["training"]["sgd_nesterov"]))
 
         workspace_tmp = repo_root / "outputs" / "test_tmp" / "config_summary_runtime"
         workspace_tmp.mkdir(parents=True, exist_ok=True)

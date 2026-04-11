@@ -153,6 +153,8 @@ def _build_test_config(output_root: str):
         },
         "training": {
             "optimizer": "adamw",
+            "sgd_momentum": 0.9,
+            "sgd_nesterov": False,
             "lr": 1e-3,
             "weight_decay": 1e-4,
             "epochs_per_task": 1,
@@ -873,6 +875,105 @@ class PaperAlignmentUnitTests(unittest.TestCase):
         self.assertIn("avg_candidate_count=2.00", joined_messages)
         self.assertIn("avg_topk=2.00", joined_messages)
 
+    def test_build_optimizer_defaults_to_adamw(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "optimizer_adamw_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        trainer = NHLoRATrainer(config, configure_logger(level=logging.WARNING), benchmark=benchmark)
+
+        optimizer = trainer._build_optimizer()
+
+        self.assertIsInstance(optimizer, torch.optim.AdamW)
+
+    def test_build_optimizer_supports_sgd_with_configured_momentum_and_nesterov(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "optimizer_sgd_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        config["training"]["optimizer"] = "SGD "
+        config["training"]["sgd_momentum"] = 0.85
+        config["training"]["sgd_nesterov"] = True
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        trainer = NHLoRATrainer(config, configure_logger(level=logging.WARNING), benchmark=benchmark)
+
+        optimizer = trainer._build_optimizer()
+
+        self.assertIsInstance(optimizer, torch.optim.SGD)
+        self.assertAlmostEqual(float(optimizer.defaults["momentum"]), 0.85, places=6)
+        self.assertTrue(bool(optimizer.defaults["nesterov"]))
+        self.assertAlmostEqual(float(optimizer.defaults["weight_decay"]), float(config["training"]["weight_decay"]), places=8)
+
+    def test_optimizer_name_normalization_accepts_whitespace_and_case(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        cases = [
+            (" SGD ", torch.optim.SGD),
+            (" AdamW", torch.optim.AdamW),
+        ]
+
+        for optimizer_name, expected_type in cases:
+            workspace_tmp = repo_root / "outputs" / "test_tmp" / f"optimizer_name_{optimizer_name.strip().lower()}"
+            workspace_tmp.mkdir(parents=True, exist_ok=True)
+            config = _build_test_config(str(workspace_tmp))
+            config["training"]["optimizer"] = optimizer_name
+            trainer = NHLoRATrainer(config, configure_logger(level=logging.WARNING), benchmark=benchmark)
+
+            optimizer = trainer._build_optimizer()
+
+            self.assertIsInstance(optimizer, expected_type)
+
+    def test_sgd_optimizer_preserves_existing_parameter_group_learning_rates(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "optimizer_sgd_group_lr_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        config["training"]["optimizer"] = "sgd"
+        config["training"]["lr"] = 2e-3
+        config["nh_lora"]["shared_lr_scale"] = 0.25
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        trainer = NHLoRATrainer(config, configure_logger(level=logging.WARNING), benchmark=benchmark)
+
+        optimizer = trainer._build_optimizer()
+
+        self.assertEqual(len(optimizer.param_groups), 2)
+        self.assertAlmostEqual(float(optimizer.param_groups[0]["lr"]), 2e-3, places=8)
+        self.assertAlmostEqual(float(optimizer.param_groups[1]["lr"]), 5e-4, places=8)
+
+        classifier_param_id = id(trainer.model.classifier.weight)
+        self.assertTrue(any(id(parameter) == classifier_param_id for parameter in optimizer.param_groups[0]["params"]))
+
+    def test_build_optimizer_rejects_unsupported_names_with_clear_error(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "optimizer_invalid_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        config["training"]["optimizer"] = "rmsprop"
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        trainer = NHLoRATrainer(config, configure_logger(level=logging.WARNING), benchmark=benchmark)
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "Unsupported optimizer 'rmsprop'. Supported optimizers: \\['adamw', 'sgd'\\]",
+        ):
+            trainer._build_optimizer()
+
+    def test_cosine_scheduler_attaches_to_sgd_optimizer(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "optimizer_sgd_scheduler_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        config["training"]["optimizer"] = "sgd"
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        trainer = NHLoRATrainer(config, configure_logger(level=logging.WARNING), benchmark=benchmark)
+
+        optimizer = trainer._build_optimizer()
+        scheduler = trainer._build_scheduler(optimizer)
+
+        self.assertIsInstance(optimizer, torch.optim.SGD)
+        self.assertIsInstance(scheduler, torch.optim.lr_scheduler.CosineAnnealingLR)
+
     def test_seed_config_logging_tolerates_missing_optional_fields(self):
         repo_root = Path(__file__).resolve().parents[1]
         workspace_tmp = repo_root / "outputs" / "test_tmp" / "seed_config_log_unit"
@@ -893,6 +994,25 @@ class PaperAlignmentUnitTests(unittest.TestCase):
         self.assertIn("retention_feature_representation=cls", joined_messages)
         self.assertIn("retention_feature_diff_logging=", joined_messages)
         self.assertIn("routing_debug_logging=", joined_messages)
+
+    def test_seed_config_logging_reports_sgd_details_when_active(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_tmp = repo_root / "outputs" / "test_tmp" / "seed_config_sgd_log_unit"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        config = _build_test_config(str(workspace_tmp))
+        config["training"]["optimizer"] = "sgd"
+        config["training"]["sgd_momentum"] = 0.8
+        config["training"]["sgd_nesterov"] = True
+        benchmark = _build_tiny_benchmark(num_tasks=1)
+        logger = _ListLogger()
+        trainer = NHLoRATrainer(config, logger, benchmark=benchmark)
+
+        trainer._log_seed_config(seed=5)
+
+        joined_messages = "\n".join(logger.messages)
+        self.assertIn("optimizer=sgd", joined_messages)
+        self.assertIn("sgd_momentum=0.8", joined_messages)
+        self.assertIn("sgd_nesterov=True", joined_messages)
 
     def test_seed_config_warns_for_full_token_retention_features(self):
         repo_root = Path(__file__).resolve().parents[1]

@@ -15,6 +15,7 @@ This repository is organized to serve as the implementation-facing reference for
 - Sparse cosine Instance Router over candidate slots
 - Incremental cosine classifier with prototype-based imprinting
 - Heuristic but explicit CHU decisions: merge, prune, keep, freeze
+- `AdamW` default plus optional standard `SGD` backend for optimizer ablations and recipe-parity experiments
 - Bootstrap mode for task 1
 - Summary-only history bank
 - Rehearsal-free class-incremental training loop
@@ -126,3 +127,5 @@ Outputs:
 - Full ViT-B/16-IN21K validation still belongs on the SSH machine with `timm`.
 - Benchmark runner scripts stream logs live to notebook output and save the same stream to `outputs/logs/`.
 - Development status is tracked in [outputs/logs/dev_status.md](/C:/Users/Syauqi%20Nabil/research/self/NH-LoRA/outputs/logs/dev_status.md).
+- `training.optimizer` supports `adamw` and `sgd`. SGD support is provided for optimizer ablations and recipe-parity experiments; it does not change NH-LoRA method semantics.
+- AdamW and SGD results should not be treated as interchangeable. Even with the same parameter groups and cosine scheduler, optimization dynamics can differ materially.

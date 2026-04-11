@@ -97,6 +97,17 @@ The design paper is the primary source of truth. When paper detail was ambiguous
   - [src/engine/trainer.py](/C:/Users/Syauqi%20Nabil/research/self/NH-LoRA/src/engine/trainer.py)
   - `NHLoRATrainer._compute_loss`
 
+### Optimizer Backend
+
+- Paper intent: optimizer choice is part of the training recipe, not the NH-LoRA method definition itself.
+- Code:
+  - [src/engine/trainer.py](/C:/Users/Syauqi%20Nabil/research/self/NH-LoRA/src/engine/trainer.py)
+  - [configs/base.yaml](/C:/Users/Syauqi%20Nabil/research/self/NH-LoRA/configs/base.yaml)
+- Repository policy:
+  - `adamw` remains the default optimizer backend
+  - standard PyTorch `sgd` is also supported for recipe-parity and optimizer-ablation experiments
+  - optimizer changes do not alter NH-LoRA structural semantics, planner semantics, or loss definitions
+
 ### Evaluation And Inference Planning
 
 - Paper intent: paper is not fully explicit; inference should stay aligned with structural decisions.
@@ -169,6 +180,11 @@ This policy is implemented in [src/models/nh_lora.py](/C:/Users/Syauqi%20Nabil/r
 - Chosen policy: `L_rank` is computed from realized active-rank masks, not planner scores.
 - Status: this is the most paper-faithful choice available in the current discrete structure design.
 - Important note: because active rank changes through planning and structural mutation, `L_rank` can become near-constant during a task and may act more like a structural cost than a strong optimizer-driving signal.
+
+### Optimizer Comparisons
+
+- Chosen policy: optimizer backend differences are treated as training-recipe ablations.
+- Rationale: supporting `sgd` is useful for comparison with external recipes such as CL-LoRA, but AdamW and SGD should not be interpreted as method-equivalent or result-interchangeable simply because parameter groups and scheduler are held fixed.
 
 ## Final Artifact Policy
 

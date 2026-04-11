@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Tuple
 import torch
 from torch import nn
 from torch.nn import functional as F
-from torch.optim import AdamW
+from torch.optim import AdamW, SGD
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 
@@ -125,7 +125,11 @@ class NHLoRATrainer:
     def _shared_lr_scale(self) -> float:
         return float(self.config["nh_lora"].get("shared_lr_scale", 1.0))
 
+    def _optimizer_name(self) -> str:
+        return str(self.config["training"].get("optimizer", "adamw")).strip().lower()
+
     def _build_optimizer(self):
+        training_cfg = self.config["training"]
         shared_params = []
         other_params = []
         for name, parameter in self.model.named_parameters():
@@ -147,7 +151,19 @@ class NHLoRATrainer:
                     "lr": self._base_learning_rate() * self._shared_lr_scale(),
                 }
             )
-        return AdamW(parameter_groups, lr=self._base_learning_rate(), weight_decay=float(self.config["training"]["weight_decay"]))
+        optimizer_name = self._optimizer_name()
+        weight_decay = float(training_cfg["weight_decay"])
+        if optimizer_name == "adamw":
+            return AdamW(parameter_groups, lr=self._base_learning_rate(), weight_decay=weight_decay)
+        if optimizer_name == "sgd":
+            return SGD(
+                parameter_groups,
+                lr=self._base_learning_rate(),
+                momentum=float(training_cfg.get("sgd_momentum", 0.9)),
+                nesterov=bool(training_cfg.get("sgd_nesterov", False)),
+                weight_decay=weight_decay,
+            )
+        raise ValueError(f"Unsupported optimizer '{optimizer_name}'. Supported optimizers: ['adamw', 'sgd']")
 
     def _build_scheduler(self, optimizer):
         training_cfg = self.config["training"]
@@ -255,10 +271,16 @@ class NHLoRATrainer:
             "  epochs_per_task=%s batch_size=%s optimizer=%s lr=%s weight_decay=%s",
             training_cfg.get("epochs_per_task", "n/a"),
             training_cfg.get("batch_size", "n/a"),
-            training_cfg.get("optimizer", "n/a"),
+            self._optimizer_name(),
             training_cfg.get("lr", "n/a"),
             training_cfg.get("weight_decay", "n/a"),
         )
+        if self._optimizer_name() == "sgd":
+            self.logger.info(
+                "  sgd_momentum=%s sgd_nesterov=%s",
+                training_cfg.get("sgd_momentum", 0.9),
+                training_cfg.get("sgd_nesterov", False),
+            )
         self.logger.info(
             "  losses lam_kd=%s lam_feat=%s lam_orth=%s lam_rank=%s lam_grow=%s lam_route=%s retention_feature_representation=%s",
             loss_cfg.get("lambda_kd", "n/a"),
