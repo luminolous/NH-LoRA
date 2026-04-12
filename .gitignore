@@ -11,3 +11,19 @@ outputs/logs/*.out
 outputs/metrics/**/*.json
 outputs/summaries/*.json
 
+AGENTS.md
+IMPLEMENT.md
+PLAN3.md
+PLANS.md
+PROMPT_CODEX_ID.md
+RUNS.md
+SPEC.md
+README_CODEX.md
+
+tests
+
+outputs/test_tmp
+outputs/logs/dev_status.md
+outputs/dev
+
+docs/paper_alignment.md
