@@ -1348,7 +1348,6 @@ class PaperAlignmentUnitTests(unittest.TestCase):
         self.assertIn("avg_candidate_count=2.00", joined_messages)
         self.assertIn("avg_topk=2.00", joined_messages)
 
-<<<<<<< HEAD
     def test_build_optimizer_defaults_to_adamw(self):
         repo_root = Path(__file__).resolve().parents[1]
         workspace_tmp = repo_root / "outputs" / "test_tmp" / "optimizer_adamw_unit"
@@ -1447,7 +1446,7 @@ class PaperAlignmentUnitTests(unittest.TestCase):
 
         self.assertIsInstance(optimizer, torch.optim.SGD)
         self.assertIsInstance(scheduler, torch.optim.lr_scheduler.CosineAnnealingLR)
-=======
+
     def test_stage5_slot_lifecycle_summary_exposes_slot_ids_without_mutating_inputs(self):
         repo_root = Path(__file__).resolve().parents[1]
         workspace_tmp = repo_root / "outputs" / "test_tmp" / "stage5_slot_lifecycle_unit"
@@ -1949,7 +1948,6 @@ class PaperAlignmentUnitTests(unittest.TestCase):
         self.assertIn("[GradNorm][Task 2][Epoch 1][classifier]", joined_messages)
         self.assertIn("[AdapterDelta][Task 2][Epoch 1][Layer 1][q_proj][shared]", joined_messages)
         self.assertIn("[AdapterDelta][Task 2][Epoch 1][Layer 1][q_proj][slot]", joined_messages)
->>>>>>> 860378ac0afde0cbf4d45b63b6aca6d5315df287
 
     def test_seed_config_logging_tolerates_missing_optional_fields(self):
         repo_root = Path(__file__).resolve().parents[1]

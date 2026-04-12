@@ -15,11 +15,9 @@ class ConfigAndSummarySmokeTest(unittest.TestCase):
         config = load_config(repo_root / "configs" / "cifar100.yaml")
         self.assertEqual(config["benchmark"]["name"], "cifar100")
         self.assertEqual(config["model"]["backbone_name"], "vit_base_patch16_224_in21k")
-<<<<<<< HEAD
         self.assertEqual(config["training"]["optimizer"], "adamw")
         self.assertAlmostEqual(float(config["training"]["sgd_momentum"]), 0.9, places=6)
         self.assertFalse(bool(config["training"]["sgd_nesterov"]))
-=======
         self.assertEqual(config["training"]["classifier_lr_scale"], 1.0)
         self.assertEqual(config["training"]["freeze_new_classifier_epochs"], 0)
         self.assertEqual(config["training"]["freeze_all_classifier_epochs"], 0)
@@ -33,7 +31,6 @@ class ConfigAndSummarySmokeTest(unittest.TestCase):
         self.assertFalse(config["training"]["planner_soft_rank_training"])
         self.assertAlmostEqual(config["training"]["planner_soft_rank_temperature"], 0.5, places=6)
         self.assertTrue(config["training"]["planner_hard_rank_eval"])
->>>>>>> 860378ac0afde0cbf4d45b63b6aca6d5315df287
 
         workspace_tmp = repo_root / "outputs" / "test_tmp" / "config_summary_runtime"
         workspace_tmp.mkdir(parents=True, exist_ok=True)

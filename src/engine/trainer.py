@@ -154,21 +154,17 @@ class NHLoRATrainer:
     def _shared_lr_scale(self) -> float:
         return float(self.config["nh_lora"].get("shared_lr_scale", 1.0))
 
-<<<<<<< HEAD
-    def _optimizer_name(self) -> str:
-        return str(self.config["training"].get("optimizer", "adamw")).strip().lower()
-=======
     def _classifier_lr_scale(self) -> float:
         return float(self.config["training"].get("classifier_lr_scale", 1.0))
 
     def _planner_mode(self) -> str:
-        return str(self.config["training"].get("planner_mode", "legacy")).lower()
+        return str(self.config["training"].get("planner_mode", "legacy")).strip().lower()
 
     def _hybrid_planner_enabled(self) -> bool:
         return self._planner_mode() == "hybrid"
 
     def _planner_control_recompute_mode(self) -> str:
-        return str(self.config["training"].get("planner_control_recompute", "per_batch")).lower()
+        return str(self.config["training"].get("planner_control_recompute", "per_batch")).strip().lower()
 
     def _planner_policy_trainable(self) -> bool:
         return bool(self.config["training"].get("planner_policy_trainable", False))
@@ -201,24 +197,19 @@ class NHLoRATrainer:
             )
         if not self._planner_control_trainable():
             raise ValueError(
-                "Stage 8 hybrid mode requires training.planner_control_trainable=true "
-                "to keep the control branch optimizer-updated."
+                "Stage 8 hybrid mode requires training.planner_control_trainable=true to keep "
+                "the control branch optimizer-updated."
             )
         if not self._planner_use_learned_shared_gate():
-            raise ValueError(
-                "Stage 8 hybrid mode requires training.planner_use_learned_shared_gate=true."
-            )
+            raise ValueError("Stage 8 hybrid mode requires training.planner_use_learned_shared_gate=true.")
         if self._planner_soft_rank_training_enabled():
             raise ValueError(
-                "Stage 8 Checkpoint A defers training.planner_soft_rank_training=true. "
-                "Leave it false for this pass."
+                "Stage 8 Checkpoint A defers training.planner_soft_rank_training=true. Leave it false for this pass."
             )
         if self._planner_control_delta_logit_scale() <= 0.0:
             raise ValueError("Hybrid planner requires training.planner_control_delta_logit_scale > 0.")
         if not self._planner_hard_rank_eval():
-            raise ValueError(
-                "Stage 8 Checkpoint A requires training.planner_hard_rank_eval=true."
-            )
+            raise ValueError("Stage 8 Checkpoint A requires training.planner_hard_rank_eval=true.")
         if self._planner_control_recompute_mode() != "per_batch":
             raise ValueError(
                 "Stage 8 Checkpoint A currently supports training.planner_control_recompute=per_batch only."
@@ -233,13 +224,13 @@ class NHLoRATrainer:
                 self.planner.freeze_control_branch()
             return
         self.planner.unfreeze_policy_branch()
-        self.planner.freeze_control_branch()
+        self.planner.unfreeze_control_branch()
 
-    def _planner_trainable_parameters(self) -> List[nn.Parameter]:
-        if self._hybrid_planner_enabled():
-            return [parameter for parameter in self.planner.control_parameters() if parameter.requires_grad]
+    def _planner_trainable_parameters(self):
         return [parameter for parameter in self.planner.parameters() if parameter.requires_grad]
->>>>>>> 860378ac0afde0cbf4d45b63b6aca6d5315df287
+
+    def _optimizer_name(self) -> str:
+        return str(self.config["training"].get("optimizer", "adamw")).strip().lower()
 
     def _build_optimizer(self):
         training_cfg = self.config["training"]
@@ -268,7 +259,13 @@ class NHLoRATrainer:
                     "lr": self._base_learning_rate() * self._shared_lr_scale(),
                 }
             )
-<<<<<<< HEAD
+        if classifier_params:
+            parameter_groups.append(
+                {
+                    "params": classifier_params,
+                    "lr": self._base_learning_rate() * classifier_lr_scale,
+                }
+            )
         optimizer_name = self._optimizer_name()
         weight_decay = float(training_cfg["weight_decay"])
         if optimizer_name == "adamw":
@@ -282,16 +279,6 @@ class NHLoRATrainer:
                 weight_decay=weight_decay,
             )
         raise ValueError(f"Unsupported optimizer '{optimizer_name}'. Supported optimizers: ['adamw', 'sgd']")
-=======
-        if classifier_params:
-            parameter_groups.append(
-                {
-                    "params": classifier_params,
-                    "lr": self._base_learning_rate() * classifier_lr_scale,
-                }
-            )
-        return AdamW(parameter_groups, lr=self._base_learning_rate(), weight_decay=float(self.config["training"]["weight_decay"]))
->>>>>>> 860378ac0afde0cbf4d45b63b6aca6d5315df287
 
     def _build_scheduler(self, optimizer):
         training_cfg = self.config["training"]
