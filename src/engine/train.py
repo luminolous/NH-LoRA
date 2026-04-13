@@ -4,9 +4,9 @@ import argparse
 
 from src.engine.trainer import NHLoRATrainer
 from src.utils.config import load_config, save_config_snapshot
+from src.utils.io import ensure_output_dirs, resolve_experiment_paths, write_json
 from src.utils.logging_utils import configure_logger
 from src.utils.seeding import seed_everything
-from src.utils.io import ensure_output_dirs, write_json
 
 
 def parse_args():
@@ -14,14 +14,14 @@ def parse_args():
     parser.add_argument("--config", required=True, help="Path to the benchmark YAML config.")
     parser.add_argument("--seed", required=True, type=int, help="Random seed for the run.")
     parser.add_argument("--benchmark", required=True, help="Benchmark name override for output naming.")
-    parser.add_argument("--output-root", default="outputs", help="Root output directory.")
+    parser.add_argument("--output-root", default=None, help="Optional root output directory override.")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
     config = load_config(args.config)
-    config["experiment"]["output_root"] = args.output_root
+    resolve_experiment_paths(config, output_root_override=args.output_root)
     config["benchmark"]["name"] = args.benchmark
     output_dirs = ensure_output_dirs(config, benchmark_name=args.benchmark)
     log_file = output_dirs["logs"] / f"{args.benchmark}_seed{args.seed}.log"

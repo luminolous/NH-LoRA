@@ -1,0 +1,38 @@
+_base_: base.yaml
+
+benchmark:
+  name: custom
+  dataset_name: custom
+  data_root: data/custom-dataset
+  scenario: class_incremental
+  # Keep num_tasks and classes_per_task consistent with the real class count in the dataset.
+  # The custom builder validates the resolved split and raises if the numbers do not match.
+  num_tasks: 5
+  # classes_per_task determines the effective split.
+  classes_per_task: 10
+  image_size: 224
+
+experiment:
+  output_root: outputs/custom
+  log_dir: outputs/custom/logs
+  metrics_dir: outputs/custom/metrics
+  summaries_dir: outputs/custom/summaries
+  checkpoints_dir: outputs/custom/checkpoints
+  deploy_dir: outputs/custom/deploy
+  export_deploy_bundle: true
+
+training:
+  batch_size: 20
+  epochs_per_task: 15
+  lr: 5e-4
+  planner_mode: hybrid
+  planner_control_delta_logit_scale: 2.0
+
+runtime:
+  num_workers: 8
+
+warmup:
+  num_batches: 5
+
+output:
+  benchmark_subdir: custom

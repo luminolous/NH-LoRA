@@ -43,6 +43,7 @@ from src.models.task_state import (
     pool_vector,
 )
 from src.utils.checkpoint import save_model_artifact
+from src.utils.deploy import export_deploy_bundle
 from src.utils.io import ensure_output_dirs
 
 LOSS_COMPONENT_KEYS = ("total", "cls", "kd", "feat", "orth", "rank", "grow", "route")
@@ -5330,6 +5331,9 @@ class NHLoRATrainer:
             "final_metrics": deepcopy(final_metrics),
         }
 
+    def _should_export_deploy_bundle(self) -> bool:
+        return bool(self.config["experiment"].get("export_deploy_bundle", False))
+
     def _save_final_model_artifact(self, seed: int, final_metrics: Dict[str, Any]) -> Path | None:
         if not bool(self.config["experiment"].get("save_checkpoints", False)):
             self.last_train_state["last_model_artifact_path"] = None
@@ -5339,6 +5343,19 @@ class NHLoRATrainer:
         save_model_artifact(payload, output_path)
         self.last_train_state["last_model_artifact_path"] = str(output_path)
         return output_path
+
+    def _export_final_deploy_bundle(self, seed: int, final_metrics: Dict[str, Any]) -> Path | None:
+        if not self._should_export_deploy_bundle():
+            return None
+        deploy_dir = export_deploy_bundle(
+            config=self.config,
+            benchmark=self.benchmark,
+            seed=seed,
+            artifact_payload=self._final_model_artifact_payload(seed=seed, final_metrics=final_metrics),
+            output_dirs=self.output_dirs,
+        )
+        self.logger.info("Exported deploy bundle to %s", deploy_dir)
+        return deploy_dir
 
     def train(self, seed: int) -> Dict[str, Any]:
         if self.training_state["seed"] is None:
@@ -5399,6 +5416,7 @@ class NHLoRATrainer:
             "accuracy_matrix": deepcopy(self.accuracy_matrix),
         }
         self._save_final_model_artifact(seed=seed, final_metrics=final_metrics)
+        self._export_final_deploy_bundle(seed=seed, final_metrics=final_metrics)
         average_task_wall_time = (
             sum(float(metric["task_wall_time"]) for metric in self.task_metrics) / len(self.task_metrics)
             if self.task_metrics

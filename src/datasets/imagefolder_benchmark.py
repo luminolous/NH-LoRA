@@ -111,6 +111,10 @@ def build_imagefolder_class_incremental_benchmark(
             "benchmark": benchmark_name,
             "dataset_type": "imagefolder",
             "class_to_idx": dict(class_to_idx),
+            "idx_to_class": dict(idx_to_class),
+            "class_names": [idx_to_class[int(class_id)] for class_id in range(num_classes)],
+            "num_classes": num_classes,
+            "image_size": image_size,
             "class_name_count": num_classes,
             "split_class_names": {
                 "train": train_class_names,

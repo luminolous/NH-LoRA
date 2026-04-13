@@ -21,24 +21,21 @@ NH-LoRA is a rehearsal-free class-incremental learning method built on a frozen 
 
 ### Environments
 
-
-
 ### Training
 
-To train the model, you can setup the configuration in `/configs` folder first, navigate to the main directory and then run it with:
+To train the model, set up the configuration in the `configs` folder first, navigate to the main directory, and then run:
 
 ```bash
 scripts/<bash_file_benchmark_you_want_to_run>.sh
 ```
 
-or in python notebook:
+or in a Python notebook:
 
 ```python
 bash scripts/<bash_file_benchmark_you_want_to_run>.sh
 ```
 
 ### Benchmark / Dataset
-
 
 #### Cifar-100
 
@@ -64,25 +61,58 @@ scripts/run_imagenet_r.sh
 scripts/run_custom.sh
 ```
 
-For custom training, you can use this following dataset structure:
+Custom ImageFolder datasets must follow this structure:
 
-```
+```text
 data/custom-dataset/
-├─ train/
-│  ├─ class_000/
-│  │  ├─ img_0001.jpg
-│  │  ├─ img_0002.jpg
-│  │  └─ ...
-│  ├─ class_001/
-│  ├─ class_002/
-│  └─ ...
-└─ test/
-   ├─ class_000/
-   │  ├─ img_0001.jpg
-   │  └─ ...
-   ├─ class_001/
-   ├─ class_002/
-   └─ ...
+|- train/
+|  |- class_000/
+|  |  |- img_0001.jpg
+|  |  |- img_0002.jpg
+|  |  `- ...
+|  |- class_001/
+|  |- class_002/
+|  `- ...
+`- test/
+   |- class_000/
+   |  |- img_0001.jpg
+   |  `- ...
+   |- class_001/
+   |- class_002/
+   `- ...
+```
+
+The custom benchmark reads `train/` and `test/` class folders, requires the class-folder sets to match, and uses alphabetical folder order as the class order.
+
+`configs/run_custom.yaml` is the single source of truth for the custom output layout:
+
+- `outputs/custom/logs`
+- `outputs/custom/metrics/custom`
+- `outputs/custom/summaries/custom_summary.json`
+- `outputs/custom/checkpoints/custom`
+- `outputs/custom/deploy/custom`
+
+Keep `benchmark.num_tasks` and `benchmark.classes_per_task` compatible with the real class count in your dataset. The custom builder validates the resolved split and raises an error if the task count implied by `classes_per_task` does not match `benchmark.num_tasks`.
+
+Run a single custom seed directly with:
+
+```bash
+python -m src.engine.train --config configs/run_custom.yaml --seed 1 --benchmark custom
+```
+
+After training, the deploy bundle for a seed is written under:
+
+```text
+outputs/custom/deploy/custom/seed_<seed>/
+```
+
+Run local prediction from the deploy artifact with:
+
+```bash
+python -m src.engine.predict \
+  --artifact-dir outputs/custom/deploy/custom/seed_1 \
+  --image path/to/image.jpg \
+  --topk 5
 ```
 
 ## Acknowledgments

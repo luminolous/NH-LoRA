@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Callable, Dict
 
 from src.datasets.cifar100 import build_cifar100_benchmark
+from src.datasets.custom import build_custom_benchmark
 from src.datasets.imagenet_a import build_imagenet_a_benchmark
 from src.datasets.imagenet_r import build_imagenet_r_benchmark
 from src.datasets.omnibenchmark import build_omnibenchmark_benchmark
@@ -10,6 +11,7 @@ from src.datasets.omnibenchmark import build_omnibenchmark_benchmark
 
 DATASET_REGISTRY: Dict[str, Callable[[Dict[str, Any]], Any]] = {
     "cifar100": build_cifar100_benchmark,
+    "custom": build_custom_benchmark,
     "imagenet_a": build_imagenet_a_benchmark,
     "imagenet_r": build_imagenet_r_benchmark,
     "omnibenchmark": build_omnibenchmark_benchmark,
