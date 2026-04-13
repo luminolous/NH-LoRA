@@ -103,27 +103,12 @@ The custom benchmark reads `train/` and `test/` class folders, requires the clas
 - `outputs/custom/checkpoints/custom`
 - `outputs/custom/deploy/custom`
 
-Keep `benchmark.num_tasks` and `benchmark.classes_per_task` compatible with the real class count in your dataset. The custom builder validates the resolved split and raises an error if the task count implied by `classes_per_task` does not match `benchmark.num_tasks`.
-
-Run a single custom seed directly with:
-
-```bash
-python -m src.engine.train --config configs/run_custom.yaml --seed 1 --benchmark custom
-```
+> Keep `benchmark.num_tasks` and `benchmark.classes_per_task` compatible with the real class count in your dataset. The custom builder validates the resolved split and raises an error if the task count implied by `classes_per_task` does not match `benchmark.num_tasks`.
 
 After training, the deploy bundle for a seed is written under:
 
 ```text
 outputs/custom/deploy/custom/seed_<seed>/
-```
-
-Run local prediction from the deploy artifact with:
-
-```bash
-python -m src.engine.predict \
-  --artifact-dir outputs/custom/deploy/custom/seed_1 \
-  --image path/to/image.jpg \
-  --topk 5
 ```
 
 ## Acknowledgments
