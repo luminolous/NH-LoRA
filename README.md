@@ -21,6 +21,17 @@ NH-LoRA is a rehearsal-free class-incremental learning method built on a frozen 
 
 ### Environments
 
+- `Python==3.12+`
+- `PyTorch==2.11.0`
+- `TorchVision==0.26.0`
+- `timm==1.0.26`
+- `numpy`
+- `Pillow`
+- `PyYAML`
+- `tqdm`
+- `safetensors`
+- `huggingface_hub`
+
 ### Training
 
 To train the model, set up the configuration in the `configs` folder first, navigate to the main directory, and then run:
