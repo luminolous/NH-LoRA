@@ -2,6 +2,17 @@
 
 This repository contains the official PyTorch implementation of NH-LoRA: Future-Aware Structural Expansion of Low-Rank Adapters for Rehearsal-Free Class-Incremental Learning.
 
+<p align="center">
+  <img src="https://img.shields.io/badge/PyTorch-Implementation-ee4c2c?style=flat-square&logo=pytorch&logoColor=white" alt="PyTorch Implementation">
+  <img src="https://img.shields.io/badge/Task-Class--Incremental%20Learning-6f42c1?style=flat-square" alt="CIL">
+  <img src="https://img.shields.io/badge/Python-3.12%2B-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python 3.12+">
+  <img src="https://img.shields.io/github/license/luminolous/NH-LoRA?style=flat-square" alt="License">
+  <img src="https://img.shields.io/github/last-commit/luminolous/NH-LoRA?style=flat-square" alt="Last Commit">
+  <a href="https://nhlora.luminolous.site">
+    <img src="https://img.shields.io/badge/Homepage-Project%20Page-0ea5e9?style=flat-square&logo=googlechrome&logoColor=white" alt="Project Homepage">
+  </a>
+</p>
+
 ## Overview
 
 NH-LoRA is a rehearsal-free class-incremental learning method built on a frozen Vision Transformer and parameter-efficient low-rank adaptation. It separates reusable cross-task knowledge from task-specific expandable memory, then uses a task-aware planner to control structural decisions such as reuse, rank expansion, or new-slot creation. During learning, sparse routing and post-task consolidation help balance plasticity and stability while keeping parameter growth under control.
