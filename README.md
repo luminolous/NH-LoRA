@@ -10,18 +10,20 @@ NH-LoRA is a rehearsal-free class-incremental learning method built on a frozen 
 
 ### Environments
 
+
+
 ### Training
 
-To train the model, you can setup the configuration in `/configs` folder first and then run it with:
+To train the model, you can setup the configuration in `/configs` folder first, navigate to the main directory and then run it with:
 
 ```bash
-scripts/<bash file benchmark you want to run>.sh
+scripts/<bash_file_benchmark_you_want_to_run>.sh
 ```
 
-or in python:
+or in python notebook:
 
 ```python
-bash scripts/<bash file benchmark you want to run>.sh
+bash scripts/<bash_file_benchmark_you_want_to_run>.sh
 ```
 
 ### Benchmark / Dataset
@@ -51,10 +53,31 @@ scripts/run_imagenet_r.sh
 scripts/run_custom.sh
 ```
 
-## Citation
+For custom training, you can use this following dataset structure:
+
+```
+data/custom-dataset/
+├─ train/
+│  ├─ class_000/
+│  │  ├─ img_0001.jpg
+│  │  ├─ img_0002.jpg
+│  │  └─ ...
+│  ├─ class_001/
+│  ├─ class_002/
+│  └─ ...
+└─ test/
+   ├─ class_000/
+   │  ├─ img_0001.jpg
+   │  └─ ...
+   ├─ class_001/
+   ├─ class_002/
+   └─ ...
+```
 
 ## Acknowledgments
 
-
+This data loader and preparation implementation builds using the [LAMDA-PILOT](https://github.com/sun-hailong/LAMDA-PILOT) code.
 
 ## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
