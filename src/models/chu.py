@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict
+from dataclasses import dataclass, field
+from typing import Any, Dict, List
 
 import torch
 from torch.nn import functional as F
@@ -20,6 +20,7 @@ class CHUReport:
     pruned_slots: int = 0
     kept_slots: int = 0
     frozen_slots: int = 0
+    merge_events: List[Dict[str, Any]] = field(default_factory=list)
 
 
 class ConsolidationHomeostasisUnit:
@@ -100,7 +101,17 @@ class ConsolidationHomeostasisUnit:
 
             if decision.should_merge:
                 for bank in layer.point_banks.values():
-                    bank.merge_slot_into_shared(slot_id, self.merge_rate, rank=layer.slot_metadata[slot_id].rank)
+                    merge_event = bank.merge_slot_into_shared(
+                        slot_id,
+                        self.merge_rate,
+                        rank=layer.slot_metadata[slot_id].rank,
+                    )
+                    report.merge_events.append(
+                        {
+                            "slot_id": int(slot_id),
+                            **merge_event,
+                        }
+                    )
                 layer.freeze_slot(slot_id)
                 layer.slot_metadata[slot_id].retained_for_inference = False
                 report.merged_slots += 1

@@ -13,6 +13,44 @@ from src.models.planner import MaterializedLayerPlan
 from src.models.task_state import TaskState
 
 
+def _resolve_model_orthogonality_config(config: Dict[str, object]) -> Dict[str, object]:
+    orth_cfg = deepcopy(config.get("orthogonality", {}))
+    insertion_points = [str(point) for point in config["model"]["insertion_points"]]
+    enabled = bool(orth_cfg.get("enabled", False))
+    if enabled and not bool(orth_cfg.get("apply_to_all_selected_blocks", True)):
+        raise ValueError("This pass only supports orthogonality.apply_to_all_selected_blocks=true.")
+    target_points = [str(point) for point in orth_cfg.get("target_points", ["q_proj", "k_proj", "v_proj"])]
+    shared_cfg = orth_cfg.get("shared", {}) if isinstance(orth_cfg.get("shared", {}), dict) else {}
+    slots_cfg = orth_cfg.get("slots", {}) if isinstance(orth_cfg.get("slots", {}), dict) else {}
+    active_points = [point for point in insertion_points if enabled and point in target_points]
+    points = {}
+    for point_name in insertion_points:
+        point_enabled = point_name in active_points
+        points[point_name] = {
+            "enabled": point_enabled,
+            "shared_enabled": point_enabled and bool(shared_cfg.get("enabled", True)),
+            "shared_factor": str(shared_cfg.get("factor", "a")),
+            "shared_mode": str(shared_cfg.get("mode", "one_side_fixed")),
+            "shared_init": str(shared_cfg.get("init", "orthogonal")),
+            "slots_enabled": point_enabled and bool(slots_cfg.get("enabled", True)),
+            "against_live_slots": point_enabled and bool(slots_cfg.get("against_live_slots", True)),
+            "against_shared": point_enabled and bool(slots_cfg.get("against_shared", True)),
+            "on_open_new_slot": point_enabled and bool(slots_cfg.get("on_open_new_slot", True)),
+            "on_expand_rank": point_enabled and bool(slots_cfg.get("on_expand_rank", True)),
+            "basis_source": str(slots_cfg.get("basis_source", "active_rank_only")),
+        }
+    return {
+        "enabled": enabled,
+        "target_points": target_points,
+        "active_points": active_points,
+        "points": points,
+        "loss": deepcopy(orth_cfg.get("loss", {})) if isinstance(orth_cfg.get("loss", {}), dict) else {},
+        "diagnostics": deepcopy(orth_cfg.get("diagnostics", {}))
+        if isinstance(orth_cfg.get("diagnostics", {}), dict)
+        else {},
+    }
+
+
 class NHLoRAModel(nn.Module):
     VALID_RETENTION_FEATURE_REPRESENTATIONS = {"cls", "mean_pool_tokens", "full_tokens"}
 
@@ -31,6 +69,7 @@ class NHLoRAModel(nn.Module):
                 f"{self.retention_feature_representation}. Expected one of "
                 f"{sorted(self.VALID_RETENTION_FEATURE_REPRESENTATIONS)}."
             )
+        self.orthogonality = _resolve_model_orthogonality_config(config)
         self.backbone = FrozenVisionTransformerBackbone.build(model_cfg, benchmark_cfg)
         self.selected_blocks = [int(block_id) for block_id in model_cfg["selected_blocks"]]
         self.insertion_points = [str(point) for point in model_cfg["insertion_points"]]
@@ -47,6 +86,7 @@ class NHLoRAModel(nn.Module):
                 router_topk=int(nh_cfg["router_topk"]),
                 router_temperature=float(nh_cfg["router_temperature"]),
                 task_embedding_dim=int(config["warmup"]["task_embedding_dim"]),
+                orthogonality_cfg=self.orthogonality,
             )
         self.classifier = IncrementalCosineClassifier(
             feature_dim=self.backbone.embed_dim,
@@ -55,6 +95,18 @@ class NHLoRAModel(nn.Module):
 
     def nh_layers_by_block(self):
         return {int(block_id): layer for block_id, layer in self.layers.items()}
+
+    def orthogonality_enabled(self) -> bool:
+        return bool(self.orthogonality.get("enabled", False))
+
+    def orthogonality_active_points(self) -> List[str]:
+        return [str(point) for point in self.orthogonality.get("active_points", [])]
+
+    def orthogonality_init_summaries(self) -> Dict[int, Dict[str, Dict[str, object]]]:
+        return {
+            int(block_id): layer.shared_orthogonality_summaries()
+            for block_id, layer in self.nh_layers_by_block().items()
+        }
 
     def export_structure_state(self) -> Dict[str, object]:
         return {

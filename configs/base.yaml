@@ -33,6 +33,29 @@ model:
   insertion_points: [q_proj, v_proj]
   feature_dim: 768
 
+orthogonality:
+  enabled: false
+  target_points: [q_proj, k_proj, v_proj]
+  apply_to_all_selected_blocks: true
+  shared:
+    enabled: true
+    factor: a
+    mode: one_side_fixed
+    init: orthogonal
+  slots:
+    enabled: true
+    against_live_slots: true
+    against_shared: true
+    on_open_new_slot: true
+    on_expand_rank: true
+    basis_source: active_rank_only
+  loss:
+    enabled: true
+    lambda_slot_slot: null
+    lambda_slot_shared: null
+  diagnostics:
+    enabled: false
+
 nh_lora:
   shared_rank: 8
   shared_lr_scale: 0.5

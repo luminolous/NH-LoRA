@@ -1,0 +1,10 @@
+_base_: cifar100.yaml
+
+model:
+  insertion_points: [q_proj, v_proj]
+
+orthogonality:
+  enabled: true
+  target_points: [q_proj, k_proj, v_proj]
+  diagnostics:
+    enabled: true
