@@ -21,9 +21,9 @@ from src.models.losses import (
     feature_retention,
     growth_penalty,
     kd_loss,
+    orthogonality_components,
     rank_penalty,
     routing_balance_loss,
-    slot_orthogonality,
 )
 from src.models.nh_lora import NHLoRAModel
 from src.models.planner import (
@@ -92,6 +92,7 @@ class NHLoRATrainer:
         self.chu = ConsolidationHomeostasisUnit(config["chu"])
         self.history_bank = HistoryBank()
         self.inference_profile = self.model.build_inference_profile()
+        self._log_orth_init()
 
         self.task_metrics: List[Dict[str, Any]] = []
         self.accuracy_matrix: List[List[float]] = []
@@ -116,6 +117,7 @@ class NHLoRATrainer:
             "task2_actions": {},
             "eval_shared_only_layers": [],
             "last_model_artifact_path": None,
+            "orth_exhaustion_events": 0,
         }
         self.training_state: Dict[str, Any] = {
             "seed": None,
@@ -375,6 +377,8 @@ class NHLoRATrainer:
         planner_cfg = self.config.get("planner", {})
         nh_lora_cfg = self.config.get("nh_lora", {})
         chu_cfg = self.config.get("chu", {})
+        orth_cfg = self._orthogonality_cfg()
+        orth_loss_cfg = self._orthogonality_loss_cfg()
         self.logger.info("Seed %d config:", seed)
         self.logger.info("  benchmark=%s", self.benchmark.name)
         self.logger.info("  dataset=%s", benchmark_cfg.get("dataset_name", benchmark_cfg.get("name", self.benchmark.name)))
@@ -406,6 +410,19 @@ class NHLoRATrainer:
             loss_cfg.get("lambda_grow", "n/a"),
             loss_cfg.get("lambda_route", "n/a"),
             loss_cfg.get("retention_feature_representation", "cls"),
+        )
+        self.logger.info(
+            "  orthogonality enabled=%s active_points=%s shared_factor=%s shared_mode=%s split_loss_weights=%s lambda_slot_slot=%s lambda_slot_shared=%s diagnostics=%s",
+            bool(orth_cfg.get("enabled", False)),
+            self.model.orthogonality_active_points(),
+            orth_cfg.get("shared", {}).get("factor", "a") if isinstance(orth_cfg.get("shared", {}), dict) else "a",
+            orth_cfg.get("shared", {}).get("mode", "one_side_fixed")
+            if isinstance(orth_cfg.get("shared", {}), dict)
+            else "one_side_fixed",
+            self._uses_split_orthogonality_weights(),
+            orth_loss_cfg.get("lambda_slot_slot", "n/a"),
+            orth_loss_cfg.get("lambda_slot_shared", "n/a"),
+            self._orthogonality_diagnostics_enabled(),
         )
         self.logger.info(
             "  planner tau_novelty=%s tau_conflict=%s tau_consolidate=%s rank_min=%s rank_max=%s",
@@ -464,6 +481,91 @@ class NHLoRATrainer:
             self.logger.warning(
                 "  retention_feature_representation=full_tokens can use substantially more memory and produce heavier debug logs than cls or mean_pool_tokens."
             )
+
+    def _log_orth_applied_events(self, context: Dict[str, Any]) -> None:
+        if not self._orthogonality_diagnostics_enabled():
+            return
+        orth_exhaustion_events = 0
+        for block_id, applied in context.get("applied_plans", {}).items():
+            requested = int(applied.get("requested_added_rank", 0) or 0)
+            actual = int(applied.get("actual_added_rank", 0) or 0)
+            orth_exhausted = bool(applied.get("orth_exhausted", False))
+            if orth_exhausted:
+                orth_exhaustion_events += 1
+            if requested <= 0 and not orth_exhausted:
+                continue
+            point_events = applied.get("orth_point_events", {})
+            if str(applied.get("action")) == "expand_rank_existing_slot":
+                for point_name, event in point_events.items():
+                    self.logger.info(
+                        "[OrthExpand][Task %d][Layer %d][Point %s] slot=%s old_rank=%s requested_added_rank=%d actual_added_rank=%d orth_exhausted=%s slot_slot_max_overlap=%.4e slot_shared_max_overlap=%.4e warning=%s",
+                        context["task_number"],
+                        int(block_id),
+                        point_name,
+                        applied.get("selected_slot"),
+                        applied.get("old_rank"),
+                        requested,
+                        actual,
+                        orth_exhausted,
+                        float(event.get("slot_slot_max_overlap", 0.0)),
+                        float(event.get("slot_shared_max_overlap", 0.0)),
+                        applied.get("orth_warning", "none") or "none",
+                    )
+            else:
+                for point_name, event in point_events.items():
+                    self.logger.info(
+                        "[OrthSlotOpen][Task %d][Layer %d][Point %s] new_slot=%s requested_added_rank=%d actual_added_rank=%d orth_exhausted=%s slot_slot_max_overlap=%.4e slot_shared_max_overlap=%.4e warning=%s",
+                        context["task_number"],
+                        int(block_id),
+                        point_name,
+                        applied.get("selected_slot"),
+                        requested,
+                        actual,
+                        orth_exhausted,
+                        float(event.get("slot_slot_max_overlap", 0.0)),
+                        float(event.get("slot_shared_max_overlap", 0.0)),
+                        applied.get("orth_warning", "none") or "none",
+                    )
+        self.last_train_state["orth_exhaustion_events"] = orth_exhaustion_events
+
+    def _log_orth_summary(self, context: Dict[str, Any], chu_report: Dict[str, Any]) -> None:
+        if not self._orthogonality_diagnostics_enabled():
+            return
+        for merge_event in chu_report.get("orth_merge_events", []):
+            self.logger.info(
+                "[OrthMerge][Task %d][Layer %d][Point %s] slot=%d gram_error=%.4e solver=%s shared_a_preserved=%s reconstruction_error=%.4e",
+                context["task_number"],
+                int(merge_event.get("block_id", -1)),
+                merge_event.get("point_name", "unknown"),
+                int(merge_event.get("slot_id", -1)),
+                float(merge_event.get("gram_error", 0.0)),
+                merge_event.get("solver", "unknown"),
+                bool(merge_event.get("shared_a_preserved", False)),
+                float(merge_event.get("reconstruction_error", 0.0)),
+            )
+        orth_components = orthogonality_components(self.model)
+        requested_total = sum(
+            int(applied.get("requested_added_rank", 0) or 0)
+            for applied in context.get("applied_plans", {}).values()
+        )
+        actual_total = sum(
+            int(applied.get("actual_added_rank", 0) or 0)
+            for applied in context.get("applied_plans", {}).values()
+        )
+        exhaustion_events = sum(
+            int(bool(applied.get("orth_exhausted", False)))
+            for applied in context.get("applied_plans", {}).values()
+        )
+        self.logger.info(
+            "[OrthSummary][Task %d] mean_shared_gram_error=%.4e mean_slot_slot_overlap=%.4e mean_slot_shared_overlap=%.4e orth_exhaustion_events=%d requested_added_rank_total=%d actual_added_rank_total=%d",
+            context["task_number"],
+            float(orth_components["mean_shared_gram_error"]),
+            float(orth_components["mean_slot_slot_overlap"]),
+            float(orth_components["mean_slot_shared_overlap"]),
+            exhaustion_events,
+            requested_total,
+            actual_total,
+        )
 
     @staticmethod
     def _benchmark_class_name_preview(class_names: List[str], limit: int = 5) -> List[str]:
@@ -586,13 +688,56 @@ class NHLoRATrainer:
     def _retention_audit_enabled(self) -> bool:
         return bool(self.config["training"].get("retention_debug_logging", True))
 
+    def _orthogonality_cfg(self) -> Dict[str, Any]:
+        return self.config.get("orthogonality", {})
+
+    def _orthogonality_diagnostics_enabled(self) -> bool:
+        orth_cfg = self._orthogonality_cfg()
+        diagnostics_cfg = orth_cfg.get("diagnostics", {}) if isinstance(orth_cfg.get("diagnostics", {}), dict) else {}
+        return bool(orth_cfg.get("enabled", False)) and bool(diagnostics_cfg.get("enabled", False))
+
+    def _orthogonality_loss_cfg(self) -> Dict[str, Any]:
+        orth_cfg = self._orthogonality_cfg()
+        return orth_cfg.get("loss", {}) if isinstance(orth_cfg.get("loss", {}), dict) else {}
+
+    def _uses_split_orthogonality_weights(self) -> bool:
+        orth_loss_cfg = self._orthogonality_loss_cfg()
+        return orth_loss_cfg.get("lambda_slot_slot") is not None or orth_loss_cfg.get("lambda_slot_shared") is not None
+
+    def _orthogonality_weighted_loss(self, components: Dict[str, torch.Tensor | float]) -> torch.Tensor:
+        orth_loss_cfg = self._orthogonality_loss_cfg()
+        slot_slot = components["slot_slot"]
+        slot_shared = components["slot_shared"]
+        if self._uses_split_orthogonality_weights():
+            return (
+                float(orth_loss_cfg.get("lambda_slot_slot") or 0.0) * slot_slot
+                + float(orth_loss_cfg.get("lambda_slot_shared") or 0.0) * slot_shared
+            )
+        return (slot_slot + slot_shared) * float(self.config["loss"].get("lambda_orth", 0.0))
+
+    def _log_orth_init(self) -> None:
+        if not self._orthogonality_diagnostics_enabled():
+            return
+        summaries = self.model.orthogonality_init_summaries()
+        for block_id, point_summaries in summaries.items():
+            for point_name, summary in point_summaries.items():
+                self.logger.info(
+                    "[OrthInit][Layer %d][Point %s] shared_a_gram_error=%.4e fixed=%s warning=%s",
+                    int(block_id),
+                    point_name,
+                    float(summary.get("shared_a_gram_error", 0.0)),
+                    bool(summary.get("fixed", False)),
+                    summary.get("orth_warning", "none") or "none",
+                )
+
     def _loss_component_weights(self) -> Dict[str, float]:
         loss_cfg = self.config["loss"]
+        orth_weight = 1.0 if self._uses_split_orthogonality_weights() else float(loss_cfg.get("lambda_orth", 0.0))
         return {
             "cls": 1.0,
             "kd": float(loss_cfg.get("lambda_kd", 0.0)),
             "feat": float(loss_cfg.get("lambda_feat", 0.0)),
-            "orth": float(loss_cfg.get("lambda_orth", 0.0)),
+            "orth": orth_weight,
             "rank": float(loss_cfg.get("lambda_rank", 0.0)),
             "grow": float(loss_cfg.get("lambda_grow", 0.0)),
             "route": float(loss_cfg.get("lambda_route", 0.0)),
@@ -605,6 +750,18 @@ class NHLoRATrainer:
             key: float(normalized.get(key, 0.0)) * float(weights.get(key, 0.0))
             for key in weights
         }
+        if self._uses_split_orthogonality_weights() and loss_values:
+            orth_loss_cfg = self._orthogonality_loss_cfg()
+            slot_slot = loss_values.get("orth_slot_slot", 0.0)
+            slot_shared = loss_values.get("orth_slot_shared", 0.0)
+            slot_slot_value = float(slot_slot.detach().item()) if isinstance(slot_slot, torch.Tensor) else float(slot_slot)
+            slot_shared_value = (
+                float(slot_shared.detach().item()) if isinstance(slot_shared, torch.Tensor) else float(slot_shared)
+            )
+            weighted["orth"] = (
+                float(orth_loss_cfg.get("lambda_slot_slot") or 0.0) * slot_slot_value
+                + float(orth_loss_cfg.get("lambda_slot_shared") or 0.0) * slot_shared_value
+            )
         weighted_total = float(sum(weighted.values()))
         weighted_shares = {
             key: (float(value) / weighted_total if weighted_total > 0.0 else 0.0)
@@ -4421,7 +4578,7 @@ class NHLoRATrainer:
         self,
         context: Dict[str, Any],
         eval_metrics: Dict[str, Any],
-        chu_report: Dict[str, int],
+        chu_report: Dict[str, Any],
         epoch_history: List[Dict[str, Any]],
         training_time: float,
         task_wall_time: float,
@@ -4457,6 +4614,18 @@ class NHLoRATrainer:
             "merged_slots": int(chu_report["merged_slots"]),
             "frozen_slots": int(chu_report["frozen_slots"]),
             "kept_slots": int(chu_report["kept_slots"]),
+            "orth_exhaustion_events": sum(
+                int(bool(applied.get("orth_exhausted", False)))
+                for applied in context.get("applied_plans", {}).values()
+            ),
+            "requested_added_rank_total": sum(
+                int(applied.get("requested_added_rank", 0) or 0)
+                for applied in context.get("applied_plans", {}).values()
+            ),
+            "actual_added_rank_total": sum(
+                int(applied.get("actual_added_rank", 0) or 0)
+                for applied in context.get("applied_plans", {}).values()
+            ),
             "parameter_growth": parameter_growth,
             "parameter_growth_delta": parameter_growth - previous_growth,
             "total_active_rank": self._total_active_rank(),
@@ -4746,6 +4915,7 @@ class NHLoRATrainer:
                 applied_plans,
             )
         self._log_stage5_plan_debug(context)
+        self._log_orth_applied_events(context)
         self._log_planner_audit_prepare(context)
         self._log_hybrid_planner_prepare(context)
         return context
@@ -4848,11 +5018,20 @@ class NHLoRATrainer:
         loss_cfg = self.config["loss"]
         task_number = int(context["task_number"])
         cls_loss = F.cross_entropy(outputs["logits"], labels)
-        orth_loss = slot_orthogonality(self.model)
+        orth_components = orthogonality_components(self.model)
+        orth_loss = orth_components["slot_slot"] + orth_components["slot_shared"]
+        context["orthogonality_loss_components"] = {
+            "slot_slot": float(orth_components["slot_slot"].detach().item()),
+            "slot_shared": float(orth_components["slot_shared"].detach().item()),
+            "mean_shared_gram_error": float(orth_components["mean_shared_gram_error"]),
+            "mean_slot_slot_overlap": float(orth_components["mean_slot_slot_overlap"]),
+            "mean_slot_shared_overlap": float(orth_components["mean_slot_shared_overlap"]),
+            "uses_split_weights": self._uses_split_orthogonality_weights(),
+        }
         rank_loss = rank_penalty(self.model, self.device)
         route_loss = routing_balance_loss(outputs["route_info"], self.device)
         total_loss = cls_loss
-        total_loss = total_loss + float(loss_cfg["lambda_orth"]) * orth_loss
+        total_loss = total_loss + self._orthogonality_weighted_loss(orth_components)
         total_loss = total_loss + float(loss_cfg["lambda_rank"]) * rank_loss
         total_loss = total_loss + float(loss_cfg["lambda_route"]) * route_loss
 
@@ -4909,6 +5088,8 @@ class NHLoRATrainer:
             "total": total_loss,
             "cls": cls_loss,
             "orth": orth_loss,
+            "orth_slot_slot": orth_components["slot_slot"],
+            "orth_slot_shared": orth_components["slot_shared"],
             "rank": rank_loss,
             "route": route_loss,
             "kd": kd_term,
@@ -5135,6 +5316,7 @@ class NHLoRATrainer:
             pre_eval=pre_metrics,
             post_eval=eval_metrics,
         )
+        self._log_orth_summary(context, chu_report)
         inference_overhead = self._estimate_inference_overhead(task_index)
         return self._summarize_task_metrics(
             context=context,
@@ -5146,12 +5328,13 @@ class NHLoRATrainer:
             inference_overhead=inference_overhead,
         )
 
-    def _run_consolidation(self, context: Dict[str, Any], usage_stats: Dict[int, Dict[int, float]]) -> Dict[str, int]:
+    def _run_consolidation(self, context: Dict[str, Any], usage_stats: Dict[int, Dict[int, float]]) -> Dict[str, Any]:
         merged_slots = 0
         pruned_slots = 0
         kept_slots = 0
         frozen_slots = 0
         opened_slots = 0
+        orth_merge_events = []
         for block_id, runtime_cfg in context["applied_plans"].items():
             layer = self.model.layers[str(block_id)]
             if bool(runtime_cfg.get("created_new_slot", False)):
@@ -5161,12 +5344,22 @@ class NHLoRATrainer:
             pruned_slots += report.pruned_slots
             kept_slots += report.kept_slots
             frozen_slots += report.frozen_slots
+            orth_merge_events.extend(
+                [
+                    {
+                        "block_id": int(block_id),
+                        **merge_event,
+                    }
+                    for merge_event in report.merge_events
+                ]
+            )
         return {
             "merged_slots": merged_slots,
             "pruned_slots": pruned_slots,
             "kept_slots": kept_slots,
             "frozen_slots": frozen_slots,
             "opened_slots": opened_slots,
+            "orth_merge_events": orth_merge_events,
         }
 
     def _append_history(self, context: Dict[str, Any], usage_stats: Dict[int, Dict[int, float]]) -> None:

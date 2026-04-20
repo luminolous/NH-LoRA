@@ -5,6 +5,8 @@ from typing import Dict
 import torch
 from torch.nn import functional as F
 
+from src.models.orthogonality import gram_error, pairwise_overlap_stats
+
 
 def kd_loss(student_logits: torch.Tensor, teacher_logits: torch.Tensor, temperature: float) -> torch.Tensor:
     student_log_prob = F.log_softmax(student_logits / temperature, dim=-1)
@@ -28,25 +30,82 @@ def feature_retention(
     return torch.stack(losses).mean()
 
 
-def slot_orthogonality(model) -> torch.Tensor:
-    penalties = []
+def _row_overlap_penalty(left_rows: torch.Tensor, right_rows: torch.Tensor) -> torch.Tensor:
+    if left_rows.numel() == 0 or right_rows.numel() == 0:
+        return left_rows.new_zeros(())
+    normalized_left = F.normalize(left_rows, dim=1)
+    normalized_right = F.normalize(right_rows, dim=1)
+    overlap = normalized_left @ normalized_right.transpose(0, 1)
+    return overlap.pow(2).mean()
+
+
+def orthogonality_components(model) -> Dict[str, torch.Tensor | float]:
+    slot_slot_penalties = []
+    slot_shared_penalties = []
+    shared_gram_errors = []
+    slot_slot_overlaps = []
+    slot_shared_overlaps = []
     device = next(model.parameters()).device
     for layer in model.layers.values():
         live_slots = layer.live_slot_ids()
-        if len(live_slots) <= 1:
-            continue
-        for point_name in layer.selected_points:
-            factors = []
+        active_points = layer.orthogonality_active_points() or list(layer.selected_points)
+        for point_name in active_points:
+            bank = layer.point_banks[point_name]
+            if bank.uses_fixed_shared_a():
+                shared_gram_errors.append(gram_error(bank.shared_a.detach()))
+            if len(live_slots) > 1:
+                for left_index in range(len(live_slots)):
+                    left_rows = layer.active_slot_a(live_slots[left_index], point_name)
+                    for right_index in range(left_index + 1, len(live_slots)):
+                        right_rows = layer.active_slot_a(live_slots[right_index], point_name)
+                        slot_slot_penalties.append(_row_overlap_penalty(left_rows, right_rows))
+                        slot_slot_overlaps.append(
+                            pairwise_overlap_stats(left_rows.detach(), right_rows.detach())["max_abs_cos"]
+                        )
+            shared_rows = bank.shared_a
             for slot_id in live_slots:
-                factor = layer.active_slot_a(slot_id, point_name)
-                factors.append(F.normalize(factor, dim=0))
-            for left_index in range(len(factors)):
-                for right_index in range(left_index + 1, len(factors)):
-                    overlap = factors[left_index] @ factors[right_index].transpose(0, 1)
-                    penalties.append(overlap.pow(2).mean())
-    if not penalties:
-        return torch.zeros((), device=device)
-    return torch.stack(penalties).mean()
+                slot_rows = layer.active_slot_a(slot_id, point_name)
+                slot_shared_penalties.append(_row_overlap_penalty(slot_rows, shared_rows))
+                slot_shared_overlaps.append(
+                    pairwise_overlap_stats(slot_rows.detach(), shared_rows.detach())["max_abs_cos"]
+                )
+    slot_slot = (
+        torch.stack(slot_slot_penalties).mean()
+        if slot_slot_penalties
+        else torch.zeros((), device=device)
+    )
+    slot_shared = (
+        torch.stack(slot_shared_penalties).mean()
+        if slot_shared_penalties
+        else torch.zeros((), device=device)
+    )
+    mean_shared_gram_error = (
+        float(torch.stack(shared_gram_errors).mean().item())
+        if shared_gram_errors
+        else 0.0
+    )
+    mean_slot_slot_overlap = (
+        float(sum(slot_slot_overlaps) / len(slot_slot_overlaps))
+        if slot_slot_overlaps
+        else 0.0
+    )
+    mean_slot_shared_overlap = (
+        float(sum(slot_shared_overlaps) / len(slot_shared_overlaps))
+        if slot_shared_overlaps
+        else 0.0
+    )
+    return {
+        "slot_slot": slot_slot,
+        "slot_shared": slot_shared,
+        "mean_shared_gram_error": mean_shared_gram_error,
+        "mean_slot_slot_overlap": mean_slot_slot_overlap,
+        "mean_slot_shared_overlap": mean_slot_shared_overlap,
+    }
+
+
+def slot_orthogonality(model) -> torch.Tensor:
+    components = orthogonality_components(model)
+    return components["slot_slot"] + components["slot_shared"]
 
 
 def rank_penalty(model, device: torch.device) -> torch.Tensor:
